@@ -12,8 +12,8 @@ check:
     cargo sort --workspace --check --no-format
     actionlint
     # Every action pins a release's commit and names its tag, which Dependabot moves; it cannot move a branch's.
-    # yq parses every form of the key, so a quoted key, inline mapping, or next-line value is checked too.
-    yq ea --no-doc '.. | select(tag == "!!map" and has("uses")) | .uses | filename + ":" + (line | tostring) + ": " + . + " #" + line_comment' $(find .github -name '*.yml' -o -name '*.yaml') | { ! grep -vE '^[^:]+:[0-9]+: (\./\S+ #|[^ #]+@[0-9a-f]{40} #v[0-9]\S*)$'; }
+    # yq parses every form of a job's, step's, or composite step's `uses`, such as a quoted key or an inline mapping.
+    find .github \( -name '*.yml' -o -name '*.yaml' \) -exec yq e --no-doc '((.jobs[]? | (.uses, .steps[]?.uses)), .runs.steps[]?.uses) | select(. != null) | filename + ":" + (line | tostring) + ": " + . + " #" + line_comment' {} + | { ! grep -vE '^[^:]+:[0-9]+: (\./\S+ #.*|[^ #]+@[0-9a-f]{40} #v[0-9]\S*)$'; }
     taplo format --check
     nixfmt --check flake.nix
     quest check
