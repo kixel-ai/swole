@@ -75,7 +75,7 @@
                   "--package"
                   "cargo-swole"
                 ];
-                nativeBuildInputs = [ pkgs.makeWrapper ];
+                nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
                 postInstall = lib.optionalString linux ''
                   for bin in swole cargo-swole; do
                     wrapProgram $out/bin/$bin --prefix PATH : ${valgrind}/bin

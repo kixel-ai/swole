@@ -16,10 +16,6 @@ Recommendations for the implementer:
 - Report off-CPU blocked time and futex wait time per call alongside wall-clock time in `--report` and changed-benchmark details, and integrate with [derived diagnostics](/quest/m0/diagnostics.md)'s zero-privilege `(user_ns + system_ns) / wall_ns` off-CPU ratio.
 - Verify on a real Linux host with a mutex-contended benchmark, an idle-parked async worker, and a sleeping benchmark, confirming blocked time matches the sleep, futex wait captures futex waits, and only lock acquisitions carry a lock-contention label.
 
-## Required
-
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - builds on the setup capability probe and `swole bench`
-
 ## Hosts
 
 - linux - kernel sched and futex tracepoints

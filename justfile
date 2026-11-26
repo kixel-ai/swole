@@ -25,7 +25,7 @@ test *args:
 # Run what CI runs: lint, then test.
 ci: check test
 
-# Run swole from the development checkout: `just run run --out metrics.json`.
+# Run swole from the development checkout: `just run sim --out metrics.json`.
 run *args:
     cargo run --locked --quiet --release --bin swole -- {{ args }}
 

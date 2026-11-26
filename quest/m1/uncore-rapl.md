@@ -20,7 +20,6 @@ Recommendations for the implementer:
 ## Required
 
 - [Exclusive pinned cores for bench mode](/quest/m0/exclusive-cores.md) - its lease mechanism grants the host-enforced whole-socket lease this pass needs
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - builds on the setup capability probe and multi-pass perf collector
 
 ## Hosts
 

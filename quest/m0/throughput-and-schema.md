@@ -17,7 +17,3 @@ Recommendations for the implementer:
 - Emit throughput metadata from the harness once per case (e.g., `swole throughput bytes <n> <name>`) and have `cargo-swole` emit each count-per-byte/item metric (`instructions/byte`, `cycles/byte`, or `items` equivalents) only when its source count was actually measured in that run, and per-second rates (`bytes/s` formatted as `MB/s` / `GiB/s`, or `items/s`) only when the mode measures native elapsed time for the benchmark window (`bench`, never `sim`'s emulated runtime).
 - Add `"schema_version": 1` to the top-level `--report` JSON object and document its stability contract in `README.md`.
 - Verify with unit/compile tests in `swole-macros` and an end-to-end fixture benchmark checking `instructions/byte` in `sim` (and `quick` on PMU hosts), `bytes/s` in `bench` on any host, and `cycles/byte` in `bench` only on hosts that supply cycle counts.
-
-## Required
-
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - builds on the unified harness protocol and `--report` JSON

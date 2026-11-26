@@ -17,10 +17,6 @@ Recommendations for the implementer:
 - Format concise top-contributor diffs (3 to 5 functions explaining the net delta) in `swole bench <base>` Markdown output and write the full per-function breakdown to `--report`.
 - Verify on a real Linux host (`fedora` / `nixos`, AMD Zen 5 or Intel Core Ultra): adding extra work to one helper function in a compare fixture surfaces that exact function at the top of `swole bench <base>`'s native attribution diff.
 
-## Required
-
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - builds on the setup capability probe and `swole bench` reporting
-
 ## Hosts
 
 - linux - AMD IBS / Intel PEBS sampling and perf ring buffer

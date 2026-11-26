@@ -1,8 +1,8 @@
 # swole
 
 Benchmarks as plain functions marked `#[bench]`, which [swole](../../README.md) counts in
-instructions under Valgrind, each alone in its own process, in parallel, and times by wall clock,
-alone or paired with a base commit's, for Kixel Quest's `metrics.json` or a local compare. A
+instructions under Valgrind or with the host's perf counters, each alone in its own process, in
+parallel, and times by wall clock, alone or paired with a base commit's, for Kixel Quest's `metrics.json` or a local compare. A
 benchmark written for it needs neither Criterion nor CodSpeed's crates.
 
 ```toml
@@ -66,10 +66,11 @@ fn main() {
 
 ```bash
 cargo bench                                    # each benchmark once, natively
-nix run github:kixel-ai/swole -- run           # each one counted under Valgrind
-nix run github:kixel-ai/swole -- compare main  # each one's change from main
-nix run github:kixel-ai/swole -- time          # each one timed
-nix run github:kixel-ai/swole -- time main     # each one timed beside main's
+nix run github:kixel-ai/swole -- sim           # each one counted under Valgrind
+nix run github:kixel-ai/swole -- sim main      # each one's change from main
+nix run github:kixel-ai/swole -- quick         # each one counted with this host's perf counters
+nix run github:kixel-ai/swole -- bench         # each one timed, with every counter
+nix run github:kixel-ai/swole -- bench main    # each one timed beside main's
 ```
 
 ## What a benchmark is
@@ -129,15 +130,17 @@ does.
 
 `swole::main()` runs every benchmark once, sorted by name, setting up each case
 and bracketing its call with Callgrind's client requests, then prints `swole ran <name>`
-after it. Natively the requests are instructions that do nothing, so `cargo bench` and
+after it, starting its records on a fresh line, as the benchmark's own output may not have ended one. Natively the requests are instructions that do nothing, so `cargo bench` and
 `cargo test --benches` run each case once as a check. With `SWOLE_BENCH` set to a name, it
 runs that benchmark alone, which swole sets on each job. It takes no arguments but
 Cargo's own `--bench` and `--quiet`; swole's `--benchmarks` chooses benchmarks.
 
 With `SWOLE_TIME=1` as well, it sets that benchmark up and then times it, a sample for
 each iteration count a line of stdin holds, printing `swole sample <nanoseconds>` on a
-line of its own after each, until stdin ends. swole drives it so, and reads a benchmark's
-own output on stdout around its samples.
+line of its own after each, until stdin ends, after a `swole rusage` line of what the process
+used over the sample: user and system CPU nanoseconds, peak resident bytes, minor and major page
+faults, and voluntary and involuntary context switches. swole drives it so, and reads a
+benchmark's own output on stdout around its samples.
 
 Under Valgrind with `--instr-atstart=no`, as swole runs it, each case's count is
 everything its call executes on every thread, between `ZERO_STATS` and
@@ -148,8 +151,23 @@ the body, its call, and the requests' own few dozen instructions at most. A prog
 The requests are x86_64's and aarch64's; elsewhere the harness requests nothing, and
 swole fails a job that measured no benchmark.
 
-With `SWOLE_PERF` set to a core PMU's perf type, or 0 on a host with one, it also counts
-each case's user-space instructions with Linux perf counters, on every thread, and prints
-`swole counted <instructions> <alone|threads> <name>` before `swole ran <name>`:
-`threads` when another thread ran during the count. `swole run --perf` sets it, on that
-PMU's cores, as its [README](../../README.md#perf-counters) says.
+Run by swole, it prints `swole threaded <name>` for a case beside which the process had another
+thread: one there when its call started or ended, or, under swole's preload, one its call started;
+and `swole alone <name>` for any other, so swole counts a case again under Valgrind when a harness
+too old to watch says neither.
+
+With `SWOLE_COUNTERS` set to how many Linux perf counters swole opened on the process before it
+ran the target, as `<hardware>+<software>`, it starts them all after the case's setup and reads
+each hardware one in user space with `rdpmc`, then reads them again after its call and stops
+them, so a count holds no system call. It counts only under swole's preload, or its build that counts threads alone, whose thread count
+tells swole whether another thread, whose work the counters cannot see, ran beside a call. It
+then prints a `swole rusage` line of what the process used over the call and
+`swole counted <value>... <name>`, each counter's value in the order swole opened them, before
+`swole ran <name>`. The benchmark itself needs no privilege: swole opens the counters with its
+own. `swole quick` sets `SWOLE_COUNTERS` alone (counting one call without warm-up). `swole bench` sets
+both `SWOLE_COUNTERS` and `SWOLE_ITERATIONS`: the harness first replays the uncounted calls `bench`
+warms it up with before timing, one call and then batches doubled from one up to that many, then
+calls it that many times, counting a deterministic stratified subset of up to 64 of those calls
+(while watching every call for worker threads), and prints `swole calls <n> <name>`, how many its
+counts cover, or a benchmark that times itself once, for that many iterations. See the
+[README](../../README.md#quick).

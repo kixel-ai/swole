@@ -1,6 +1,8 @@
 //! Wall-clock times of the working tree's benchmarks, each alone, or each paired with a base
 //! commit's: a sample of one beside a sample of the other, in an order drawn anew for each pair,
 //! so host load that drifts or recurs biases neither side. Load still widens the change's interval.
+//! Beside each time, what the process used over its samples, and every perf counter the host
+//! lets swole open, a call's share of each, counted in processes of their own.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -13,8 +15,8 @@ use serde_json::Number;
 
 use crate::cargo::Lacking;
 use crate::compare::Checkout;
-use crate::fingerprint::Fnv;
-use crate::{Job, Options, cargo, metrics, missing, work};
+use crate::fingerprint::Native;
+use crate::{Job, Measure, Mode, Options, cargo, metrics, missing, perf, work};
 
 /// How long a sample's timed part aims to take: long enough that the clock's reads and its
 /// resolution vanish in it, short enough that a pair's two samples see the same host and that a
@@ -42,20 +44,21 @@ const SAMPLE: &str = "swole sample ";
 /// The unit every time is in.
 const UNIT: &str = "ns";
 
-/// Times the working tree's benchmarks, or with `base` each beside the base's, prints them, and
-/// writes them to `--out` when given.
-pub fn time(base: Option<&str>, options: &Options) -> Result<(), String> {
-	if !options.programs.is_empty() || options.build.is_some() {
-		return Err("time times a Cargo workspace's benchmarks, not --program's".to_owned());
+/// Times the working tree's benchmarks, or with `base` each beside the base's, with what each
+/// used and every counter the host allows, prints them, and writes them to `--out` and `--report`
+/// when given.
+pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
+	// Probed before anything builds, so the run says first what it can measure.
+	let native = Native::probe(Mode::Bench)?;
+	eprint!("{}", crate::indent(&native.host.describe()));
+	if let Err(why) = &native.host.perf {
+		eprintln!("swole: no perf counters, since {why}: timing by wall clock, with rusage");
 	}
-	if options.perf {
-		return Err("time measures by wall clock, not perf counters: --perf is run's and compare's".to_owned());
-	}
-	if options.jobs.is_some() {
-		return Err("time runs one benchmark at a time, so a time is never another's load: --jobs is run's".to_owned());
-	}
-	let host = host()?;
-	eprintln!("swole: host {host}");
+	let perf = native.host.perf.as_ref().ok();
+	// Both timed and counting passes run under the preload built to count threads alone when perf
+	// is available, which detects even short-lived workers spawned and joined inside a timed sample
+	// or counter pass while keeping the host's clock and randomness untouched.
+	let preload = perf.map(|_| crate::preload::threads()).transpose()?;
 	// Held until the base is timed, so no other compare checks out another commit under it.
 	let checkout = base.map(|base| Checkout::new(base, options)).transpose()?;
 	// Each side builds only the packages and targets of the Cargo args its revision has.
@@ -137,20 +140,44 @@ pub fn time(base: Option<&str>, options: &Options) -> Result<(), String> {
 	let work = work(Path::new("."))?;
 	let mut coin = Coin::seeded();
 	let mut times = BTreeMap::new();
+	// Each benchmark's other measures, by side: the base's, then the head's.
+	let mut details: [BTreeMap<String, Vec<Measure>>; 2] = Default::default();
+	// The benchmarks beside which another thread ran, on either side, which have no counters.
+	let mut threaded = std::collections::BTreeSet::new();
+	// Whether another thread ran beside each benchmark, where every side was watched or one
+	// was seen threaded.
+	let mut seen = BTreeMap::new();
+	// Mapped libc identity reported by every benchmark process across the run, verifying none is
+	// missing (on Linux) and all agree on one libc build.
+	let mut libcs: Vec<(String, Option<String>)> = Vec::new();
 	let total = names.len();
 	for (index, name) in names.into_iter().enumerate() {
 		let started = Instant::now();
 		let dir = work.join(index.to_string());
 		let base = before.as_mut().and_then(|jobs| jobs.remove(&name));
 		let head = after.remove(&name);
-		let timed = match (base, head) {
+		let pmu = perf.map(|perf| &perf.pmu);
+		let (timed, iterations, used, timed_threaded) = match (&base, &head) {
 			(Some(base), Some(head)) => {
-				let mut base = Process::spawn(base, &dir.join("base"))?;
-				let mut head = Process::spawn(head, &dir.join("head"))?;
+				let mut base = Process::spawn(base, pmu, preload.as_deref(), &dir.join("base"))?;
+				let mut head = Process::spawn(head, pmu, preload.as_deref(), &dir.join("head"))?;
 				let (iterations, pairs) = paired(&mut base, &mut head, &mut coin)?;
+				let base_threaded = base.threaded || pairs.iter().any(|(b, _)| b.threaded);
+				let head_threaded = head.threaded || pairs.iter().any(|(_, h)| h.threaded);
+				libcs.push((format!("{name} (base)"), base.libc.take()));
+				libcs.push((format!("{name} (head)"), head.libc.take()));
 				base.finish()?;
 				head.finish()?;
-				Times::pairs(iterations, &pairs).map_err(|err| format!("{name}: {err}"))?
+				let nanos: Vec<(u64, u64)> = pairs.iter().map(|(b, h)| (b.nanos, h.nanos)).collect();
+				let base_used = usage(pairs.iter().map(|(b, _)| b));
+				let head_used = usage(pairs.iter().map(|(_, h)| h));
+				let timed = Times::pairs(iterations, &nanos).map_err(|err| format!("{name}: {err}"))?;
+				(
+					timed,
+					iterations,
+					[base_used, head_used],
+					[base_threaded, head_threaded],
+				)
 			}
 			(base, head) => {
 				let (side, job) = match (base, head) {
@@ -158,12 +185,71 @@ pub fn time(base: Option<&str>, options: &Options) -> Result<(), String> {
 					(None, Some(head)) => (Which::Head, head),
 					_ => unreachable!("every name is one side's"),
 				};
-				let mut process = Process::spawn(job, &dir.join(side.name()))?;
+				let mut process = Process::spawn(job, pmu, preload.as_deref(), &dir.join(side.name()))?;
 				let (iterations, samples) = alone(&mut process)?;
+				let side_threaded = process.threaded || samples.iter().any(|sample| sample.threaded);
+				libcs.push((name.clone(), process.libc.take()));
 				process.finish()?;
-				Times::alone(side, iterations, &samples).map_err(|err| format!("{name}: {err}"))?
+				let nanos: Vec<u64> = samples.iter().map(|sample| sample.nanos).collect();
+				let timed = Times::alone(side, iterations, &nanos).map_err(|err| format!("{name}: {err}"))?;
+				let used = usage(samples.iter());
+				(
+					timed,
+					iterations,
+					if side == Which::Base {
+						[used, None]
+					} else {
+						[None, used]
+					},
+					if side == Which::Base {
+						[side_threaded, false]
+					} else {
+						[false, side_threaded]
+					},
+				)
 			}
 		};
+		let mut watched = true;
+		for (i, (side, job)) in [(Which::Base, &base), (Which::Head, &head)].into_iter().enumerate() {
+			let Some(job) = job else { continue };
+			let mut measures = if timed_threaded[i] {
+				threaded.insert(name.clone());
+				Vec::new()
+			} else {
+				match (perf, &preload) {
+					(Some(perf), Some(preload)) => {
+						let (counted, count_libc) = count(job, perf, preload, iterations, &dir.join(side.name()))?;
+						libcs.push((format!("{name} ({} counters)", side.name()), count_libc));
+						match counted {
+							Counted::Measures(measures) => measures,
+							Counted::Threaded => {
+								threaded.insert(name.clone());
+								Vec::new()
+							}
+							Counted::Unwatched => {
+								watched = false;
+								Vec::new()
+							}
+						}
+					}
+					_ => {
+						watched = false;
+						Vec::new()
+					}
+				}
+			};
+			if let Some((used, calls)) = &used[i] {
+				measures.extend(used.measures(*calls * iterations));
+			}
+			if !measures.is_empty() {
+				details[i].insert(name.clone(), measures);
+			}
+		}
+		if threaded.contains(&name) {
+			seen.insert(name.clone(), true);
+		} else if watched {
+			seen.insert(name.clone(), false);
+		}
 		eprintln!(
 			"swole: [{}/{total}] {name}: {}, {:.1}s",
 			index + 1,
@@ -174,12 +260,144 @@ pub fn time(base: Option<&str>, options: &Options) -> Result<(), String> {
 	}
 	// Every process exited cleanly, so the run's output is no longer evidence.
 	std::fs::remove_dir_all(&work).map_err(|e| format!("cannot remove {}: {e}", work.display()))?;
-	print!("{}", table(&times, checkout.is_some()));
+	let native = match crate::fingerprint::require_single_libc(
+		libcs.iter().map(|(label, libc)| (label.as_str(), libc.as_deref())),
+		cfg!(target_os = "linux"),
+	)? {
+		Some(bench_libc) => native.with_libc(Some(bench_libc)),
+		None => native,
+	};
+	let host = native.label();
+	eprintln!("swole: fingerprint {host}");
+	let paired = checkout.is_some();
+	print!("{}", table(&times, paired));
+	if !threaded.is_empty() {
+		let names: Vec<&str> = threaded.iter().map(String::as_str).collect();
+		println!(
+			"\nOther threads ran beside {}, so bench left out their perf counters, which read the calling thread \
+			 alone.",
+			names.join(", ")
+		);
+	}
+	let [base_details, head_details] = &details;
+	print!("{}", metrics::details(paired.then_some(base_details), head_details));
+	let sha = checkout.as_ref().map(|checkout| checkout.sha.as_str());
 	if let Some(out) = &options.out {
-		file(&times, &host, checkout.as_ref().map(|checkout| checkout.sha.as_str())).write(out)?;
+		file(&times, &host, sha).write(out)?;
 		eprintln!("swole: wrote {}", out.display());
 	}
+	if let Some(path) = &options.report {
+		report(&times, &details, &seen, &host, &native.describe(), sha).write(path)?;
+		eprintln!("swole: wrote {}", path.display());
+	}
 	Ok(())
+}
+
+/// What the process used over `samples`, in all, and how many samples that took, when its harness
+/// says what it used.
+fn usage<'a>(samples: impl Iterator<Item = &'a Sample>) -> Option<(perf::Usage, u64)> {
+	let mut total = perf::Usage::default();
+	let mut count = 0;
+	for sample in samples {
+		total.add(&sample.usage?);
+		count += 1;
+	}
+	(count > 0).then_some((total, count))
+}
+
+/// What counting a benchmark found.
+enum Counted {
+	/// Each counter's share of a call.
+	Measures(Vec<Measure>),
+	/// Another thread ran beside a call, whose work the counters, reading the calling thread
+	/// alone, would leave out.
+	Threaded,
+	/// The job's harness is too old to count, or to say whether another thread ran.
+	Unwatched,
+}
+
+/// Counts `job`'s benchmark with each of `perf`'s passes, in a process of its own for each under
+/// the library at `preload`, over `iterations` calls, its output under `dir`.
+fn count(
+	job: &Job,
+	perf: &perf::Perf,
+	preload: &Path,
+	iterations: u64,
+	dir: &Path,
+) -> Result<(Counted, Option<String>), String> {
+	let mut values = Vec::new();
+	let mut libcs: Vec<(String, Option<String>)> = Vec::new();
+	for (i, pass) in perf.passes.iter().enumerate() {
+		let dir = dir.join(format!("pass-{}", i + 1));
+		std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+		let file = |name: &str| {
+			std::fs::File::create(dir.join(name))
+				.map_err(|e| format!("cannot create {}: {e}", dir.join(name).display()))
+		};
+		let mut command = job.command();
+		perf::launch(&mut command, &perf.pmu, pass, false);
+		command.env(perf::ITERATIONS, iterations.to_string());
+		// Bench keeps ASLR and unpadded stacks; preload threads.so without 1 MiB padding.
+		let env = crate::environment(&command, preload, &job.label, false)?;
+		let status = command
+			.env_clear()
+			.envs(env)
+			.stdin(Stdio::null())
+			.stdout(file("stdout")?)
+			.stderr(file("stderr")?)
+			.status()
+			.map_err(|e| format!("cannot run {}: {e}", job.label))?;
+		if !status.success() {
+			return Err(format!(
+				"{} failed counting ({status}){}; its output is in {}",
+				job.label,
+				crate::reason(&dir.join("stderr")),
+				dir.display()
+			));
+		}
+		let path = dir.join("stdout");
+		let text = crate::printed(&path)?;
+		let readings = perf::readings(&text, pass.len()).map_err(|err| format!("{}: {err}", job.label))?;
+		match readings.as_slice() {
+			[] => {
+				eprintln!(
+					"swole: {}'s swole harness is too old to count, so it has no counters",
+					job.label
+				);
+				return Ok((Counted::Unwatched, None));
+			}
+			[reading] => {
+				let verified = reading
+					.libc
+					.as_deref()
+					.map(crate::fingerprint::validate_libc_record)
+					.transpose()?;
+				libcs.push((job.label.clone(), verified));
+				if reading.threaded {
+					let libc = crate::fingerprint::require_single_libc(
+						libcs.iter().map(|(label, libc)| (label.as_str(), libc.as_deref())),
+						cfg!(target_os = "linux"),
+					)?;
+					return Ok((Counted::Threaded, libc));
+				}
+				// Over the calls the harness counted (stratified over the sample's iterations), or
+				// `iterations` for a harness too old to emit `swole calls`.
+				values.push((reading.values.clone(), reading.calls.unwrap_or(iterations)));
+			}
+			_ => {
+				return Err(format!(
+					"{} counted more than one benchmark; its output is in {}",
+					job.label,
+					dir.display()
+				));
+			}
+		}
+	}
+	let libc = crate::fingerprint::require_single_libc(
+		libcs.iter().map(|(label, libc)| (label.as_str(), libc.as_deref())),
+		cfg!(target_os = "linux"),
+	)?;
+	Ok((Counted::Measures(perf::measures(&perf.passes, &values)), libc))
 }
 
 /// Jobs by the benchmark each runs.
@@ -189,61 +407,6 @@ fn by_name(jobs: Vec<Job>) -> BTreeMap<String, Job> {
 		.collect()
 }
 
-/// The label that names this host's hardware in every time's measure, so times from two kinds of
-/// CPU never share a series: the architecture, then a hash of the CPU's model, as the system
-/// describes it, and of how many CPUs this process may run on.
-fn host() -> Result<String, String> {
-	let mut hash = Fnv::default();
-	hash.write(&cpu()?);
-	let cpus = std::thread::available_parallelism().map_err(|e| format!("cannot count the CPUs: {e}"))?;
-	hash.write(&cpus.to_string());
-	Ok(format!("{}-{:012x}", std::env::consts::ARCH, hash.0 >> 16))
-}
-
-/// The CPU's model as Linux describes each logical CPU, by the fields that name it.
-#[cfg(target_os = "linux")]
-fn cpu() -> Result<String, String> {
-	const MODEL: [&str; 9] = [
-		"vendor_id",
-		"cpu family",
-		"model",
-		"model name",
-		"stepping",
-		"CPU implementer",
-		"CPU variant",
-		"CPU part",
-		"CPU revision",
-	];
-	let info = std::fs::read_to_string("/proc/cpuinfo").map_err(|e| format!("cannot read /proc/cpuinfo: {e}"))?;
-	let model: String = info
-		.lines()
-		.filter(|line| line.split_once(':').is_some_and(|(key, _)| MODEL.contains(&key.trim())))
-		.map(|line| format!("{line}\n"))
-		.collect();
-	if model.is_empty() {
-		return Err("/proc/cpuinfo names no CPU model".to_owned());
-	}
-	Ok(model)
-}
-
-/// The CPU's model as macOS names it.
-#[cfg(target_os = "macos")]
-fn cpu() -> Result<String, String> {
-	let out = std::process::Command::new("sysctl")
-		.args(["-n", "machdep.cpu.brand_string"])
-		.output()
-		.map_err(|e| format!("cannot run sysctl: {e}"))?;
-	if !out.status.success() {
-		return Err(format!("sysctl failed ({})", out.status));
-	}
-	String::from_utf8(out.stdout).map_err(|_| "sysctl named the CPU in something not UTF-8".to_owned())
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn cpu() -> Result<String, String> {
-	Err("time names CPUs on Linux and macOS alone".to_owned())
-}
-
 /// One sample of one side.
 #[derive(Clone, Copy, Debug)]
 struct Sample {
@@ -251,6 +414,10 @@ struct Sample {
 	nanos: u64,
 	/// What the request took in all, steps and setup between calls included.
 	wall: Duration,
+	/// What the process used over the sample, when its harness says.
+	usage: Option<perf::Usage>,
+	/// Whether the timing process observed another thread alive during this sample.
+	threaded: bool,
 }
 
 /// A benchmark set up in a process of one side, which runs a sample when asked.
@@ -282,23 +449,22 @@ fn calibrate(sides: &mut [&mut dyn Side]) -> Result<u64, String> {
 	}
 }
 
-/// Samples `side` alone until the budget is spent: the iterations each sample took, and each
-/// sample's nanoseconds.
-fn alone(side: &mut dyn Side) -> Result<(u64, Vec<u64>), String> {
+/// Samples `side` alone until the budget is spent: the iterations each sample took, and each sample.
+fn alone(side: &mut dyn Side) -> Result<(u64, Vec<Sample>), String> {
 	let iterations = calibrate(&mut [&mut *side])?;
 	let mut spent = Duration::ZERO;
 	let mut samples = Vec::new();
 	while samples.len() < MIN_SAMPLES || spent < BUDGET {
 		let sample = side.sample(iterations)?;
 		spent += sample.wall;
-		samples.push(sample.nanos);
+		samples.push(sample);
 	}
 	Ok((iterations, samples))
 }
 
 /// Samples `base` and `head` in pairs, in an order `coin` draws anew for each, until the budget is
-/// spent: the iterations each sample took, and each pair's nanoseconds, the base's first.
-fn paired(base: &mut dyn Side, head: &mut dyn Side, coin: &mut Coin) -> Result<(u64, Vec<(u64, u64)>), String> {
+/// spent: the iterations each sample took, and each pair, the base's first.
+fn paired(base: &mut dyn Side, head: &mut dyn Side, coin: &mut Coin) -> Result<(u64, Vec<(Sample, Sample)>), String> {
 	let iterations = calibrate(&mut [&mut *base, &mut *head])?;
 	let mut spent = Duration::ZERO;
 	let mut pairs = Vec::new();
@@ -311,7 +477,7 @@ fn paired(base: &mut dyn Side, head: &mut dyn Side, coin: &mut Coin) -> Result<(
 			(base.sample(iterations)?, h)
 		};
 		spent += b.wall + h.wall;
-		pairs.push((b.nanos, h.nanos));
+		pairs.push((b, h));
 	}
 	Ok((iterations, pairs))
 }
@@ -544,10 +710,10 @@ fn table(times: &BTreeMap<String, Times>, paired: bool) -> String {
 /// The times as a `metrics.json`: the working tree's as the run's own commit's, and the base's,
 /// when there is one, as its commit's.
 fn file(times: &BTreeMap<String, Times>, host: &str, base: Option<&str>) -> metrics::File {
-	let values = |side: fn(&Times) -> Option<f64>| -> BTreeMap<String, Number> {
+	let values = |side: fn(&Times) -> Option<f64>| -> BTreeMap<String, metrics::Point> {
 		times
 			.iter()
-			.filter_map(|(name, times)| side(times).map(|time| (name.clone(), number(time))))
+			.filter_map(|(name, times)| side(times).map(|time| (name.clone(), number(time).into())))
 			.collect()
 	};
 	let mut samples = Vec::new();
@@ -568,6 +734,45 @@ fn file(times: &BTreeMap<String, Times>, host: &str, base: Option<&str>) -> metr
 	}
 }
 
+/// Every measure of each benchmark, its time and the change's interval among them, as `--report`
+/// writes it, the base's from the commit `base` when there is one.
+fn report(
+	times: &BTreeMap<String, Times>,
+	details: &[BTreeMap<String, Vec<Measure>>; 2],
+	// Whether another thread ran beside each benchmark, where that is known.
+	seen: &BTreeMap<String, bool>,
+	host: &str,
+	describe: &str,
+	base: Option<&str>,
+) -> metrics::Report {
+	let mut benchmarks = BTreeMap::new();
+	for (name, timed) in times {
+		let mut entry = serde_json::Map::new();
+		for (i, (side, time)) in [("base", timed.base()), ("head", timed.head())].into_iter().enumerate() {
+			let Some(time) = time else { continue };
+			let mut measures = vec![Measure::new("time", time, UNIT)];
+			measures.extend(details[i].get(name).cloned().unwrap_or_default());
+			entry.insert(side.to_owned(), metrics::side(&measures));
+		}
+		if let Some(&threaded) = seen.get(name) {
+			entry.insert("threaded".to_owned(), threaded.into());
+		}
+		if let Times::Both { ratio, .. } = timed {
+			entry.insert(
+				"change".to_owned(),
+				serde_json::json!({
+					"value": metrics::number(ratio.value),
+					"lower": metrics::number(ratio.lower),
+					"upper": metrics::number(ratio.upper),
+					"unit": "head/base",
+				}),
+			);
+		}
+		benchmarks.insert(name.clone(), entry);
+	}
+	metrics::Report::new(Mode::Bench, host, describe, base, benchmarks)
+}
+
 /// A time to five significant digits, more than load lets a run resolve.
 fn number(time: f64) -> Number {
 	let rounded: f64 = format!("{time:.4e}").parse().expect("a float reads back");
@@ -583,21 +788,35 @@ struct Process {
 	stdout: BufReader<ChildStdout>,
 	/// The target's own output, apart from its samples.
 	log: std::fs::File,
+	/// Whether any sample (including warmup/calibration) observed another thread alive or started.
+	threaded: bool,
+	/// The loaded libc identity reported by this benchmark process on Linux.
+	libc: Option<String>,
 }
 
 impl Process {
-	/// Starts `job`'s target timing its benchmark, its output in `dir`, and waits until its
-	/// benchmark is set up: a sample of one call, which no time keeps, answers only after setup,
-	/// so no kept sample's wall time takes it in.
-	fn spawn(job: Job, dir: &Path) -> Result<Self, String> {
-		let Job { label, mut command, .. } = job;
+	/// Starts `job`'s target timing its benchmark, pinned to `pmu`'s CPUs when given so timing and
+	/// counters measure the same cores on hybrid hosts, preloading `preload` (threads-only) when
+	/// perf counters are available so short-lived workers spawned during timed samples are detected,
+	/// its output in `dir`, and waits until its benchmark is set up: a sample of one call, which
+	/// no time keeps, answers only after setup, so no kept sample's wall time takes it in.
+	fn spawn(job: &Job, pmu: Option<&perf::Pmu>, preload: Option<&Path>, dir: &Path) -> Result<Self, String> {
+		let label = job.label.clone();
+		let mut command = job.command();
+		if let Some(pmu) = pmu {
+			perf::pin_command(&mut command, pmu);
+		}
+		command.env(cargo::HARNESS_TIME, "1");
+		if let Some(preload) = preload {
+			let env = crate::environment(&command, preload, &label, false)?;
+			command.env_clear().envs(env);
+		}
 		std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 		let file = |name: &str| {
 			std::fs::File::create(dir.join(name))
 				.map_err(|e| format!("cannot create {}: {e}", dir.join(name).display()))
 		};
 		let mut child = command
-			.env(cargo::HARNESS_TIME, "1")
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
 			.stderr(file("stderr")?)
@@ -612,8 +831,11 @@ impl Process {
 			stdin,
 			stdout,
 			log: file("stdout")?,
+			threaded: false,
+			libc: None,
 		};
-		process.sample(1)?;
+		let first = process.sample(1)?;
+		process.threaded |= first.threaded;
 		Ok(process)
 	}
 
@@ -644,6 +866,7 @@ impl Process {
 			stdin,
 			mut stdout,
 			mut log,
+			..
 		} = self;
 		drop(stdin);
 		std::io::copy(&mut stdout, &mut log).map_err(|e| format!("cannot keep {label}'s output: {e}"))?;
@@ -666,6 +889,8 @@ impl Side for Process {
 		}
 		// Bytes, since the benchmark's own output need not be UTF-8.
 		let mut line = Vec::new();
+		let mut usage = None;
+		let mut threaded = false;
 		loop {
 			line.clear();
 			match self.stdout.read_until(b'\n', &mut line) {
@@ -692,10 +917,44 @@ impl Side for Process {
 							String::from_utf8_lossy(nanos)
 						)
 					})?;
+				self.threaded |= threaded;
 				return Ok(Sample {
 					nanos,
 					wall: started.elapsed(),
+					usage: usage.take(),
+					threaded,
 				});
+			}
+			if let Some(fields) = line
+				.strip_prefix(perf::RUSAGE.as_bytes())
+				.and_then(|rest| rest.strip_suffix(b"\n"))
+			{
+				let fields = String::from_utf8_lossy(fields);
+				usage = Some(perf::Usage::parse(&fields).map_err(|err| format!("{}: {err}", self.label))?);
+				continue;
+			}
+			if let Some(raw) = line
+				.strip_prefix(perf::LIBC.as_bytes())
+				.and_then(|rest| rest.strip_suffix(b"\n"))
+			{
+				let raw =
+					std::str::from_utf8(raw).map_err(|_| format!("{}: printed a non-UTF-8 libc record", self.label))?;
+				let resolved =
+					crate::fingerprint::validate_libc_record(raw).map_err(|err| format!("{}: {err}", self.label))?;
+				if let Some(existing) = &self.libc
+					&& existing != &resolved
+				{
+					return Err(format!(
+						"{}: reported conflicting libc builds ({existing}, {resolved})",
+						self.label
+					));
+				}
+				self.libc = Some(resolved);
+				continue;
+			}
+			if line.starts_with(perf::THREADED.as_bytes()) {
+				threaded = true;
+				continue;
 			}
 			self.log
 				.write_all(&line)
@@ -727,6 +986,8 @@ mod tests {
 			Ok(Sample {
 				nanos,
 				wall: Duration::from_nanos(nanos + self.step * iterations),
+				usage: None,
+				threaded: false,
 			})
 		}
 	}
@@ -745,7 +1006,7 @@ mod tests {
 			expect: None,
 			codspeed: false,
 		};
-		let mut process = Process::spawn(job, &dir).unwrap();
+		let mut process = Process::spawn(&job, None, None, &dir).unwrap();
 		assert_eq!(process.sample(7).unwrap().nanos, 7);
 		process.finish().unwrap();
 		assert_eq!(std::fs::read(dir.join("stdout")).unwrap(), b"\xff\n\xff\n");

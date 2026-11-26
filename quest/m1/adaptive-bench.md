@@ -16,7 +16,3 @@ Recommendations for the implementer:
 - Check convergence using sequentially valid inference for both stopping and reporting: either alpha spending across planned geometric checkpoints (e.g., 20, 40, 80, 160 pairs) or an anytime-valid confidence sequence for the median ratio, never a naive fixed-sample 95% interval peeked repeatedly.
 - For standalone `swole bench` (no `<base>`), stop once the median's relative half-width stabilizes below a tight threshold after the minimum window.
 - Verify with unit tests over synthetic `Fake` sides (clean constant ratio stops early; noisy borderline ratio runs past 1 s up to the cap) and record the wall-clock speedup on a real multi-benchmark suite.
-
-## Required
-
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - modifies `bench.rs`'s sampling loop

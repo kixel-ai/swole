@@ -15,7 +15,3 @@ Recommendations for the implementer:
 - Update `runs-on` in `.github/workflows/check.yml` to match the organization's self-hosted runner label (see dotfiles' `bin/repo-settings` and sibling repos like `moq` / `rust2`).
 - Verify in CI logs on the PR that `counts_with_perf_counters_what_valgrind_does` and `times_each_harness_benchmark`'s perf counter assertions actually execute rather than returning early on a PMU-less host.
 - Keep `just ci` green and ensure action pins pass the `check` recipe's `yq` pin gate.
-
-## Required
-
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - adds the `quick` and `bench` perf counter tests CI needs to exercise

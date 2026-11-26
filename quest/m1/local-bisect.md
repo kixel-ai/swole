@@ -16,7 +16,3 @@ Recommendations for the implementer:
 - Support `--mode sim|quick` (defaulting to `sim` for exactness, or `quick` when asked for speed), measure `<good>` and `<bad>` first to verify a clear regression exists, and classify each midpoint relative to the good/bad gap (refusing ambiguous midpoints or failing cleanly when the benchmark did not exist yet).
 - Print the first bad commit SHA, subject, and measured progression table at the end.
 - Verify with an end-to-end test over a synthetic 8-commit scratch git repository where commit 5 doubles a benchmark's spin loop, confirming `swole bisect` identifies commit 5.
-
-## Required
-
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - builds on the unified `quick`/`sim` modes and cached compare worktree

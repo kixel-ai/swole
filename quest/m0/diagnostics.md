@@ -26,10 +26,6 @@ Recommendations for the implementer:
   - Keep `--report` complete, while sorting comparison tables by largest absolute change and printing details only for moved benchmarks by default (with `--all-details` or small-suite threshold so a 1,200-benchmark `moq` run does not flood 30,000 rows to stdout). Also format `0 -> N` deltas explicitly instead of leaving the change cell blank.
 - Verify with unit tests for every derived ratio, bottleneck classifier rule (including alignment-shift and throttling detection), and compact table formatting, plus an integration test on a real Linux PMU confirming `ref-cycles` and top-down percentages.
 
-## Required
-
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - builds on the perf probe, counter passes, and `--report`/table output
-
 ## Hosts
 
 - linux - `ref-cycles` and Intel/AMD top-down PMU events

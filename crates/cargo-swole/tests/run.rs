@@ -5,7 +5,7 @@
 // Valgrind, and the fingerprint, are x86_64 Linux's here.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// The benchmarks the fixture runs, `name=iterations` comma-separated, when it is the program.
@@ -120,7 +120,7 @@ fn bench(dir: &Path, benches: &str, wrap: &str, args: &[&str]) -> Output {
 fn command(dir: &Path, benches: &str, wrap: &str, args: &[&str]) -> Command {
 	let mut command = Command::new(env!("CARGO_BIN_EXE_swole"));
 	command
-		.arg("run")
+		.arg("sim")
 		.args(["--program", &program(benches, wrap)])
 		.args(args)
 		.current_dir(dir)
@@ -246,7 +246,6 @@ fn fails_on_a_program_that_measures_nothing() {
 /// built in a target directory of its own, since this test's build holds the workspace's.
 fn harness(args: &[&str]) -> Output {
 	Command::new(env!("CARGO_BIN_EXE_swole"))
-		.arg("run")
 		.args(args)
 		.args(["--", "-p", "swole", "--bench", "fixture"])
 		.current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -263,7 +262,7 @@ fn harness(args: &[&str]) -> Output {
 fn counts_each_harness_benchmark_alone_without_its_setup() {
 	let dir = scratch("harness");
 	let metrics = dir.join("metrics.json");
-	let out = harness(&["--out", metrics.to_str().unwrap()]);
+	let out = harness(&["sim", "--out", metrics.to_str().unwrap()]);
 	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 	let metrics: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(metrics).unwrap()).unwrap();
 	let metrics = metrics["samples"][0]["metrics"].as_object().unwrap();
@@ -274,6 +273,7 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 		[
 			"alone",
 			"borrowed",
+			"dropped",
 			"generic[4000]",
 			"handed",
 			"inner::nested[a]",
@@ -281,6 +281,7 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 			"sized[1000]",
 			"sized[2000]",
 			"sized[4000]",
+			"slept",
 			"spawned[100000]",
 			"spawned[1000]",
 			"stepped",
@@ -312,6 +313,7 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 	near("unstable[1000]", alone);
 	near("unstable[8000]", 8 * alone);
 	near("borrowed", alone);
+	near("dropped", alone);
 	near("generic[4000]", alone);
 	near("word[word]", alone);
 	near("stepped", alone);
@@ -323,6 +325,7 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 	std::fs::write(dir.join("list"), format!("{file}sized[2000]\n")).unwrap();
 	let only = dir.join("only.json");
 	let out = harness(&[
+		"sim",
 		"--benchmarks",
 		dir.join("list").to_str().unwrap(),
 		"--out",
@@ -333,7 +336,7 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 	let only = only["samples"][0]["metrics"].as_object().unwrap();
 	assert_eq!(only.keys().collect::<Vec<_>>(), [&format!("{file}sized[2000]")]);
 	std::fs::write(dir.join("list"), format!("{file}sized[3000]\n")).unwrap();
-	let out = harness(&["--benchmarks", dir.join("list").to_str().unwrap()]);
+	let out = harness(&["sim", "--benchmarks", dir.join("list").to_str().unwrap()]);
 	assert!(!out.status.success());
 	let err = String::from_utf8_lossy(&out.stderr);
 	assert!(
@@ -344,6 +347,7 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 	std::fs::write(dir.join("list"), format!("{file}sized[2000]\n{file}sized[3000]\n")).unwrap();
 	let some = dir.join("some.json");
 	let out = harness(&[
+		"sim",
 		"--benchmarks",
 		dir.join("list").to_str().unwrap(),
 		"--allow-missing",
@@ -361,69 +365,113 @@ fn table(stdout: &[u8]) -> std::collections::BTreeMap<String, u64> {
 	String::from_utf8_lossy(stdout)
 		.lines()
 		.map_while(|line| {
-			let (count, name) = line.trim_start().split_once("  ")?;
+			let (count, rest) = line.trim_start().split_once("  ")?;
+			// A sampled count's least and most follow its name.
+			let name = rest.split("  ").next()?;
 			Some((name.to_owned(), count.parse().ok()?))
 		})
 		.collect()
 }
 
-/// On a host that exposes perf counters, they count what Valgrind does, on every thread; on
-/// one that exposes none, as a hosted CI runner, the run fails, saying so.
+/// The fixture's benchmarks that run another thread.
+const THREADED: [&str; 3] = ["handed", "spawned[100000]", "spawned[1000]"];
+
+/// A file naming each of the fixture's benchmarks that runs no other thread, one a line.
+fn single_threaded(dir: &Path) -> PathBuf {
+	let file = "crates/swole/benches/fixture.rs::";
+	let names = [
+		"alone",
+		"borrowed",
+		"dropped",
+		"generic[4000]",
+		"inner::nested[a]",
+		"inner::nested[bc]",
+		"sized[1000]",
+		"sized[2000]",
+		"sized[4000]",
+		"slept",
+		"stepped",
+		"timed",
+		"unstable[1000]",
+		"unstable[8000]",
+		"word[word]",
+	];
+	let list = dir.join("single-threaded");
+	std::fs::write(&list, names.map(|name| format!("{file}{name}\n")).concat()).unwrap();
+	list
+}
+
+/// On a host that exposes perf counters, they count what Valgrind does on the calling thread,
+/// and fail a benchmark that runs another; on one that exposes none, as a hosted CI runner, the
+/// run fails, saying so.
 #[test]
 fn counts_with_perf_counters_what_valgrind_does() {
-	let out = harness(&["--perf"]);
-	let err = String::from_utf8_lossy(&out.stderr);
-	if !out.status.success() {
-		assert!(err.contains("this host exposes no counters"), "{err}");
-		return;
-	}
-	let perf = table(&out.stdout);
-	let valgrind = harness(&[]);
-	assert!(
-		valgrind.status.success(),
-		"{}",
-		String::from_utf8_lossy(&valgrind.stderr)
-	);
-	let valgrind = table(&valgrind.stdout);
-	assert_eq!(perf.keys().collect::<Vec<_>>(), valgrind.keys().collect::<Vec<_>>());
-	assert_eq!(perf.len(), 16);
+	let dir = scratch("quick-single");
 	let file = "crates/swole/benches/fixture.rs::";
-	let threaded = [
-		format!("{file}handed"),
-		format!("{file}spawned[100000]"),
-		format!("{file}spawned[1000]"),
-	];
+	// Each alone, since a host with one PMU CPU runs one job at a time and stops at a failure.
+	for name in THREADED {
+		let list = dir.join("threaded");
+		std::fs::write(&list, format!("{file}{name}\n")).unwrap();
+		let out = harness(&["quick", "--benchmarks", list.to_str().unwrap()]);
+		let err = String::from_utf8_lossy(&out.stderr);
+		assert!(!out.status.success(), "{err}");
+		if err.contains("quick counts with perf counters, and") {
+			return;
+		}
+		assert!(
+			err.contains(&format!("{file}{name}: another thread ran beside a counted call"))
+				&& err.contains("count it with sim"),
+			"{name}: {err}"
+		);
+	}
+	let list = single_threaded(&dir);
+	let list = list.to_str().unwrap();
+	let out = harness(&["quick", "--benchmarks", list]);
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	let perf = table(&out.stdout);
+	let sim = harness(&["sim", "--benchmarks", list]);
+	assert!(sim.status.success(), "{}", String::from_utf8_lossy(&sim.stderr));
+	let valgrind = table(&sim.stdout);
+	assert_eq!(perf.keys().collect::<Vec<_>>(), valgrind.keys().collect::<Vec<_>>());
+	assert_eq!(perf.len(), 15);
 	for (name, &count) in &perf {
+		// The same instructions, but for each bracket's own few dozen.
 		let under = valgrind[name];
-		if threaded.contains(name) {
-			// Starting a thread takes its own path under Valgrind's scheduler.
-			let ratio = count as f64 / under as f64;
-			assert!(
-				(0.9..1.1).contains(&ratio),
-				"{name}: {count} natively, {under} under Valgrind"
-			);
+		assert!(
+			count.abs_diff(under) < 100,
+			"{name}: {count} natively, {under} under Valgrind"
+		);
+	}
+	// A count reads the counters in user space, the same few instructions around every call,
+	// whatever follows it, and exactly so on every run.
+	let (alone, dropped) = (perf[&format!("{file}alone")], perf[&format!("{file}dropped")]);
+	assert!(alone.abs_diff(dropped) < 16, "{alone} {dropped}");
+	// A call that sleeps leaves the CPU and its counters move, which moves its count not at all:
+	// it is as far from Valgrind's as `alone`'s.
+	let gap = |name: &str| {
+		let name = format!("{file}{name}");
+		perf[&name] as i64 - valgrind[&name] as i64
+	};
+	assert!(
+		gap("slept").abs_diff(gap("alone")) < 16,
+		"{} {}",
+		gap("slept"),
+		gap("alone")
+	);
+	// Repeat counts stay tight for short calls (at most a few instructions if a hardware interrupt
+	// lands under load) and close for longer ones.
+	let again = table(&harness(&["quick", "--benchmarks", list]).stdout);
+	assert_eq!(perf.keys().collect::<Vec<_>>(), again.keys().collect::<Vec<_>>());
+	let short = perf.values().filter(|&&count| count < 5000).count();
+	assert_eq!(short, 11, "{perf:?}");
+	for (name, &count) in &perf {
+		let other = again[name];
+		if count < 5000 {
+			assert!(count.abs_diff(other) <= 4, "{name}: {count} then {other}");
 		} else {
-			// The same instructions, but for each bracket's own few dozen.
-			assert!(
-				count.abs_diff(under) < 100,
-				"{name}: {count} natively, {under} under Valgrind"
-			);
+			assert!(count.abs_diff(other) < 16, "{name}: {count} then {other}");
 		}
 	}
-	// The other thread's spins count, the one setup started and the one the benchmark spawns.
-	assert!(perf[&format!("{file}handed")] > 100 * perf[&format!("{file}alone")] * 9 / 10);
-	assert!(
-		perf[&format!("{file}spawned[100000]")] - perf[&format!("{file}spawned[1000]")]
-			> 99 * perf[&format!("{file}alone")] * 9 / 10
-	);
-	let stdout = String::from_utf8_lossy(&out.stdout);
-	assert!(
-		stdout.ends_with(&format!(
-			"\nOther threads ran during the perf counts of {}, which the scheduler makes noisy.\n",
-			threaded.join(", ")
-		)),
-		"{stdout}"
-	);
 }
 
 #[test]
@@ -498,7 +546,7 @@ fn compares_a_base_with_every_change_in_the_working_tree_from_one_directory() {
 	std::fs::remove_file(repo.join("d.list")).unwrap();
 	let status = git(&repo, &["status", "--porcelain"]);
 	let out = Command::new(env!("CARGO_BIN_EXE_swole"))
-		.args(["compare", "HEAD", "--program", &program("$(cat *.list)", "")])
+		.args(["sim", "HEAD", "--program", &program("$(cat *.list)", "")])
 		// Each side's build resolves its own ignored lockfile, never the side's before.
 		.args(["--build", "! test -e Cargo.lock && touch Cargo.lock"])
 		.current_dir(&repo)
@@ -579,11 +627,10 @@ fn compares_a_selection_only_one_side_has() {
 	)
 	.unwrap();
 	package(&repo, "b", "y", &["f"]);
-	// Compare from `dir`, with swole's `flags` and the `cargo` args.
-	let run = |dir: &Path, flags: &[&str], cargo: &[&str]| {
+	// Compare from `dir`, in `mode`, with the `cargo` args.
+	let run = |dir: &Path, mode: &str, cargo: &[&str]| {
 		Command::new(env!("CARGO_BIN_EXE_swole"))
-			.args(["compare", "HEAD"])
-			.args(flags)
+			.args([mode, "HEAD"])
 			.arg("--")
 			.args(cargo)
 			.current_dir(dir)
@@ -596,7 +643,7 @@ fn compares_a_selection_only_one_side_has() {
 			.output()
 			.unwrap()
 	};
-	let compare = |cargo: &[&str]| run(&repo, &[], cargo);
+	let compare = |cargo: &[&str]| run(&repo, "sim", cargo);
 	let out = compare(&["-p", "a", "--package=b", "--bench", "x", "--bench=y", "-F", "b/f"]);
 	let err = String::from_utf8_lossy(&out.stderr);
 	assert!(out.status.success(), "{err}");
@@ -635,7 +682,7 @@ fn compares_a_selection_only_one_side_has() {
 	// So does the directory of a package only the head has, even once a run left the head's
 	// build output in it.
 	for _ in 0..2 {
-		let out = run(&repo.join("b"), &[], &["--features", "f"]);
+		let out = run(&repo.join("b"), "sim", &["--features", "f"]);
 		let err = String::from_utf8_lossy(&out.stderr);
 		assert!(out.status.success(), "{err}");
 		let table = String::from_utf8(out.stdout).unwrap();
@@ -644,12 +691,12 @@ fn compares_a_selection_only_one_side_has() {
 	}
 
 	// Under perf counters, the empty side carries the counted side's fingerprint.
-	let out = run(&repo, &["--perf"], &["-p", "b", "--features", "b/f"]);
+	let out = run(&repo, "quick", &["-p", "b", "--features", "b/f"]);
 	let err = String::from_utf8_lossy(&out.stderr);
 	if out.status.success() {
 		assert!(row(&String::from_utf8(out.stdout).unwrap(), "b").ends_with("| added |"));
 	} else {
-		assert!(err.contains("this host exposes no counters"), "{err}");
+		assert!(err.contains("quick counts with perf counters, and"), "{err}");
 	}
 
 	// Without `-p`, the base leaves out the feature of a package it lacks.
@@ -679,4 +726,115 @@ fn compares_a_selection_only_one_side_has() {
 	let err = String::from_utf8_lossy(&out.stderr);
 	assert!(!out.status.success());
 	assert!(err.contains("neither HEAD nor the working tree has -p c"), "{err}");
+}
+
+#[cfg(target_env = "gnu")]
+#[test]
+fn detects_c11_threads_and_uncounted_or_late_workers() {
+	let dir = scratch("thread-watch");
+	let repo = dir.join("repo");
+	std::fs::create_dir_all(repo.join("benches")).unwrap();
+	let harness = Path::new(env!("CARGO_MANIFEST_DIR")).join("../swole");
+	std::fs::write(
+		repo.join("Cargo.toml"),
+		format!(
+			"[package]\nname = \"threads\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n\
+			 [dev-dependencies]\nswole = {{ path = {harness:?} }}\n\n[[bench]]\nname = \"workers\"\nharness = false\n"
+		),
+	)
+	.unwrap();
+	std::fs::copy(
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+		repo.join("Cargo.lock"),
+	)
+	.unwrap();
+	std::fs::write(
+		repo.join("benches/workers.rs"),
+		r#"use std::ffi::{c_int, c_void};
+use std::sync::atomic::{AtomicU64, Ordering};
+use swole::bench;
+
+unsafe extern "C" {
+	fn thrd_create(thr: *mut u64, func: extern "C" fn(*mut c_void) -> c_int, arg: *mut c_void) -> c_int;
+	fn thrd_join(thr: u64, res: *mut c_int) -> c_int;
+}
+
+extern "C" fn noop(_: *mut c_void) -> c_int { 0 }
+
+#[bench]
+fn c11_worker() {
+	let mut thr = 0u64;
+	let mut res = 0;
+	unsafe {
+		assert_eq!(thrd_create(&mut thr, noop, std::ptr::null_mut()), 0);
+		assert_eq!(thrd_join(thr, &mut res), 0);
+	}
+}
+
+/// Spawns and immediately joins a short-lived worker only on the 10th call. Each call sleeps 2ms
+/// so bench calibration settles on 1 iteration (meaning the counter process runs only 3 calls and
+/// never reaches call 10, while timed samples run at least 12 calls and must catch the worker via
+/// the thread-start counter even though it exits before the sample ends).
+#[bench]
+fn late_worker() -> u64 {
+	static CALLS: AtomicU64 = AtomicU64::new(0);
+	if CALLS.fetch_add(1, Ordering::Relaxed) == 10 {
+		std::thread::spawn(|| {}).join().unwrap();
+	}
+	std::thread::sleep(std::time::Duration::from_millis(2));
+	std::hint::black_box(1)
+}
+
+fn main() { swole::main(); }
+"#,
+	)
+	.unwrap();
+
+	let run_swole = |args: &[&str]| {
+		Command::new(env!("CARGO_BIN_EXE_swole"))
+			.args(args)
+			.current_dir(&repo)
+			.env("XDG_CACHE_HOME", dir.join("cache"))
+			.env("CARGO_TARGET_DIR", dir.join("target"))
+			.env("CARGO_NET_OFFLINE", "true")
+			.output()
+			.unwrap()
+	};
+
+	let list = dir.join("c11");
+	std::fs::write(&list, "benches/workers.rs::c11_worker\n").unwrap();
+	let out = run_swole(&["quick", "--benchmarks", list.to_str().unwrap()]);
+	let err = String::from_utf8_lossy(&out.stderr);
+	assert!(!out.status.success(), "{err}");
+	if err.contains("quick counts with perf counters, and") {
+		return;
+	}
+	assert!(
+		err.contains("benches/workers.rs::c11_worker: another thread ran beside a counted call"),
+		"{err}"
+	);
+
+	let late = dir.join("late");
+	std::fs::write(&late, "benches/workers.rs::late_worker\n").unwrap();
+	let report_path = dir.join("report.json");
+	let out = run_swole(&[
+		"bench",
+		"--benchmarks",
+		late.to_str().unwrap(),
+		"--report",
+		report_path.to_str().unwrap(),
+	]);
+	let err = String::from_utf8_lossy(&out.stderr);
+	assert!(out.status.success(), "{err}");
+	let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+	let host = report["host"].as_array().unwrap();
+	assert!(
+		host.iter().any(|line| line
+			.as_str()
+			.is_some_and(|line| line.starts_with("libc: ") && line.contains("build-id "))),
+		"{host:?}"
+	);
+	let entry = &report["benchmarks"]["benches/workers.rs::late_worker"];
+	assert_eq!(entry["threaded"], true, "{entry}");
+	assert!(entry["head"].get("instructions:u").is_none(), "{entry}");
 }

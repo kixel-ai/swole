@@ -55,12 +55,11 @@ fn times(sample: &Value, measure: &str) -> Vec<(String, f64)> {
 		.collect()
 }
 
-#[test]
-fn times_each_harness_benchmark() {
-	let dir = scratch("time-alone");
-	let out = Command::new(env!("CARGO_BIN_EXE_swole"))
-		.args(["time", "--out"])
-		.arg(dir.join("metrics.json"))
+/// swole run in this workspace with `args` on the harness's fixture benchmark target.
+fn fixture(args: &[&std::ffi::OsStr]) -> Output {
+	Command::new(env!("CARGO_BIN_EXE_swole"))
+		.arg("bench")
+		.args(args)
 		.args(["--", "-p", "swole", "--bench", "fixture"])
 		.current_dir(env!("CARGO_MANIFEST_DIR"))
 		// The target directory the count tests build the fixture in, apart from this test's own.
@@ -69,20 +68,36 @@ fn times_each_harness_benchmark() {
 			Path::new(env!("CARGO_TARGET_TMPDIR")).join("harness"),
 		)
 		.output()
-		.unwrap();
+		.unwrap()
+}
+
+/// The fixture's benchmarks that run another thread, which perf counters read in user space
+/// cannot count.
+const THREADED: [&str; 3] = ["handed", "spawned[100000]", "spawned[1000]"];
+
+#[test]
+fn times_each_harness_benchmark() {
+	let dir = scratch("time-alone");
+	let file = "crates/swole/benches/fixture.rs::";
+	let out = fixture(&[
+		"--out".as_ref(),
+		dir.join("metrics.json").as_os_str(),
+		"--report".as_ref(),
+		dir.join("report.json").as_os_str(),
+	]);
 	succeeded(&out);
 	let (measure, metrics) = read(&dir.join("metrics.json"));
 	let samples = metrics["samples"].as_array().unwrap();
 	assert_eq!(samples.len(), 1);
 	assert!(samples[0].get("commit").is_none());
 	let times = times(&samples[0], &measure);
-	let file = "crates/swole/benches/fixture.rs::";
 	let names: Vec<&str> = times.iter().map(|(name, _)| name.strip_prefix(file).unwrap()).collect();
 	assert_eq!(
 		names,
 		[
 			"alone",
 			"borrowed",
+			"dropped",
 			"generic[4000]",
 			"handed",
 			"inner::nested[a]",
@@ -90,6 +105,7 @@ fn times_each_harness_benchmark() {
 			"sized[1000]",
 			"sized[2000]",
 			"sized[4000]",
+			"slept",
 			"spawned[100000]",
 			"spawned[1000]",
 			"stepped",
@@ -104,7 +120,68 @@ fn times_each_harness_benchmark() {
 	assert!(time("unstable[8000]") > 2.0 * time("unstable[1000]"), "{times:?}");
 	let table = String::from_utf8(out.stdout).unwrap();
 	assert!(table.starts_with("| benchmark | time |\n"), "{table}");
-	assert_eq!(table.lines().count(), 2 + names.len(), "{table}");
+	assert_eq!(
+		table.lines().take_while(|line| !line.is_empty()).count(),
+		2 + names.len(),
+		"{table}"
+	);
+	// Beside each time, what the process used over its samples on any host, and where the host
+	// has perf counters, each one's share of a call.
+	let report: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("report.json")).unwrap()).unwrap();
+	assert_eq!(report["mode"], "bench");
+	assert!(measure.contains(report["fingerprint"].as_str().unwrap()), "{measure}");
+	let head = |name: &str| report["benchmarks"][format!("{file}{name}")]["head"].clone();
+	for name in &names {
+		let head = head(name);
+		assert_eq!(head["time"]["unit"], "ns", "{name}: {head}");
+		assert!(head["max RSS"]["value"].as_f64().unwrap() > 0.0, "{name}: {head}");
+		assert!(head["user time"].is_object(), "{name}: {head}");
+	}
+	let host: Vec<&str> = report["host"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.map(|line| line.as_str().unwrap())
+		.collect();
+	if host.iter().any(|line| line.starts_with("perf: tier")) {
+		// A benchmark beside which another thread ran keeps its time, but no counters, which read
+		// the calling thread alone, and the note under the table names it.
+		for name in THREADED {
+			let head = head(name);
+			assert!(head.get("instructions:u").is_none(), "{name}: {head}");
+			assert_eq!(report["benchmarks"][format!("{file}{name}")]["threaded"], true);
+		}
+		assert!(table.contains(&format!(
+			"\nOther threads ran beside {}, so bench left out their perf counters",
+			THREADED.map(|name| format!("{file}{name}")).join(", ")
+		)));
+		// A call of `alone` spins a thousand times, some four thousand instructions, as Valgrind
+		// counts it, and as many calls of a counter pass share them.
+		let instructions = head("alone")["instructions:u"]["value"].as_f64().unwrap();
+		assert!((3600.0..4400.0).contains(&instructions), "{instructions}");
+		let unstable = head("unstable[8000]")["instructions:u"]["value"].as_f64().unwrap();
+		assert!(
+			(7.5..8.5).contains(&(unstable / instructions)),
+			"{unstable} {instructions}"
+		);
+		assert!(head("alone")["IPC:u"]["value"].as_f64().unwrap() > 0.0);
+		// A drop to run after each call changes nothing counted: each count, of each side,
+		// starts and stops around every call alike.
+		let alone = head("alone")["instructions:u"]["value"].as_f64().unwrap();
+		let dropped = head("dropped")["instructions:u"]["value"].as_f64().unwrap();
+		assert!((dropped - alone).abs() < 16.0, "{dropped} {alone}");
+		// The counters are read in user space, so a count holds none of the kernel's work to
+		// start and stop them, some 18,000 instructions a call: only interrupts', a few a call.
+		// A benchmark that times itself counts as one called each time does, but for the
+		// reads' own fixed few dozen instructions a call.
+		if let Some(kernel) = head("alone")["instructions:k"]["value"].as_f64() {
+			assert!(kernel < 1000.0, "{kernel}");
+			let timed = head("timed")["instructions:u"]["value"].as_f64().unwrap();
+			assert!((alone - timed).abs() < 300.0, "{alone} {timed}");
+		}
+	} else {
+		assert!(head("alone").get("instructions:u").is_none());
+	}
 }
 
 /// A benchmark target spinning `work` times in `work`, a thousand in `same`, and with `extra`,
@@ -172,7 +249,7 @@ fn pairs_a_base_commit_with_the_working_tree() {
 	std::fs::write(repo.join("benches/spin.rs"), spins(2000, "new")).unwrap();
 
 	let out = Command::new(env!("CARGO_BIN_EXE_swole"))
-		.args(["time", "HEAD", "--out", "metrics.json"])
+		.args(["bench", "HEAD", "--out", "metrics.json"])
 		.current_dir(&repo)
 		// The base's worktree, outside the scratch repository, and one target directory both
 		// sides share, so the harness builds once.
@@ -287,7 +364,7 @@ fn times_a_selection_only_one_side_has() {
 	package(&repo, "b", "y");
 	let time = |cargo: &[&str]| {
 		Command::new(env!("CARGO_BIN_EXE_swole"))
-			.args(["time", "HEAD", "--"])
+			.args(["bench", "HEAD", "--"])
 			.args(cargo)
 			.current_dir(&repo)
 			.env("XDG_CACHE_HOME", dir.join("cache"))
@@ -302,7 +379,9 @@ fn times_a_selection_only_one_side_has() {
 	assert!(out.status.success(), "{err}");
 	assert!(err.contains("HEAD has no -p b"), "{err}");
 	assert!(err.contains("HEAD has no --bench y"), "{err}");
-	let table = String::from_utf8(out.stdout).unwrap();
+	let stdout = String::from_utf8(out.stdout).unwrap();
+	// The times' table, before what else each benchmark measured.
+	let table = stdout.split("\n\n").next().unwrap();
 	// Each package's three benchmarks, `b`'s only at the head.
 	assert_eq!(table.lines().count(), 2 + 6, "{table}");
 	for row in table.lines().skip(2) {
@@ -321,7 +400,8 @@ fn times_a_selection_only_one_side_has() {
 		err.contains("HEAD has nothing the cargo args select, so times none"),
 		"{err}"
 	);
-	let table = String::from_utf8(out.stdout).unwrap();
+	let stdout = String::from_utf8(out.stdout).unwrap();
+	let table = stdout.split("\n\n").next().unwrap();
 	assert_eq!(table.matches("| added |").count(), 3, "{table}");
 	assert_eq!(table.lines().count(), 2 + 3, "{table}");
 
