@@ -51,7 +51,7 @@ impl IntoIterator for Iterations {
 const COUNTERS: &str = "SWOLE_COUNTERS";
 
 /// The variable that, beside `SWOLE_COUNTERS`, has the benchmark called this many times, each
-/// call counted, after one uncounted call, rather than once.
+/// call counted, after the uncounted calls bench warms it up with, rather than once.
 const ITERATIONS: &str = "SWOLE_ITERATIONS";
 
 /// What a count with perf counters prints before each counter's value, in the order swole opened
@@ -137,10 +137,22 @@ fn run() -> Result<(), String> {
 	for (name, case) in cases {
 		let meter = __private::Meter::new(&name, counters.take(), watched)?;
 		let mut sampler = (case.build)();
-		// Counted as bench times it: after a first call that waits out its setup, uncounted.
 		if warm.is_some() {
+			// Counted as bench times it: after the samples that warm it up, uncounted, one call
+			// that waits out its setup, then batches doubled from one up to the iterations.
 			sampler.time(1);
+			let mut batch = 1;
+			loop {
+				sampler.time(batch);
+				if batch >= iterations {
+					break;
+				}
+				batch *= 2;
+			}
 		}
+		// The floor follows the threads setup and warming started, whose inherited counters
+		// each start and stop enables and disables.
+		meter.calibrate().map_err(|err| format!("{name}: {err}"))?;
 		sampler.count(&meter, iterations);
 		drop(sampler);
 		let watch = meter.finish().map_err(|err| format!("{name}: {err}"))?;
@@ -379,6 +391,15 @@ pub mod __private {
 				})
 			});
 			Ok(Self { name, counters, watch })
+		}
+
+		/// Finds the counters' floor, once the case is set up.
+		pub(crate) fn calibrate(&self) -> Result<(), String> {
+			#[cfg(target_os = "linux")]
+			if let Some(counters) = &self.counters {
+				return counters.calibrate();
+			}
+			Ok(())
 		}
 
 		/// Zeroes the counts and starts counting.

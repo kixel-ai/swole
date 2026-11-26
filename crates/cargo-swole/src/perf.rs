@@ -725,8 +725,7 @@ pub fn drop_ambient() -> Result<(), String> {
 pub fn helper() -> Result<std::path::PathBuf, String> {
 	let exe = std::env::current_exe().map_err(|e| format!("cannot locate swole itself: {e}"))?;
 	#[cfg(target_os = "linux")]
-	// SAFETY: getauxval reads the auxiliary vector alone.
-	if unsafe { getauxval(AT_SECURE) } != 0 {
+	if secure(&exe) {
 		let companion = exe.with_file_name("cargo-swole");
 		if !companion.is_file() {
 			return Err(format!(
@@ -738,6 +737,22 @@ pub fn helper() -> Result<std::path::PathBuf, String> {
 		return Ok(companion);
 	}
 	Ok(exe)
+}
+
+/// Whether Valgrind would refuse `exe` and glibc strip what a runner records: it ran in secure
+/// mode, or carries file capabilities the kernel ignored, as on a `nosuid` mount.
+#[cfg(target_os = "linux")]
+fn secure(exe: &std::path::Path) -> bool {
+	use std::os::unix::ffi::OsStrExt;
+	// SAFETY: getauxval reads the auxiliary vector alone.
+	if unsafe { getauxval(AT_SECURE) } != 0 {
+		return true;
+	}
+	let Ok(path) = std::ffi::CString::new(exe.as_os_str().as_bytes()) else {
+		return false;
+	};
+	// SAFETY: both names are C strings, and a null buffer of no size only asks the length.
+	unsafe { getxattr(path.as_ptr(), c"security.capability".as_ptr(), std::ptr::null_mut(), 0) >= 0 }
 }
 
 /// Whether this process holds `CAP_PERFMON` or `CAP_SYS_ADMIN`, by its effective set.
@@ -846,6 +861,12 @@ mod sys {
 		pub fn ioctl(fd: i32, request: u64, ...) -> i32;
 		pub fn prctl(option: i32, ...) -> i32;
 		pub fn getauxval(kind: u64) -> u64;
+		pub fn getxattr(
+			path: *const std::ffi::c_char,
+			name: *const std::ffi::c_char,
+			value: *mut std::ffi::c_void,
+			size: usize,
+		) -> isize;
 		pub fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
 		pub fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
 		pub fn personality(persona: u64) -> i32;

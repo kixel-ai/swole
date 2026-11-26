@@ -607,11 +607,18 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 				break;
 			}
 			let more = run(&again, &work.join((round + 1).to_string()), &preload, parallel, counter)?;
+			// Each round counts again exactly what the first did, so every median is of SAMPLES.
+			let mut names: Vec<&String> = more.iter().flatten().map(|found| &found.name).collect();
+			names.sort_unstable();
+			if !names.iter().copied().eq(repeated.iter()) {
+				return Err(format!(
+					"count {} of the benchmarks sim repeats measured {names:?}, not {:?}",
+					round + 1,
+					repeated
+				));
+			}
 			for found in more.iter().flatten() {
-				// A watched benchmark that ran alone in its first count keeps that one count.
-				if repeated.contains(&found.name) {
-					samples.entry(found.name.clone()).or_default().push(found.count);
-				}
+				samples.entry(found.name.clone()).or_default().push(found.count);
 			}
 		}
 	}

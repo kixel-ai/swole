@@ -10,10 +10,10 @@ use std::os::fd::{FromRawFd, OwnedFd};
 pub struct Counters {
 	fds: Vec<OwnedFd>,
 	/// Each counter's value once calibrated, which a case's count starts from.
-	base: Vec<u64>,
+	base: std::cell::RefCell<Vec<u64>>,
 	/// The least each counter took over an empty start and stop: the tails of the two `prctl`s
 	/// inside the window, which a case's count leaves out once per start.
-	floor: Vec<u64>,
+	floor: std::cell::RefCell<Vec<u64>>,
 	starts: std::cell::Cell<u64>,
 }
 
@@ -52,9 +52,21 @@ impl Counters {
 			.into_iter()
 			.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
 			.collect();
-		let values = || fds.iter().map(read).collect::<Result<Vec<u64>, String>>();
+		Ok(Self {
+			fds,
+			base: Default::default(),
+			floor: Default::default(),
+			starts: std::cell::Cell::new(0),
+		})
+	}
+
+	/// Finds each counter's floor, the least of several empty starts and stops, and counts
+	/// from here: run once the case is set up, since each start and stop also enables and
+	/// disables the counters every thread started since inherited.
+	pub fn calibrate(&self) -> Result<(), String> {
+		let values = || self.fds.iter().map(read).collect::<Result<Vec<u64>, String>>();
 		let mut base = values()?;
-		let mut floor = vec![u64::MAX; fds.len()];
+		let mut floor = vec![u64::MAX; self.fds.len()];
 		for _ in 0..CALIBRATIONS {
 			prctl(PR_TASK_PERF_EVENTS_ENABLE);
 			prctl(PR_TASK_PERF_EVENTS_DISABLE);
@@ -64,12 +76,10 @@ impl Counters {
 			}
 			base = now;
 		}
-		Ok(Self {
-			fds,
-			base,
-			floor,
-			starts: std::cell::Cell::new(0),
-		})
+		*self.base.borrow_mut() = base;
+		*self.floor.borrow_mut() = floor;
+		self.starts.set(0);
+		Ok(())
 	}
 
 	/// Starts every counter at once: the thread that opened them, which became this process's
@@ -90,10 +100,14 @@ impl Counters {
 	/// that did not count the whole time it was enabled.
 	pub fn read(&self) -> Result<Vec<u64>, String> {
 		let starts = self.starts.get();
+		let (base, floor) = (self.base.borrow(), self.floor.borrow());
+		if base.len() != self.fds.len() {
+			return Err("the perf counters were read before they were calibrated".to_owned());
+		}
 		self.fds
 			.iter()
-			.zip(&self.base)
-			.zip(&self.floor)
+			.zip(base.iter())
+			.zip(floor.iter())
 			.map(|((fd, base), floor)| Ok((read(fd)? - base).saturating_sub(starts * floor)))
 			.collect()
 	}
