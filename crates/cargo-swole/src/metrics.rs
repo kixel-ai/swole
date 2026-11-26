@@ -202,8 +202,13 @@ pub fn report(counts: &Counts, base: Option<&Counts>, counter: &Counter, sha: Op
 		if let Some(head) = point(counts, name) {
 			entry.insert("head".to_owned(), head);
 		}
+		// Known only where a side saw another thread, or every side watched: a count sampled but
+		// never seen threaded is one swole could not watch.
 		let threaded = counts.threaded.contains(name) || base.is_some_and(|base| base.threaded.contains(name));
-		entry.insert("threaded".to_owned(), threaded.into());
+		let unwatched = |side: &Counts| side.spread.contains_key(name) && !side.threaded.contains(name);
+		if threaded || !(unwatched(counts) || base.is_some_and(unwatched)) {
+			entry.insert("threaded".to_owned(), threaded.into());
+		}
 		benchmarks.insert(name.clone(), entry);
 	}
 	Report::new(counter.mode(), &counts.fingerprint, &counter.host, sha, benchmarks)

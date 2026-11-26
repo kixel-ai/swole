@@ -614,11 +614,19 @@ pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 			if values.len() != counters {
 				return Err(malformed());
 			}
+			// A harness that counts says whether another thread ran, unless a line the benchmark
+			// printed without a newline swallowed it, which must not pass for none having run.
+			let threaded = *threads.get(name).ok_or_else(|| {
+				format!(
+					"a harness target counted {name} but said neither {THREADED}nor {ALONE}of it: a line the benchmark \
+					 printed without a newline ran into it"
+				)
+			})?;
 			readings.push(Reading {
 				name: name.to_owned(),
 				values,
 				usage: usage.take(),
-				threaded: threads.get(name) == Some(&true),
+				threaded,
 			});
 		}
 	}
@@ -1108,7 +1116,7 @@ mod tests {
 
 	#[test]
 	fn reads_what_a_harness_counted() {
-		let out = "swole threaded a.rs::g\nswole rusage 1 2 3 4 5 6 7\nswole counted 4096 9 a.rs::f[1 2]\n\
+		let out = "swole threaded a.rs::g\nswole alone a.rs::f[1 2]\nswole rusage 1 2 3 4 5 6 7\nswole counted 4096 9 a.rs::f[1 2]\n\
 		           swole ran a.rs::f[1 2]\nown output\nswole counted 12 0 a.rs::g\n";
 		let usage = Usage {
 			user_ns: 1,
@@ -1136,6 +1144,8 @@ mod tests {
 				}
 			]
 		);
+		// A thread record a fragment without a newline swallowed is no record.
+		assert!(readings("own outputswole threaded a.rs::f\nswole counted 1 2 a.rs::f\n", 2).is_err());
 		assert!(readings("swole counted 1 a.rs::f\n", 2).is_err());
 		assert!(readings("swole counted x 1 a.rs::f\n", 2).is_err());
 		assert!(readings("swole counted 1 2\n", 2).is_err());
