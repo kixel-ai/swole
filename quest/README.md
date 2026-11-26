@@ -6,8 +6,6 @@
 
 Non-goals: per-benchmark configuration knobs; delaying `moq`'s and `rind`'s CodSpeed removal; randomized stack/env layout across paired samples (Mytkowicz/Stabilizer) and a macOS `kpc` privileged helper (dropped until a consumer hits them; macOS gets paired wall-clock, `rusage`, and `preload` heap allocation counters).
 
-What stays here once every child has merged: `swole`'s top-level README and docs covering all three modes, capability tiers, and counter definitions.
-
 ## Plan
 
 Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):

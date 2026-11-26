@@ -10,9 +10,11 @@ Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
 - ✅ Include L0 uncore/RAPL and L-1 tracepoint/IBS-PEBS metrics in the `swole` epic. Our Linux hosts run with `perf_event_paranoid = -1` (or `CAP_PERFMON`), and `moq`'s async/contention and memory-bound benchmarks directly benefit from off-CPU wait time, lock contention, memory bandwidth, energy, and native per-function attribution.
 
+Afk choice 2026-11-26 ([kixel-ai/swole#6](https://github.com/kixel-ai/swole/pull/6), coordinator recommendation for the maintainer to confirm): ✅ require exclusive-cores and take a whole-socket lease for the uncore/RAPL pass (rejected: report socket-wide counts on shared hosts, which breaks failing untrusted counts; drop uncore/RAPL).
+
 Recommendations for the implementer:
 
-- **L0 uncore & energy** (active only when the host exposes L0 and the benchmark runs with exclusive/unshared measurement, since uncore and RAPL counters are socket/package-wide):
+- **L0 uncore & energy** (active only when the host exposes L0 and the pass holds a whole-socket lease through [exclusive cores](/quest/m0/exclusive-cores.md)' lease mechanism, since uncore and RAPL counters are socket/package-wide; a pass that cannot take the lease fails the run rather than reporting socket-wide counts on a shared host):
   - Probe `/sys/bus/event_source/devices/` for `power` / `power_core` (RAPL `energy-pkg`, `energy-cores` with their `*.scale` and `*.unit` sysfs files) and uncore memory/L3 PMUs (`amd_l3`, `amd_df`, `amd_umc_*` on AMD; `uncore_imc_*` on Intel), failing loudly if a probed sysfs event cannot open.
   - Report energy in joules (or microjoules) per iteration and memory bandwidth / L3 misses per benchmark.
 - **L-1 off-CPU & contention**:
@@ -23,6 +25,7 @@ Recommendations for the implementer:
 
 ## Required
 
+- [Exclusive pinned cores for bench mode](/quest/m0/exclusive-cores.md) - its lease mechanism grants the whole-socket lease the uncore/RAPL pass needs
 - [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - builds on the setup capability probe and multi-pass perf collector
 
 ## Hosts
