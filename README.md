@@ -175,10 +175,15 @@ counters it reads follow what the host lets swole count. So `quick` and `bench` 
 architecture, the CPU's model as `/proc/cpuinfo` or macOS's `machdep.cpu.brand_string` names
 it, how many CPUs the run may use, and everything the [capability probe](#capabilities) finds:
 `kernel.perf_event_paranoid`, whether swole holds `CAP_PERFMON`, the PMUs the kernel lists, the
-core PMU and its counters, and the passes the probe packed them into; on Linux, the libc loaded
-by the benchmark processes (refusing runs that mix different libc builds) and `GLIBC_TUNABLES`,
-which pick glibc's string and memory routines; and for `quick`, the preload. `swole fingerprint quick` and `swole fingerprint bench` print each label, then its
-inputs on stderr.
+core PMU and its counters, and the passes the probe packed them into; on Linux, the mapped libc
+image (by ELF build ID) loaded by the benchmark processes (refusing runs that mix libc builds or
+leave a process's libc unverified) and `GLIBC_TUNABLES`, which pick glibc's string and memory
+routines; and for `quick`, the preload. `swole fingerprint quick` and `swole fingerprint bench`
+run a standalone host probe using the runner's own libc, printing that probe's label and inputs
+on stderr; when a workspace's benchmark targets load a different libc (such as a Nix-packaged
+runner running benchmarks built in a project dev shell), `quick` and `bench` fingerprint the
+benchmark's mapped libc instead, so look up a measurement series by the fingerprint printed by
+the run or recorded in `--out` / `--report`.
 
 Valgrind 3.27.1 on x86_64 presents one fixed Intel CPU, not the host's: an AMD Ryzen 9 9950X
 reads `GenuineIntel` family 6 model 0x3c, Haswell, through it. So hosts that support the

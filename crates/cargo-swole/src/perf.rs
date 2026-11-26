@@ -1196,7 +1196,7 @@ mod tests {
 
 	#[test]
 	fn reads_what_a_harness_counted() {
-		let out = "swole libc glibc-2.44 /lib/libc.so.6\nswole threaded a.rs::g\nswole alone a.rs::f[1 2]\nswole rusage 1 2 3 4 5 6 7\nswole counted 4096 9 a.rs::f[1 2]\n\
+		let out = "swole libc glibc 2.44 (build-id 133180439d23)\nswole threaded a.rs::g\nswole alone a.rs::f[1 2]\nswole rusage 1 2 3 4 5 6 7\nswole counted 4096 9 a.rs::f[1 2]\n\
 		           swole ran a.rs::f[1 2]\nown output\nswole calls 3 a.rs::g\nswole counted 12 0 a.rs::g\n";
 		let usage = Usage {
 			user_ns: 1,
@@ -1216,7 +1216,7 @@ mod tests {
 					calls: None,
 					usage: Some(usage),
 					threaded: false,
-					libc: Some("glibc-2.44 /lib/libc.so.6".to_owned()),
+					libc: Some("glibc 2.44 (build-id 133180439d23)".to_owned()),
 				},
 				Reading {
 					name: "a.rs::g".to_owned(),
@@ -1224,7 +1224,7 @@ mod tests {
 					calls: Some(3),
 					usage: None,
 					threaded: true,
-					libc: Some("glibc-2.44 /lib/libc.so.6".to_owned()),
+					libc: Some("glibc 2.44 (build-id 133180439d23)".to_owned()),
 				}
 			]
 		);

@@ -187,7 +187,7 @@ fn run() -> Result<(), String> {
 			};
 			writeln!(out, "{line}").map_err(|e| format!("cannot write to stdout: {e}"))
 		};
-		if counting && let Some(libc) = libc() {
+		if counting && let Some(libc) = libc()? {
 			record(format_args!("{LIBC}{libc}"))?;
 		}
 		match watch.threaded {
@@ -252,12 +252,12 @@ fn threads() -> Result<usize, String> {
 	Ok(1)
 }
 
-/// The loaded libc of this benchmark process on Linux.
-fn libc() -> Option<String> {
+/// The mapped libc identity of this benchmark process on Linux.
+fn libc() -> Result<Option<String>, String> {
 	#[cfg(target_os = "linux")]
-	return perf::libc();
+	return perf::libc().map(Some);
 	#[cfg(not(target_os = "linux"))]
-	None
+	Ok(None)
 }
 
 /// Elsewhere swole opens no perf counters.
@@ -314,7 +314,7 @@ fn serve(
 		let used = "";
 		let libc_line = if watch_threads && !reported_libc {
 			reported_libc = true;
-			libc().map_or_else(String::new, |libc| format!("\n{LIBC}{libc}"))
+			libc()?.map_or_else(String::new, |libc| format!("\n{LIBC}{libc}"))
 		} else {
 			String::new()
 		};

@@ -771,20 +771,18 @@ fn c11_worker() {
 	}
 }
 
-/// Spawns and immediately joins a short-lived worker only on the 10th call, so timed samples
-/// beyond the counter pass's replayed batch still catch it via the thread-start counter even
-/// though the worker exits before the sample ends.
+/// Spawns and immediately joins a short-lived worker only on the 10th call. Each call sleeps 2ms
+/// so bench calibration settles on 1 iteration (meaning the counter process runs only 3 calls and
+/// never reaches call 10, while timed samples run at least 12 calls and must catch the worker via
+/// the thread-start counter even though it exits before the sample ends).
 #[bench]
 fn late_worker() -> u64 {
 	static CALLS: AtomicU64 = AtomicU64::new(0);
 	if CALLS.fetch_add(1, Ordering::Relaxed) == 10 {
 		std::thread::spawn(|| {}).join().unwrap();
 	}
-	let mut sum = 0u64;
-	for i in 0..100_000u64 {
-		sum = std::hint::black_box(sum.wrapping_add(i));
-	}
-	sum
+	std::thread::sleep(std::time::Duration::from_millis(2));
+	std::hint::black_box(1)
 }
 
 fn main() { swole::main(); }
@@ -831,8 +829,9 @@ fn main() { swole::main(); }
 	let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
 	let host = report["host"].as_array().unwrap();
 	assert!(
-		host.iter()
-			.any(|line| line.as_str().is_some_and(|line| line.starts_with("libc: "))),
+		host.iter().any(|line| line
+			.as_str()
+			.is_some_and(|line| line.starts_with("libc: ") && line.contains("build-id "))),
 		"{host:?}"
 	);
 	let entry = &report["benchmarks"]["benches/workers.rs::late_worker"];

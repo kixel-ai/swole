@@ -396,65 +396,191 @@ pub fn threads() -> Result<usize, String> {
 	Ok(tasks.count())
 }
 
-/// The libc loaded by this benchmark process, as `<tag> <canonical-path>` (e.g.
-/// `glibc-2.44 /nix/store/.../libc.so.6` or `- /lib/ld-musl-x86_64.so.1`) or `static` when
-/// statically linked, so the runner fingerprints the benchmark's own libc rather than the runner's.
-pub fn libc() -> Option<String> {
-	use std::os::unix::ffi::OsStrExt;
+/// The mapped libc identity of this benchmark process, read directly from its in-memory ELF
+/// `NT_GNU_BUILD_ID` note (e.g. `glibc 2.44 (build-id 133180439d...)` or `build-id ...`), or
+/// `static` when `getpid` is statically linked into the benchmark executable itself. Fails if the
+/// mapped libc image cannot be identified reliably.
+pub fn libc() -> Result<String, String> {
+	use std::ffi::{CStr, c_char, c_int, c_void};
+	use std::fmt::Write as _;
+
+	#[cfg(target_pointer_width = "64")]
 	#[repr(C)]
-	struct DlInfo {
-		dli_fname: *const std::ffi::c_char,
-		dli_fbase: *mut std::ffi::c_void,
-		dli_sname: *const std::ffi::c_char,
-		dli_saddr: *mut std::ffi::c_void,
+	struct Phdr {
+		p_type: u32,
+		p_flags: u32,
+		p_offset: u64,
+		p_vaddr: u64,
+		p_paddr: u64,
+		p_filesz: u64,
+		p_memsz: u64,
+		p_align: u64,
+	}
+	#[cfg(target_pointer_width = "32")]
+	#[repr(C)]
+	struct Phdr {
+		p_type: u32,
+		p_offset: u32,
+		p_vaddr: u32,
+		p_paddr: u32,
+		p_filesz: u32,
+		p_memsz: u32,
+		p_flags: u32,
+		p_align: u32,
+	}
+	#[repr(C)]
+	struct DlPhdrInfo {
+		dlpi_addr: usize,
+		dlpi_name: *const c_char,
+		dlpi_phdr: *const Phdr,
+		dlpi_phnum: u16,
 	}
 	unsafe extern "C" {
 		fn getpid() -> i32;
-		fn dladdr(addr: *const std::ffi::c_void, info: *mut DlInfo) -> i32;
+		fn dl_iterate_phdr(
+			callback: unsafe extern "C" fn(*mut DlPhdrInfo, usize, *mut c_void) -> c_int,
+			data: *mut c_void,
+		) -> c_int;
 	}
-	let empty = || DlInfo {
-		dli_fname: std::ptr::null(),
-		dli_fbase: std::ptr::null_mut(),
-		dli_sname: std::ptr::null(),
-		dli_saddr: std::ptr::null_mut(),
-	};
-	let mut pid_info = empty();
-	let mut own_info = empty();
-	// SAFETY: `getpid` and `libc` are valid code addresses; both structs are writable.
-	let pid_ok = unsafe { dladdr(getpid as *const std::ffi::c_void, &mut pid_info) };
-	let own_ok = unsafe { dladdr(libc as *const std::ffi::c_void, &mut own_info) };
-	if pid_ok == 0 || pid_info.dli_fname.is_null() || (own_ok != 0 && pid_info.dli_fbase == own_info.dli_fbase) {
-		return Some("static".to_owned());
+
+	const PT_LOAD: u32 = 1;
+	const PT_NOTE: u32 = 4;
+	const NT_GNU_BUILD_ID: u32 = 3;
+
+	fn align_up(value: usize, align: usize) -> Option<usize> {
+		let mask = align.checked_sub(1)?;
+		value.checked_add(mask).map(|v| v & !mask)
 	}
-	// SAFETY: `dladdr` sets `dli_fname` to a NUL-terminated path when non-null.
-	let fname = unsafe { std::ffi::CStr::from_ptr(pid_info.dli_fname) };
-	if fname.to_bytes().is_empty() {
-		return Some("static".to_owned());
+
+	struct State {
+		target: usize,
+		own: usize,
+		result: Option<Result<String, &'static str>>,
 	}
-	let path = std::path::Path::new(std::ffi::OsStr::from_bytes(fname.to_bytes()));
-	let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-	let path = canonical.to_str().filter(|p| !p.contains(['\n', '\r']))?;
-	// SAFETY: `gnu_get_libc_version` is looked up dynamically so non-glibc builds still link.
-	let ver_sym = unsafe { dlsym(RTLD_DEFAULT, c"gnu_get_libc_version".as_ptr()) };
-	let tag = if !ver_sym.is_null() {
-		// SAFETY: glibc defines `gnu_get_libc_version() -> *const c_char`.
-		let ver_fn: unsafe extern "C" fn() -> *const std::ffi::c_char = unsafe { std::mem::transmute(ver_sym) };
-		let ptr = unsafe { ver_fn() };
-		if ptr.is_null() {
-			"-".to_owned()
-		} else {
-			// SAFETY: `gnu_get_libc_version` returns a static NUL-terminated string.
-			let ver = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy();
-			if ver.is_empty() || ver.chars().any(char::is_whitespace) {
-				"-".to_owned()
-			} else {
-				format!("glibc-{ver}")
+
+	unsafe extern "C" fn visit(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> c_int {
+		// SAFETY: `dl_iterate_phdr` passes valid `info` and our `State` pointer.
+		let info = unsafe { &*info };
+		let state = unsafe { &mut *(data as *mut State) };
+		if info.dlpi_phdr.is_null() || info.dlpi_phnum == 0 {
+			return 0;
+		}
+		// SAFETY: `dlpi_phdr` points to `dlpi_phnum` ELF program headers.
+		let phdrs = unsafe { std::slice::from_raw_parts(info.dlpi_phdr, usize::from(info.dlpi_phnum)) };
+		let contains = |addr: usize| {
+			phdrs.iter().any(|p| {
+				if p.p_type != PT_LOAD || p.p_memsz == 0 {
+					return false;
+				}
+				let start = info.dlpi_addr.wrapping_add(p.p_vaddr as usize);
+				let end = start.saturating_add(p.p_memsz as usize);
+				addr >= start && addr < end
+			})
+		};
+		if !contains(state.target) {
+			return 0;
+		}
+		if contains(state.own) {
+			state.result = Some(Ok("static".to_owned()));
+			return 1;
+		}
+		for p in phdrs {
+			if p.p_type != PT_NOTE || p.p_memsz < 12 {
+				continue;
+			}
+			let note_vaddr = p.p_vaddr as usize;
+			let note_len = p.p_memsz as usize;
+			let Some(note_end_vaddr) = note_vaddr.checked_add(note_len) else {
+				continue;
+			};
+			let mapped = phdrs.iter().any(|load| {
+				load.p_type == PT_LOAD
+					&& note_vaddr >= load.p_vaddr as usize
+					&& note_end_vaddr <= (load.p_vaddr as usize).saturating_add(load.p_memsz as usize)
+			});
+			if !mapped {
+				continue;
+			}
+			let note_ptr = info.dlpi_addr.wrapping_add(note_vaddr) as *const u8;
+			if note_ptr.is_null() {
+				continue;
+			}
+			// SAFETY: the `PT_NOTE` segment lies within a mapped `PT_LOAD` segment of this loaded image.
+			let bytes = unsafe { std::slice::from_raw_parts(note_ptr, note_len) };
+			let align = if p.p_align == 8 { 8usize } else { 4usize };
+			let mut offset = 0usize;
+			while let Some(header) = bytes.get(offset..offset + 12) {
+				let namesz = u32::from_ne_bytes(header[0..4].try_into().expect("4 bytes")) as usize;
+				let descsz = u32::from_ne_bytes(header[4..8].try_into().expect("4 bytes")) as usize;
+				let ntype = u32::from_ne_bytes(header[8..12].try_into().expect("4 bytes"));
+				let Some(name_start) = offset.checked_add(12) else {
+					break;
+				};
+				let Some(name_end) = name_start.checked_add(namesz) else {
+					break;
+				};
+				let Some(desc_start) = align_up(name_end, align) else {
+					break;
+				};
+				let Some(desc_end) = desc_start.checked_add(descsz) else {
+					break;
+				};
+				if desc_end > bytes.len() {
+					break;
+				}
+				if ntype == NT_GNU_BUILD_ID && &bytes[name_start..name_end] == b"GNU\0" && descsz > 0 {
+					let mut hex = String::with_capacity(descsz * 2);
+					for &byte in &bytes[desc_start..desc_end] {
+						let _ = write!(hex, "{byte:02x}");
+					}
+					state.result = Some(Ok(format!("build-id {hex}")));
+					return 1;
+				}
+				let Some(next) = align_up(desc_end, align) else {
+					break;
+				};
+				if next <= offset {
+					break;
+				}
+				offset = next;
 			}
 		}
-	} else {
-		"-".to_owned()
+		state.result = Some(Err("mapped libc image has no GNU build ID"));
+		1
+	}
+
+	let mut state = State {
+		target: getpid as *const () as usize,
+		own: libc as *const () as usize,
+		result: None,
 	};
-	Some(format!("{tag} {path}"))
+	// SAFETY: `visit` reads only valid program headers and writes into `state`.
+	unsafe {
+		dl_iterate_phdr(visit, (&mut state as *mut State).cast());
+	}
+	let id = match state.result {
+		Some(Ok(id)) => id,
+		Some(Err(why)) => return Err(format!("cannot identify mapped libc: {why}")),
+		None => return Err("cannot identify mapped libc: getpid not found in any loaded image".to_owned()),
+	};
+	if id == "static" {
+		return Ok(id);
+	}
+	// SAFETY: `gnu_get_libc_version` is looked up dynamically so non-glibc builds still link.
+	let ver_sym = unsafe { dlsym(RTLD_DEFAULT, c"gnu_get_libc_version".as_ptr()) };
+	if !ver_sym.is_null() {
+		// SAFETY: glibc defines `gnu_get_libc_version() -> *const c_char`.
+		let ver_fn: unsafe extern "C" fn() -> *const c_char = unsafe { std::mem::transmute(ver_sym) };
+		let ptr = unsafe { ver_fn() };
+		if !ptr.is_null() {
+			// SAFETY: `gnu_get_libc_version` returns a static NUL-terminated string.
+			let ver = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+			if !ver.is_empty() && !ver.chars().any(char::is_whitespace) {
+				return Ok(format!("glibc {ver} ({id})"));
+			}
+		}
+	}
+	Ok(id)
 }
 
 const RTLD_LAZY: i32 = 1;

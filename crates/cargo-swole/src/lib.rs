@@ -167,6 +167,12 @@ fn cli(args: &[String]) -> Result<(), String> {
 					}
 					println!("{}", native.label());
 					eprint!("{}", native.describe());
+					if cfg!(target_os = "linux") {
+						eprintln!(
+							"note: host probe uses swole's own libc; quick and bench fingerprint each benchmark's \
+							 mapped libc"
+						);
+					}
 				}
 			}
 			Ok(())
@@ -601,9 +607,13 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 	let first = run(&all, &work.join("1"), &preload, parallel, counter)?;
 	let mut counts = Counts::none(counter);
 	if let CounterKind::Perf { native, .. } = &counter.kind
-		&& let Some(bench_libc) =
-			fingerprint::single_libc(first.iter().flatten().filter_map(|found| found.libc.as_deref()))?
-	{
+		&& let Some(bench_libc) = fingerprint::require_single_libc(
+			first
+				.iter()
+				.flatten()
+				.map(|found| (found.name.as_str(), found.libc.as_deref())),
+			true,
+		)? {
 		let resolved = native.with_libc(Some(bench_libc));
 		counts.fingerprint = resolved.label();
 		counts.host = resolved.describe();
@@ -960,7 +970,7 @@ pub(crate) fn environment(
 fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf::Pass]) -> Measured {
 	let label = &job.label;
 	let mut values = Vec::new();
-	let mut libcs = BTreeSet::new();
+	let mut libcs: Vec<(String, Option<String>)> = Vec::new();
 	let mut first: Option<perf::Reading> = None;
 	for (i, pass) in passes.iter().enumerate() {
 		let dir = dir.join(format!("pass-{}", i + 1));
@@ -1005,9 +1015,12 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 				));
 			}
 		};
-		if let Some(raw) = &reading.libc {
-			libcs.insert(fingerprint::libc_from_record(raw)?);
-		}
+		let verified = reading
+			.libc
+			.as_deref()
+			.map(fingerprint::validate_libc_record)
+			.transpose()?;
+		libcs.push((label.clone(), verified));
 		values.push(reading.values.clone());
 		match &mut first {
 			Some(first) => first.threaded |= reading.threaded,
@@ -1022,7 +1035,10 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 			first.name
 		));
 	}
-	let libc = fingerprint::single_libc(libcs.iter().map(String::as_str))?;
+	let libc = fingerprint::require_single_libc(
+		libcs.iter().map(|(label, libc)| (label.as_str(), libc.as_deref())),
+		true,
+	)?;
 	let values: Vec<(Vec<u64>, u64)> = values.into_iter().map(|values| (values, 1)).collect();
 	let mut details = perf::measures(passes, &values);
 	let count = details

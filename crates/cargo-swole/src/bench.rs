@@ -147,8 +147,9 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	// Whether another thread ran beside each benchmark, where every side was watched or one
 	// was seen threaded.
 	let mut seen = BTreeMap::new();
-	// Distinct libc identities reported by benchmark processes across the run.
-	let mut libcs = BTreeSet::new();
+	// Mapped libc identity reported by every benchmark process across the run, verifying none is
+	// missing (on Linux) and all agree on one libc build.
+	let mut libcs: Vec<(String, Option<String>)> = Vec::new();
 	let total = names.len();
 	for (index, name) in names.into_iter().enumerate() {
 		let started = Instant::now();
@@ -163,8 +164,8 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				let (iterations, pairs) = paired(&mut base, &mut head, &mut coin)?;
 				let base_threaded = base.threaded || pairs.iter().any(|(b, _)| b.threaded);
 				let head_threaded = head.threaded || pairs.iter().any(|(_, h)| h.threaded);
-				libcs.extend(base.libc.take());
-				libcs.extend(head.libc.take());
+				libcs.push((format!("{name} (base)"), base.libc.take()));
+				libcs.push((format!("{name} (head)"), head.libc.take()));
 				base.finish()?;
 				head.finish()?;
 				let nanos: Vec<(u64, u64)> = pairs.iter().map(|(b, h)| (b.nanos, h.nanos)).collect();
@@ -187,7 +188,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				let mut process = Process::spawn(job, pmu, preload.as_deref(), &dir.join(side.name()))?;
 				let (iterations, samples) = alone(&mut process)?;
 				let side_threaded = process.threaded || samples.iter().any(|sample| sample.threaded);
-				libcs.extend(process.libc.take());
+				libcs.push((name.clone(), process.libc.take()));
 				process.finish()?;
 				let nanos: Vec<u64> = samples.iter().map(|sample| sample.nanos).collect();
 				let timed = Times::alone(side, iterations, &nanos).map_err(|err| format!("{name}: {err}"))?;
@@ -218,7 +219,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				match (perf, &preload) {
 					(Some(perf), Some(preload)) => {
 						let (counted, count_libc) = count(job, perf, preload, iterations, &dir.join(side.name()))?;
-						libcs.extend(count_libc);
+						libcs.push((format!("{name} ({} counters)", side.name()), count_libc));
 						match counted {
 							Counted::Measures(measures) => measures,
 							Counted::Threaded => {
@@ -259,7 +260,10 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	}
 	// Every process exited cleanly, so the run's output is no longer evidence.
 	std::fs::remove_dir_all(&work).map_err(|e| format!("cannot remove {}: {e}", work.display()))?;
-	let native = match crate::fingerprint::single_libc(libcs.iter().map(String::as_str))? {
+	let native = match crate::fingerprint::require_single_libc(
+		libcs.iter().map(|(label, libc)| (label.as_str(), libc.as_deref())),
+		cfg!(target_os = "linux"),
+	)? {
 		Some(bench_libc) => native.with_libc(Some(bench_libc)),
 		None => native,
 	};
@@ -322,7 +326,7 @@ fn count(
 	dir: &Path,
 ) -> Result<(Counted, Option<String>), String> {
 	let mut values = Vec::new();
-	let mut libcs = BTreeSet::new();
+	let mut libcs: Vec<(String, Option<String>)> = Vec::new();
 	for (i, pass) in perf.passes.iter().enumerate() {
 		let dir = dir.join(format!("pass-{}", i + 1));
 		std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -363,11 +367,17 @@ fn count(
 				return Ok((Counted::Unwatched, None));
 			}
 			[reading] => {
-				if let Some(raw) = &reading.libc {
-					libcs.insert(crate::fingerprint::libc_from_record(raw)?);
-				}
+				let verified = reading
+					.libc
+					.as_deref()
+					.map(crate::fingerprint::validate_libc_record)
+					.transpose()?;
+				libcs.push((job.label.clone(), verified));
 				if reading.threaded {
-					let libc = crate::fingerprint::single_libc(libcs.iter().map(String::as_str))?;
+					let libc = crate::fingerprint::require_single_libc(
+						libcs.iter().map(|(label, libc)| (label.as_str(), libc.as_deref())),
+						cfg!(target_os = "linux"),
+					)?;
 					return Ok((Counted::Threaded, libc));
 				}
 				// Over the calls the harness counted (stratified over the sample's iterations), or
@@ -383,7 +393,10 @@ fn count(
 			}
 		}
 	}
-	let libc = crate::fingerprint::single_libc(libcs.iter().map(String::as_str))?;
+	let libc = crate::fingerprint::require_single_libc(
+		libcs.iter().map(|(label, libc)| (label.as_str(), libc.as_deref())),
+		cfg!(target_os = "linux"),
+	)?;
 	Ok((Counted::Measures(perf::measures(&perf.passes, &values)), libc))
 }
 
@@ -927,7 +940,7 @@ impl Side for Process {
 				let raw =
 					std::str::from_utf8(raw).map_err(|_| format!("{}: printed a non-UTF-8 libc record", self.label))?;
 				let resolved =
-					crate::fingerprint::libc_from_record(raw).map_err(|err| format!("{}: {err}", self.label))?;
+					crate::fingerprint::validate_libc_record(raw).map_err(|err| format!("{}: {err}", self.label))?;
 				if let Some(existing) = &self.libc
 					&& existing != &resolved
 				{

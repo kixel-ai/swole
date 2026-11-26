@@ -153,58 +153,187 @@ GLIBC_TUNABLES: {}
 	}
 }
 
-/// The loaded libc on Linux, by version (when glibc) and a hash of its library bytes, so native
-/// counts never collide across different libc builds on the same CPU.
+/// The mapped libc on Linux, read directly from its in-memory ELF `NT_GNU_BUILD_ID` note (plus
+/// `gnu_get_libc_version()` when on glibc), so counts never collide across different libc builds
+/// or race with on-disk package updates.
 #[cfg(target_os = "linux")]
 fn libc() -> Result<Option<String>, String> {
+	use std::ffi::{CStr, c_char, c_int, c_void};
+	use std::fmt::Write as _;
+
+	#[cfg(target_pointer_width = "64")]
 	#[repr(C)]
-	struct DlInfo {
-		dli_fname: *const std::ffi::c_char,
-		dli_fbase: *mut std::ffi::c_void,
-		dli_sname: *const std::ffi::c_char,
-		dli_saddr: *mut std::ffi::c_void,
+	struct Phdr {
+		p_type: u32,
+		p_flags: u32,
+		p_offset: u64,
+		p_vaddr: u64,
+		p_paddr: u64,
+		p_filesz: u64,
+		p_memsz: u64,
+		p_align: u64,
+	}
+	#[cfg(target_pointer_width = "32")]
+	#[repr(C)]
+	struct Phdr {
+		p_type: u32,
+		p_offset: u32,
+		p_vaddr: u32,
+		p_paddr: u32,
+		p_filesz: u32,
+		p_memsz: u32,
+		p_flags: u32,
+		p_align: u32,
+	}
+	#[repr(C)]
+	struct DlPhdrInfo {
+		dlpi_addr: usize,
+		dlpi_name: *const c_char,
+		dlpi_phdr: *const Phdr,
+		dlpi_phnum: u16,
 	}
 	unsafe extern "C" {
 		fn getpid() -> i32;
-		fn dladdr(addr: *const std::ffi::c_void, info: *mut DlInfo) -> i32;
+		fn dl_iterate_phdr(
+			callback: unsafe extern "C" fn(*mut DlPhdrInfo, usize, *mut c_void) -> c_int,
+			data: *mut c_void,
+		) -> c_int;
 		#[cfg(target_env = "gnu")]
-		fn gnu_get_libc_version() -> *const std::ffi::c_char;
+		fn gnu_get_libc_version() -> *const c_char;
 	}
-	let mut info = DlInfo {
-		dli_fname: std::ptr::null(),
-		dli_fbase: std::ptr::null_mut(),
-		dli_sname: std::ptr::null(),
-		dli_saddr: std::ptr::null_mut(),
+
+	const PT_LOAD: u32 = 1;
+	const PT_NOTE: u32 = 4;
+	const NT_GNU_BUILD_ID: u32 = 3;
+
+	fn align_up(value: usize, align: usize) -> Option<usize> {
+		let mask = align.checked_sub(1)?;
+		value.checked_add(mask).map(|v| v & !mask)
+	}
+
+	struct State {
+		target: usize,
+		own: usize,
+		result: Option<Result<String, &'static str>>,
+	}
+
+	unsafe extern "C" fn visit(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> c_int {
+		// SAFETY: `dl_iterate_phdr` passes valid `info` and our `State` pointer.
+		let info = unsafe { &*info };
+		let state = unsafe { &mut *(data as *mut State) };
+		if info.dlpi_phdr.is_null() || info.dlpi_phnum == 0 {
+			return 0;
+		}
+		// SAFETY: `dlpi_phdr` points to `dlpi_phnum` ELF program headers.
+		let phdrs = unsafe { std::slice::from_raw_parts(info.dlpi_phdr, usize::from(info.dlpi_phnum)) };
+		let contains = |addr: usize| {
+			phdrs.iter().any(|p| {
+				if p.p_type != PT_LOAD || p.p_memsz == 0 {
+					return false;
+				}
+				let start = info.dlpi_addr.wrapping_add(p.p_vaddr as usize);
+				let end = start.saturating_add(p.p_memsz as usize);
+				addr >= start && addr < end
+			})
+		};
+		if !contains(state.target) {
+			return 0;
+		}
+		if contains(state.own) {
+			state.result = Some(Ok("static".to_owned()));
+			return 1;
+		}
+		for p in phdrs {
+			if p.p_type != PT_NOTE || p.p_memsz < 12 {
+				continue;
+			}
+			let note_vaddr = p.p_vaddr as usize;
+			let note_len = p.p_memsz as usize;
+			let Some(note_end_vaddr) = note_vaddr.checked_add(note_len) else {
+				continue;
+			};
+			let mapped = phdrs.iter().any(|load| {
+				load.p_type == PT_LOAD
+					&& note_vaddr >= load.p_vaddr as usize
+					&& note_end_vaddr <= (load.p_vaddr as usize).saturating_add(load.p_memsz as usize)
+			});
+			if !mapped {
+				continue;
+			}
+			let note_ptr = info.dlpi_addr.wrapping_add(note_vaddr) as *const u8;
+			if note_ptr.is_null() {
+				continue;
+			}
+			// SAFETY: the `PT_NOTE` segment lies within a mapped `PT_LOAD` segment of this loaded image.
+			let bytes = unsafe { std::slice::from_raw_parts(note_ptr, note_len) };
+			let align = if p.p_align == 8 { 8usize } else { 4usize };
+			let mut offset = 0usize;
+			while let Some(header) = bytes.get(offset..offset + 12) {
+				let namesz = u32::from_ne_bytes(header[0..4].try_into().expect("4 bytes")) as usize;
+				let descsz = u32::from_ne_bytes(header[4..8].try_into().expect("4 bytes")) as usize;
+				let ntype = u32::from_ne_bytes(header[8..12].try_into().expect("4 bytes"));
+				let Some(name_start) = offset.checked_add(12) else {
+					break;
+				};
+				let Some(name_end) = name_start.checked_add(namesz) else {
+					break;
+				};
+				let Some(desc_start) = align_up(name_end, align) else {
+					break;
+				};
+				let Some(desc_end) = desc_start.checked_add(descsz) else {
+					break;
+				};
+				if desc_end > bytes.len() {
+					break;
+				}
+				if ntype == NT_GNU_BUILD_ID && &bytes[name_start..name_end] == b"GNU\0" && descsz > 0 {
+					let mut hex = String::with_capacity(descsz * 2);
+					for &byte in &bytes[desc_start..desc_end] {
+						let _ = write!(hex, "{byte:02x}");
+					}
+					state.result = Some(Ok(format!("build-id {hex}")));
+					return 1;
+				}
+				let Some(next) = align_up(desc_end, align) else {
+					break;
+				};
+				if next <= offset {
+					break;
+				}
+				offset = next;
+			}
+		}
+		state.result = Some(Err("mapped libc image has no GNU build ID"));
+		1
+	}
+
+	let mut state = State {
+		target: getpid as *const () as usize,
+		own: libc as *const () as usize,
+		result: None,
 	};
-	// SAFETY: `getpid` is a valid code address in libc; `info` is writable.
-	let ok = unsafe { dladdr(getpid as *const std::ffi::c_void, &mut info) };
-	let digest = if ok != 0 && !info.dli_fname.is_null() {
-		// SAFETY: `dladdr` sets `dli_fname` to a NUL-terminated path when non-null.
-		let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
-		let path = std::path::Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
-			path.to_bytes(),
-		));
-		let bytes = std::fs::read(path).map_err(|e| format!("cannot read libc {}: {e}", path.display()))?;
-		let mut hash = Fnv::default();
-		hash.bytes(&bytes);
-		Some(format!("{:012x}", hash.0 >> 16))
-	} else {
-		None
+	// SAFETY: `visit` reads only valid program headers and writes into `state`.
+	unsafe {
+		dl_iterate_phdr(visit, (&mut state as *mut State).cast());
+	}
+	let id = match state.result {
+		Some(Ok(id)) => id,
+		Some(Err(why)) => return Err(format!("cannot identify mapped libc: {why}")),
+		None => return Err("cannot identify mapped libc: getpid not found in any loaded image".to_owned()),
 	};
+	if id == "static" {
+		return Ok(Some(id));
+	}
 	#[cfg(target_env = "gnu")]
-	let version = {
+	{
 		// SAFETY: `gnu_get_libc_version` returns a static NUL-terminated string.
-		let ver = unsafe { std::ffi::CStr::from_ptr(gnu_get_libc_version()) };
-		Some(format!("glibc {}", ver.to_string_lossy()))
-	};
-	#[cfg(not(target_env = "gnu"))]
-	let version: Option<String> = None;
-	Ok(match (version, digest) {
-		(Some(version), Some(digest)) => Some(format!("{version} ({digest})")),
-		(Some(version), None) => Some(version),
-		(None, Some(digest)) => Some(digest),
-		(None, None) => None,
-	})
+		let ver = unsafe { CStr::from_ptr(gnu_get_libc_version()) }.to_string_lossy();
+		if !ver.is_empty() && !ver.chars().any(char::is_whitespace) {
+			return Ok(Some(format!("glibc {ver} ({id})")));
+		}
+	}
+	Ok(Some(id))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -212,59 +341,51 @@ fn libc() -> Result<Option<String>, String> {
 	Ok(None)
 }
 
-/// Resolves a benchmark process's `swole libc <record>` line to its formatted libc identity
-/// (e.g. `glibc 2.44 (8e1894f1a26c)` or `static`), hashing the library file once per path.
-pub fn libc_from_record(record: &str) -> Result<String, String> {
+/// Validates a benchmark process's `swole libc <record>` identity read from its mapped ELF image:
+/// `static`, `build-id <hex>`, or `glibc <version> (build-id <hex>)`.
+pub fn validate_libc_record(record: &str) -> Result<String, String> {
+	let is_hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
 	if record == "static" {
-		return Ok("static".to_owned());
+		return Ok(record.to_owned());
 	}
-	let Some((tag, path)) = record
-		.split_once(' ')
-		.filter(|(tag, path)| !tag.is_empty() && !path.is_empty())
-	else {
-		return Err(format!("a harness target printed malformed libc record {record:?}"));
-	};
-	let digest = hash_file(std::path::Path::new(path))?;
-	if let Some(version) = tag.strip_prefix("glibc-") {
-		Ok(format!("glibc {version} ({digest})"))
-	} else if tag == "-" {
-		Ok(digest)
-	} else {
-		Ok(format!("{tag} ({digest})"))
+	if let Some(hex) = record.strip_prefix("build-id ")
+		&& is_hex(hex)
+	{
+		return Ok(record.to_owned());
 	}
+	if let Some(rest) = record.strip_prefix("glibc ")
+		&& let Some((version, tail)) = rest.split_once(" (build-id ")
+		&& let Some(hex) = tail.strip_suffix(')')
+		&& !version.is_empty()
+		&& !version.chars().any(char::is_whitespace)
+		&& is_hex(hex)
+	{
+		return Ok(record.to_owned());
+	}
+	Err(format!("a harness target printed malformed libc identity {record:?}"))
 }
 
-/// FNV-1a digest of the file at `path`, cached by `(path, len, mtime)` so a suite of many
-/// benchmarks hashes the shared `libc.so.6` once per run.
-fn hash_file(path: &std::path::Path) -> Result<String, String> {
-	use std::collections::HashMap;
-	use std::path::PathBuf;
-	use std::sync::{Mutex, OnceLock};
-	use std::time::SystemTime;
-
-	type Key = (PathBuf, u64, Option<SystemTime>);
-	static CACHE: OnceLock<Mutex<HashMap<Key, String>>> = OnceLock::new();
-	let meta = std::fs::metadata(path).map_err(|e| format!("cannot stat libc {}: {e}", path.display()))?;
-	let key: Key = (path.to_path_buf(), meta.len(), meta.modified().ok());
-	let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-	if let Some(digest) = cache.lock().expect("libc cache lock is never poisoned").get(&key) {
-		return Ok(digest.clone());
+/// Validates that every benchmark process reported a verified mapped libc identity (when required,
+/// i.e. on Linux) and that all reported identities match a single libc build.
+pub fn require_single_libc<'a>(
+	seen: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+	required: bool,
+) -> Result<Option<String>, String> {
+	let mut unique = std::collections::BTreeSet::new();
+	for (label, libc) in seen {
+		match libc {
+			Some(libc) => {
+				unique.insert(libc);
+			}
+			None if required => {
+				return Err(format!(
+					"{label} did not report its mapped libc identity (its swole harness may predate libc verification), \
+					 so swole cannot verify its fingerprint"
+				));
+			}
+			None => {}
+		}
 	}
-	let bytes = std::fs::read(path).map_err(|e| format!("cannot read libc {}: {e}", path.display()))?;
-	let mut hash = Fnv::default();
-	hash.bytes(&bytes);
-	let digest = format!("{:012x}", hash.0 >> 16);
-	cache
-		.lock()
-		.expect("libc cache lock is never poisoned")
-		.insert(key, digest.clone());
-	Ok(digest)
-}
-
-/// Validates that all observed benchmark libc identities agree on one libc build, returning it
-/// when at least one was reported, or failing when benchmarks loaded different libc builds.
-pub fn single_libc<'a>(seen: impl IntoIterator<Item = &'a str>) -> Result<Option<String>, String> {
-	let unique: std::collections::BTreeSet<&str> = seen.into_iter().collect();
 	match unique.len() {
 		0 => Ok(None),
 		1 => Ok(unique.into_iter().next().map(str::to_owned)),
@@ -454,41 +575,43 @@ mod tests {
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn native_fingerprint_includes_loaded_libc() {
-		let found = libc().unwrap();
-		assert!(found.is_some(), "expected loaded libc on Linux");
+		let found = libc().unwrap().expect("expected mapped libc on Linux");
+		assert!(found.contains("build-id ") || found == "static", "{found}");
 		let mut a = Native::probe(crate::Mode::Bench).unwrap();
 		let mut b = Native::probe(crate::Mode::Bench).unwrap();
-		a.libc = Some("glibc 2.39 (000000000001)".to_owned());
-		b.libc = Some("glibc 2.40 (000000000002)".to_owned());
+		a.libc = Some("glibc 2.39 (build-id 000000000001)".to_owned());
+		b.libc = Some("glibc 2.40 (build-id 000000000002)".to_owned());
 		assert_ne!(a.label(), b.label());
 	}
 
 	#[test]
-	fn libc_from_record_hashes_benchmark_libc_and_rejects_mixed_builds() {
-		let exe = std::env::current_exe().unwrap();
-		let dir = exe.with_file_name(format!("swole-libc-test-{}", std::process::id()));
-		std::fs::create_dir_all(&dir).unwrap();
-		let a_path = dir.join("libc-a.so");
-		let b_path = dir.join("libc-b.so");
-		std::fs::write(&a_path, b"fake libc build A").unwrap();
-		std::fs::write(&b_path, b"fake libc build B").unwrap();
+	fn validates_mapped_libc_and_rejects_missing_or_mixed_builds() {
+		let a = validate_libc_record("glibc 2.43 (build-id aabbccdd0011)").unwrap();
+		let b = validate_libc_record("glibc 2.44 (build-id 112233445566)").unwrap();
+		assert_eq!(validate_libc_record("build-id deadbeef").unwrap(), "build-id deadbeef");
+		assert_eq!(validate_libc_record("static").unwrap(), "static");
+		assert!(validate_libc_record("malformed").is_err());
+		assert!(validate_libc_record("glibc 2.44 (build-id nothex!)").is_err());
+		assert!(validate_libc_record("build-id ").is_err());
 
-		let a = libc_from_record(&format!("glibc-2.43 {}", a_path.display())).unwrap();
-		let b = libc_from_record(&format!("glibc-2.44 {}", b_path.display())).unwrap();
-		assert!(a.starts_with("glibc 2.43 ("), "{a}");
-		assert!(b.starts_with("glibc 2.44 ("), "{b}");
-		assert_ne!(a, b);
-		assert_eq!(libc_from_record("static").unwrap(), "static");
-		assert!(libc_from_record("malformed").is_err());
-
-		assert_eq!(single_libc([a.as_str(), a.as_str()]).unwrap(), Some(a.clone()));
-		assert_eq!(single_libc(std::iter::empty::<&str>()).unwrap(), None);
-		let err = single_libc([a.as_str(), b.as_str()]).unwrap_err();
-		assert!(err.contains("different libc builds"), "{err}");
+		assert_eq!(
+			require_single_libc([("x", Some(a.as_str())), ("y", Some(a.as_str()))], true).unwrap(),
+			Some(a.clone())
+		);
+		assert_eq!(
+			require_single_libc(std::iter::empty::<(&str, Option<&str>)>(), true).unwrap(),
+			None
+		);
+		// Missing libc identity is rejected when verification is required (Linux).
+		let missing = require_single_libc([("old", None), ("new", Some(a.as_str()))], true).unwrap_err();
+		assert!(missing.contains("did not report its mapped libc identity"), "{missing}");
+		// Missing libc identity is ignored off Linux.
+		assert_eq!(require_single_libc([("mac", None)], false).unwrap(), None);
+		// Mixed libc builds are rejected.
+		let mixed = require_single_libc([("x", Some(a.as_str())), ("y", Some(b.as_str()))], true).unwrap_err();
+		assert!(mixed.contains("different libc builds"), "{mixed}");
 
 		let base = Native::probe(crate::Mode::Bench).unwrap();
 		assert_ne!(base.with_libc(Some(a)).label(), base.with_libc(Some(b)).label());
-
-		std::fs::remove_dir_all(&dir).unwrap();
 	}
 }
