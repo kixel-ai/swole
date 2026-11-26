@@ -37,11 +37,12 @@ fn dropped() -> (u64, Dropped) {
 	(spin(1000), Dropped)
 }
 
-/// Counts as `alone` does, but for the sleep's own work: the thread leaves the CPU mid-call,
-/// and its counters with it.
+/// Counts as `alone` does, but for the sleep's own work and a line it leaves unfinished, which
+/// the harness's records follow: the thread leaves the CPU mid-call, and its counters with it.
 #[bench]
 fn slept() -> u64 {
 	std::thread::sleep(Duration::from_millis(1));
+	print!("slept");
 	spin(1000)
 }
 

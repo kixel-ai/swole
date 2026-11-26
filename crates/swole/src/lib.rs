@@ -157,9 +157,11 @@ fn run() -> Result<(), String> {
 		sampler.count(&meter, iterations);
 		drop(sampler);
 		let watch = meter.finish().map_err(|err| format!("{name}: {err}"))?;
+		// On a fresh line, as a benchmark's own output may not have ended one, and the rest
+		// follow it.
 		match watch.threaded {
-			Some(true) => println!("{THREADED}{name}"),
-			Some(false) => println!("{ALONE}{name}"),
+			Some(true) => println!("\n{THREADED}{name}"),
+			Some(false) => println!("\n{ALONE}{name}"),
 			None => {}
 		}
 		if let Some(usage) = watch.usage {

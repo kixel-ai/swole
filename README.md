@@ -252,6 +252,10 @@ rather than be scaled up: another user of the host's counters multiplexed it, or
 the PMU's cores. The kernel maps no page for a counter a process's threads inherit, so a benchmark
 beside which the process had another thread fails `quick`, naming it, since `sim` counts every
 thread, and keeps only its time in `bench`. Run under Valgrind, the same benchmark counts within those few dozen instructions.
+Each hardware interrupt that lands during a call, such as the timer's tick, adds an instruction
+and a branch to its count, as x86's counters count the return to user space, so a call longer
+than the tick repeats only within a few instructions: a 10 ms loop counted 2 to 7 over its
+40,000,092 on an Intel Core Ultra 7 270K Plus at `CONFIG_HZ=1000`.
 
 ## Capabilities
 
