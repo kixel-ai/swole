@@ -150,9 +150,6 @@ fn run() -> Result<(), String> {
 				batch *= 2;
 			}
 		}
-		// The floor follows the threads setup and warming started, whose inherited counters
-		// each start and stop enables and disables.
-		meter.calibrate().map_err(|err| format!("{name}: {err}"))?;
 		sampler.count(&meter, iterations);
 		drop(sampler);
 		let watch = meter.finish().map_err(|err| format!("{name}: {err}"))?;
@@ -391,15 +388,6 @@ pub mod __private {
 				})
 			});
 			Ok(Self { name, counters, watch })
-		}
-
-		/// Finds the counters' floor, once the case is set up.
-		pub(crate) fn calibrate(&self) -> Result<(), String> {
-			#[cfg(target_os = "linux")]
-			if let Some(counters) = &self.counters {
-				return counters.calibrate();
-			}
-			Ok(())
 		}
 
 		/// Zeroes the counts and starts counting.

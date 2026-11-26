@@ -157,8 +157,7 @@ thread: one there when its call started or ended, or, under swole's preload, one
 With `SWOLE_COUNTERS` set to how many Linux perf counters swole opened on the process before it
 ran the target, it starts them all after the case's setup and stops them after its call, on
 every thread, then prints a `swole rusage` line of what the process used over the call and
-`swole counted <value>... <name>`, each counter's value in the order swole opened them, less
-the least an empty start and stop counted after setup, once for each start, before
+`swole counted <value>... <name>`, each counter's value in the order swole opened them, before
 `swole ran <name>`. The benchmark itself needs no privilege: swole opens the counters with its
 own. With `SWOLE_ITERATIONS` as well, it first replays the uncounted calls `swole bench` warms
 it up with before timing, one call and then batches doubled from one up to that many, then calls

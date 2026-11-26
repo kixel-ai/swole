@@ -9,12 +9,6 @@ use std::os::fd::{FromRawFd, OwnedFd};
 /// descriptors: each takes the lowest free one.
 pub struct Counters {
 	fds: Vec<OwnedFd>,
-	/// Each counter's value once calibrated, which a case's count starts from.
-	base: std::cell::RefCell<Vec<u64>>,
-	/// The least each counter took over an empty start and stop: the tails of the two `prctl`s
-	/// inside the window, which a case's count leaves out once per start.
-	floor: std::cell::RefCell<Vec<u64>>,
-	starts: std::cell::Cell<u64>,
 }
 
 impl Counters {
@@ -46,47 +40,20 @@ impl Counters {
 				found.len()
 			));
 		}
-		// SAFETY: each is an open perf event descriptor nothing else in the process owns:
-		// swole opened it before the process started, for the harness alone.
-		let fds: Vec<OwnedFd> = found
-			.into_iter()
-			.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-			.collect();
 		Ok(Self {
-			fds,
-			base: Default::default(),
-			floor: Default::default(),
-			starts: std::cell::Cell::new(0),
+			// SAFETY: each is an open perf event descriptor nothing else in the process owns:
+			// swole opened it before the process started, for the harness alone.
+			fds: found
+				.into_iter()
+				.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+				.collect(),
 		})
-	}
-
-	/// Finds each counter's floor, the least of several empty starts and stops, and counts
-	/// from here: run once the case is set up, since each start and stop also enables and
-	/// disables the counters every thread started since inherited.
-	pub fn calibrate(&self) -> Result<(), String> {
-		let values = || self.fds.iter().map(read).collect::<Result<Vec<u64>, String>>();
-		let mut base = values()?;
-		let mut floor = vec![u64::MAX; self.fds.len()];
-		for _ in 0..CALIBRATIONS {
-			prctl(PR_TASK_PERF_EVENTS_ENABLE);
-			prctl(PR_TASK_PERF_EVENTS_DISABLE);
-			let now = values()?;
-			for ((floor, now), base) in floor.iter_mut().zip(&now).zip(&base) {
-				*floor = (*floor).min(now - base);
-			}
-			base = now;
-		}
-		*self.base.borrow_mut() = base;
-		*self.floor.borrow_mut() = floor;
-		self.starts.set(0);
-		Ok(())
 	}
 
 	/// Starts every counter at once: the thread that opened them, which became this process's
 	/// main thread, owns them, so one `prctl` starts them all, on every thread.
 	#[inline(always)]
 	pub fn start(&self) {
-		self.starts.set(self.starts.get() + 1);
 		prctl(PR_TASK_PERF_EVENTS_ENABLE);
 	}
 
@@ -96,20 +63,9 @@ impl Counters {
 		prctl(PR_TASK_PERF_EVENTS_DISABLE);
 	}
 
-	/// What each counter counted since calibrating, less its floor for each start, refusing one
-	/// that did not count the whole time it was enabled.
+	/// Each counter's value, refusing one that did not count the whole time it was enabled.
 	pub fn read(&self) -> Result<Vec<u64>, String> {
-		let starts = self.starts.get();
-		let (base, floor) = (self.base.borrow(), self.floor.borrow());
-		if base.len() != self.fds.len() {
-			return Err("the perf counters were read before they were calibrated".to_owned());
-		}
-		self.fds
-			.iter()
-			.zip(base.iter())
-			.zip(floor.iter())
-			.map(|((fd, base), floor)| Ok((read(fd)? - base).saturating_sub(starts * floor)))
-			.collect()
+		self.fds.iter().map(read).collect()
 	}
 }
 
@@ -160,8 +116,6 @@ pub fn threads() -> Result<usize, String> {
 	Ok(tasks.count())
 }
 
-/// How many empty starts and stops find each counter's floor, the least of their counts.
-const CALIBRATIONS: usize = 8;
 const RTLD_LAZY: i32 = 1;
 const RTLD_NOLOAD: i32 = 4;
 const RTLD_DEFAULT: *mut std::ffi::c_void = std::ptr::null_mut();

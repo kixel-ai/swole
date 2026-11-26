@@ -269,6 +269,9 @@ what each job gets; the native [fingerprint](#fingerprints) holds all of it.
   `cpu-migrations`.
 - Tier L1, `perf_event_paranoid` at most 1 or `CAP_PERFMON`: each hardware counter in the kernel
   as well (`:k` beside `:u`), so a syscall's or `io_uring`'s cost shows apart from user space's.
+  A count, `:u` or `:k`, includes the tail of the system calls that start and stop counting, a
+  fixed cost each time counting starts, which cancels between a base and a head on one
+  fingerprint.
   `quick` counts user space alone at any tier.
 - No tier, above 2 without `CAP_PERFMON`, or a host without a PMU, or macOS: `bench` times by
   wall clock with rusage alone, saying why, and `quick` fails.

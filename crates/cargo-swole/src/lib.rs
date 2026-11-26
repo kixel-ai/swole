@@ -589,33 +589,41 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 		// Under Valgrind, a job beside whose benchmarks other threads ran counts again, its
 		// samples' spread standing for what the scheduler moves. So does one whose threads
 		// swole cannot see: CodSpeed's, and a program's, whose harness no `SWOLE_BENCH` watches.
-		let mut repeated: BTreeSet<String> = counts.threaded.clone();
-		let again: Vec<&Job> = jobs
+		// Each job repeated, with the names its first round measured.
+		let again: Vec<(&Job, Vec<&String>)> = jobs
 			.iter()
 			.zip(&first)
-			.filter(|(job, found)| {
-				let unwatched = job.codspeed || job.expect.is_none();
-				if unwatched {
-					repeated.extend(found.iter().map(|found| found.name.clone()));
-				}
-				unwatched || found.iter().any(|found| found.threaded)
+			.filter(|(job, found)| job.codspeed || job.expect.is_none() || found.iter().any(|found| found.threaded))
+			.map(|(job, found)| {
+				let mut names: Vec<&String> = found.iter().map(|found| &found.name).collect();
+				names.sort_unstable();
+				(job, names)
 			})
-			.map(|(job, _)| job)
 			.collect();
+		let repeated: Vec<&Job> = again.iter().map(|(job, _)| *job).collect();
 		for round in 1..SAMPLES {
-			if again.is_empty() {
+			if repeated.is_empty() {
 				break;
 			}
-			let more = run(&again, &work.join((round + 1).to_string()), &preload, parallel, counter)?;
-			// Each round counts again exactly what the first did, so every median is of SAMPLES.
-			let mut names: Vec<&String> = more.iter().flatten().map(|found| &found.name).collect();
-			names.sort_unstable();
-			if !names.iter().copied().eq(repeated.iter()) {
-				return Err(format!(
-					"count {} of the benchmarks sim repeats measured {names:?}, not {:?}",
-					round + 1,
-					repeated
-				));
+			let more = run(
+				&repeated,
+				&work.join((round + 1).to_string()),
+				&preload,
+				parallel,
+				counter,
+			)?;
+			// Each job counts again exactly what its first round did, so every median is of
+			// SAMPLES of one job's benchmark.
+			for ((job, expected), found) in again.iter().zip(&more) {
+				let mut names: Vec<&String> = found.iter().map(|found| &found.name).collect();
+				names.sort_unstable();
+				if names != *expected {
+					return Err(format!(
+						"count {} of {} measured {names:?}, not {expected:?}",
+						round + 1,
+						job.label
+					));
+				}
 			}
 			for found in more.iter().flatten() {
 				samples.entry(found.name.clone()).or_default().push(found.count);
