@@ -10,7 +10,7 @@ Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
 - ✅ Include L0 uncore/RAPL and L-1 tracepoint/IBS-PEBS metrics in the `swole` epic. Our Linux hosts run with `perf_event_paranoid = -1` (or `CAP_PERFMON`), and `moq`'s async/contention and memory-bound benchmarks directly benefit from off-CPU wait time, lock contention, memory bandwidth, energy, and native per-function attribution.
 
-Afk choice 2026-11-26 ([kixel-ai/swole#6](https://github.com/kixel-ai/swole/pull/6), coordinator recommendation for the maintainer to confirm): ✅ require exclusive-cores and take a whole-socket lease for the uncore/RAPL pass (rejected: report socket-wide counts on shared hosts, which breaks failing untrusted counts; drop uncore/RAPL).
+Decided 2026-11-26 (maintainer, `/quest-run`, [kixel-ai/swole#6](https://github.com/kixel-ai/swole/pull/6)): ✅ require exclusive-cores, take a host-enforced whole-socket lease for the uncore/RAPL pass, and report bandwidth, L3 misses, and energy as socket-wide, timing-like measurements that include device I/O and DMA (rejected: also fail the pass unless the host keeps device traffic out, which no host setting can guarantee; report socket-wide readings on shared hosts without a lease, which other agents' traffic would swamp; drop uncore/RAPL).
 
 Recommendations for the implementer:
 
