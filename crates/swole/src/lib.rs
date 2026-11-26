@@ -496,10 +496,28 @@ pub mod __private {
 		setup: bool,
 	}
 
+	impl<M, F> Fresh<M, F> {
+		/// Whether a sample builds every call's input before the first call: clones of the
+		/// argument, with nothing to drop.
+		fn batched<I, O>(&self) -> bool {
+			!self.setup && !std::mem::needs_drop::<I>() && !std::mem::needs_drop::<O>()
+		}
+	}
+
 	impl<I, O, M: FnMut() -> I, F: FnMut(I) -> O> Sampler for Fresh<M, F> {
 		fn count(&mut self, meter: &Meter, iterations: u64) {
 			// A count around each call, whatever the case's shape, so each call carries the same
 			// fixed start and stop cost on every side of a comparison.
+			if self.batched::<I, O>() {
+				// Clones prepared as `time` prepares them: all of them before the first call.
+				let inputs: Vec<I> = (0..iterations).map(|_| (self.make)()).collect();
+				for input in inputs {
+					meter.start();
+					black_box((self.call)(input));
+					meter.stop();
+				}
+				return;
+			}
 			for _ in 0..iterations {
 				let input = (self.make)();
 				meter.start();
@@ -510,7 +528,7 @@ pub mod __private {
 		}
 
 		fn time(&mut self, iterations: u64) -> u64 {
-			if !self.setup && !std::mem::needs_drop::<I>() && !std::mem::needs_drop::<O>() {
+			if self.batched::<I, O>() {
 				// Clones with nothing to drop, so one clock around every call, the clones built
 				// before it and their vector freed after it.
 				let mut inputs: Vec<I> = (0..iterations).map(|_| (self.make)()).collect();
@@ -910,6 +928,10 @@ mod tests {
 				}) as Box<dyn FnMut(u64) -> u64>,
 			);
 			sampler.time(2);
+			assert_eq!(*log.borrow(), order);
+			// A count prepares them in the same order.
+			log.borrow_mut().clear();
+			sampler.count(&Meter::new("a", None, false).unwrap(), 2);
 			assert_eq!(*log.borrow(), order);
 		}
 	}
