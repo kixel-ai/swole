@@ -2,9 +2,9 @@
 
 ## Goal
 
-`swole` (`kixel-ai/swole`) is a configless Rust benchmark tool (`swole` harness + `cargo-swole` CLI) that compiles every benchmark binary once and runs it across three modes—`swole quick` (1× native single-shot perf + allocs), `swole sim` (deterministic Valgrind Callgrind + simulated cycles + attribution, replacing CodSpeed), and `swole bench` (paired multi-iteration native timing + every hardware counter and OS metric the host exposes)—so performance regressions surface with their root cause instead of bare wall-clock time, published on crates.io.
+`swole` (`kixel-ai/swole`) is a configless Rust benchmark tool (`swole` harness + `cargo-swole` CLI) whose single compiled binary serves three distinct roles: `swole quick` for fast local spot-checks across whole workspaces, `swole sim` for deterministic cross-host merge gating with simulated cycles and per-function attribution (replacing CodSpeed), and `swole bench` for paired hardware validation with full host counters and root-cause diagnostics, so developers and agents both catch regressions and immediately see why code is slow, published on crates.io.
 
-Non-goals: per-benchmark configuration knobs; delaying `moq`'s and `rind`'s CodSpeed removal; randomized stack/env layout across paired samples (Mytkowicz/Stabilizer) and a macOS `kpc` privileged helper (dropped until a consumer hits them; macOS gets paired wall-clock, `rusage`, and `preload` heap allocation counters).
+Non-goals: per-benchmark configuration knobs; delaying `moq`'s and `rind`'s CodSpeed removal; chasing cross-host bit-exactness in `quick` or `bench` (`sim` alone owns cross-host exact repeatability); full randomized stack/env layout across paired samples (Mytkowicz/Stabilizer) and a macOS `kpc` privileged helper (dropped until a consumer hits them; macOS gets paired wall-clock, `rusage`, and `preload` heap allocation counters).
 
 ## Plan
 
@@ -21,3 +21,10 @@ Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 m0: `moq` and `rind` are the named consumers, and neither blocks its CodSpeed removal on these upgrades beyond the repository move. (rust2 numbered these milestones m2 and m3; here they are m0 and m1.)
 
 Decided 2026-11-25 (maintainer, [kixel-ai/rust2#1041](https://github.com/kixel-ai/rust2/pull/1041)): ✅ swole moves from `kixel-ai/rust2`'s `bench/runner/` to this repository, keeping its history, filtered to the runner's and these quests' paths, with bare `#N` references rewritten to `kixel-ai/rust2#N`.
+
+Decided 2026-11-26 (maintainer, `/quest-plan` while taking over [kixel-ai/swole#5](https://github.com/kixel-ai/swole/pull/5)):
+
+- ✅ Clarify the root goal and `AGENTS.md` around the three-role model (`quick` local whole-workspace spot-check, `sim` deterministic merge gate, `bench` paired hardware validation + active root-cause diagnosis) with `sim` alone owning cross-host bit-exactness (rejected: keeping current goal with `quick` pursuing exactness; dropping).
+- ✅ Drop `quick-accuracy` (1-in-40M interrupt subtraction in `quick`) and expand threaded inherited counters to both `quick` and `bench` so `swole quick` runs whole workspaces without failing on threaded/async benches (rejected: deferring `quick-accuracy` to m1; keeping PR #5's follow-ups as written).
+- ✅ Split `deep-perf` into three quests: [native attribution](/quest/m0/native-attribution.md) and [off-CPU/futex contention](/quest/m0/off-cpu-contention.md) stay in m0, while [uncore/RAPL energy](/quest/m1/uncore-rapl.md) moves to m1 (rejected: keeping all three in m0; keeping `deep-perf` combined).
+- ✅ Plan new m0 capabilities: [derived diagnostics & bottleneck summary](/quest/m0/diagnostics.md), [hot-loop inspect mode + function `.text` size](/quest/m0/inspect.md), [optional `#[bench]` throughput + `--report` schema version before 0.1.0](/quest/m0/throughput-and-schema.md), and [self-hosted PMU CI runner](/quest/m0/ci-self-hosted-pmu.md). Plan [warm-worktree local bisect](/quest/m1/local-bisect.md) and [adaptive `bench` stopping](/quest/m1/adaptive-bench.md) in m1 (rejected: tail latency `p50`/`p95`/`p99` + `/proc/self/io` counters for now).

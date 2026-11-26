@@ -4,6 +4,5 @@ description: Install Nix for the flake's dev shell.
 runs:
   using: composite
   steps:
-    - uses: DeterminateSystems/nix-installer-action@1d87d45818068401a10cf16bdc5f00b24994a83f # main
-      with:
-        determinate: false
+    # Upstream Nix, as moq's CI installs it; DeterminateSystems' installer no longer supports it.
+    - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32.0.0
