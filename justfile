@@ -11,6 +11,8 @@ check:
     cargo shear
     cargo sort --workspace --check --no-format
     actionlint
+    # Every action pins a release's commit and names its tag, which Dependabot moves; it cannot move a branch's.
+    ! (grep -rnE 'uses: [^.].*@' .github | grep -vE '@[0-9a-f]{40} # v[0-9]')
     taplo format --check
     nixfmt --check flake.nix
     quest check
