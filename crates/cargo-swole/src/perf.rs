@@ -719,6 +719,27 @@ pub fn drop_ambient() -> Result<(), String> {
 	Ok(())
 }
 
+/// The executable swole runs its own helpers through: itself, or, when it holds file
+/// capabilities, the `cargo-swole` beside it, since Valgrind refuses to run a capability-bearing
+/// executable and glibc strips a launch's `LD_LIBRARY_PATH` before such a runner can record it.
+pub fn helper() -> Result<std::path::PathBuf, String> {
+	let exe = std::env::current_exe().map_err(|e| format!("cannot locate swole itself: {e}"))?;
+	#[cfg(target_os = "linux")]
+	// SAFETY: getauxval reads the auxiliary vector alone.
+	if unsafe { getauxval(AT_SECURE) } != 0 {
+		let companion = exe.with_file_name("cargo-swole");
+		if !companion.is_file() {
+			return Err(format!(
+				"{} holds capabilities, so swole runs its helpers through {}, which is missing: install both of swole's binaries side by side",
+				exe.display(),
+				companion.display()
+			));
+		}
+		return Ok(companion);
+	}
+	Ok(exe)
+}
+
 /// Whether this process holds `CAP_PERFMON` or `CAP_SYS_ADMIN`, by its effective set.
 fn perfmon() -> Result<bool, String> {
 	let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
@@ -809,6 +830,7 @@ mod sys {
 	pub const PERF_EVENT_IOC_ENABLE: u64 = 0x2400;
 	pub const PERF_EVENT_IOC_DISABLE: u64 = 0x2401;
 	pub const PERF_IOC_FLAG_GROUP: u64 = 1;
+	pub const AT_SECURE: u64 = 23;
 	pub const PR_CAP_AMBIENT: i32 = 47;
 	pub const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
 	pub const ENOENT: i32 = 2;
@@ -823,6 +845,7 @@ mod sys {
 		pub fn syscall(number: i64, ...) -> i64;
 		pub fn ioctl(fd: i32, request: u64, ...) -> i32;
 		pub fn prctl(option: i32, ...) -> i32;
+		pub fn getauxval(kind: u64) -> u64;
 		pub fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
 		pub fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
 		pub fn personality(persona: u64) -> i32;

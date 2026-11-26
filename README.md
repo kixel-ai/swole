@@ -95,7 +95,9 @@ started or ended, or one its call started, which the [preload](#randomness-and-t
 even when it is gone by the call's end, counts what that thread ran meanwhile, which the
 scheduler decides. So `sim` counts each such benchmark's job five times in all, and records the
 median of the five, with their least and most beside it in the table and as `lower_value` and
-`upper_value` in `metrics.json`. A benchmark that ran alone counts once: under the preload's
+`upper_value` in `metrics.json`. So does every benchmark whose threads swole cannot see: those of
+CodSpeed's crates and of a `--program`, whose harness runs every benchmark in one process. A
+harness benchmark that ran alone counts once: under the preload's
 randomness and clock it repeats exactly, but for an input the host decides, such as the order a
 directory lists its entries in, which no repeat on one host would show.
 
@@ -171,8 +173,8 @@ counters it reads follow what the host lets swole count. So `quick` and `bench` 
 architecture, the CPU's model as `/proc/cpuinfo` or macOS's `machdep.cpu.brand_string` names
 it, how many CPUs the run may use, and everything the [capability probe](#capabilities) finds:
 `kernel.perf_event_paranoid`, whether swole holds `CAP_PERFMON`, the PMUs the kernel lists, the
-core PMU and its counters, and the passes the probe packed them into; and for `quick`, the
-preload. `swole fingerprint quick` and `swole fingerprint bench` print each label, then its
+core PMU and its counters, and the passes the probe packed them into; `GLIBC_TUNABLES`, which
+picks glibc's string and memory routines; and for `quick`, the preload. `swole fingerprint quick` and `swole fingerprint bench` print each label, then its
 inputs on stderr.
 
 Valgrind 3.27.1 on x86_64 presents one fixed Intel CPU, not the host's: an AMD Ryzen 9 9950X
@@ -301,6 +303,13 @@ security.wrappers.swole = {
 ```
 
 `cargo swole` runs `cargo-swole` from `PATH`, which holds no capability: run `swole` instead.
+A `swole` given the capability itself runs its helpers through the `cargo-swole` installed beside
+it, since Valgrind refuses an executable that holds capabilities.
+
+glibc starts a program that holds a capability in its secure mode, which drops `LD_LIBRARY_PATH`,
+`GLIBC_TUNABLES`, and the loader's other variables from its environment, so a granted swole and
+everything it runs never see them. A count's fingerprint reads the environment swole sees, so it
+records the tunables as unset.
 
 ## Bench
 

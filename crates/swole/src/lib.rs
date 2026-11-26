@@ -51,7 +51,7 @@ impl IntoIterator for Iterations {
 const COUNTERS: &str = "SWOLE_COUNTERS";
 
 /// The variable that, beside `SWOLE_COUNTERS`, has the benchmark called this many times, each
-/// call counted, rather than once.
+/// call counted, after one uncounted call, rather than once.
 const ITERATIONS: &str = "SWOLE_ITERATIONS";
 
 /// What a count with perf counters prints before each counter's value, in the order swole opened
@@ -123,7 +123,8 @@ fn run() -> Result<(), String> {
 		return serve((case.build)(), std::io::stdin().lock(), std::io::stdout());
 	}
 	let counters = number(COUNTERS)?;
-	let iterations = number(ITERATIONS)?.unwrap_or(1);
+	let warm = number(ITERATIONS)?;
+	let iterations = warm.unwrap_or(1);
 	if counters.is_some() && cases.len() != 1 {
 		return Err(format!("{COUNTERS} counts one benchmark, which {ONLY} names"));
 	}
@@ -136,6 +137,10 @@ fn run() -> Result<(), String> {
 	for (name, case) in cases {
 		let meter = __private::Meter::new(&name, counters.take(), watched)?;
 		let mut sampler = (case.build)();
+		// Counted as bench times it: after a first call that waits out its setup, uncounted.
+		if warm.is_some() {
+			sampler.time(1);
+		}
 		sampler.count(&meter, iterations);
 		drop(sampler);
 		let watch = meter.finish().map_err(|err| format!("{name}: {err}"))?;

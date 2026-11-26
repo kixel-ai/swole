@@ -362,7 +362,9 @@ fn table(stdout: &[u8]) -> std::collections::BTreeMap<String, u64> {
 	String::from_utf8_lossy(stdout)
 		.lines()
 		.map_while(|line| {
-			let (count, name) = line.trim_start().split_once("  ")?;
+			let (count, rest) = line.trim_start().split_once("  ")?;
+			// A sampled count's least and most follow its name.
+			let name = rest.split("  ").next()?;
 			Some((name.to_owned(), count.parse().ok()?))
 		})
 		.collect()

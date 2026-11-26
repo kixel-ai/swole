@@ -36,7 +36,7 @@ impl Fingerprint {
 			Command::new(crate::valgrind_path()?).arg("--version"),
 			"valgrind --version",
 		)?;
-		let exe = std::env::current_exe().map_err(|e| format!("cannot locate swole itself: {e}"))?;
+		let exe = crate::perf::helper()?;
 		let mut probe = crate::valgrind()?;
 		probe.arg("--callgrind-out-file=/dev/null").arg(exe).arg(crate::PROBE);
 		let cpu = output(&mut probe, "the CPU probe under Valgrind")?;
@@ -79,7 +79,8 @@ impl Fingerprint {
 /// The environment a native measure, quick's count or bench's time, is comparable within: the
 /// CPU's model, how many CPUs swole may run on, and what the host lets swole count, the perf
 /// tier, PMU, and counters its probe found, so a series never mixes two kinds of host or two
-/// sets of counters; and for quick, the preload, whose code runs inside each count.
+/// sets of counters; the glibc tunables every benchmark inherits, which pick its string and
+/// memory routines; and for quick, the preload, whose code runs inside each count.
 pub struct Native {
 	pub arch: &'static str,
 	/// The CPU's model, as the system describes it.
@@ -87,6 +88,8 @@ pub struct Native {
 	/// How many CPUs swole may run on.
 	pub cpus: usize,
 	pub host: crate::perf::Host,
+	/// `GLIBC_TUNABLES`, as every benchmark inherits it.
+	pub tunables: Option<String>,
 	/// The preload's hash, for a count that runs with it.
 	pub preload: Option<String>,
 }
@@ -101,6 +104,7 @@ impl Native {
 				.map_err(|e| format!("cannot count the CPUs: {e}"))?
 				.get(),
 			host: crate::perf::Host::probe(mode)?,
+			tunables: std::env::var("GLIBC_TUNABLES").ok(),
 			preload: (mode == crate::Mode::Quick).then(crate::preload::hash),
 		})
 	}
@@ -110,9 +114,11 @@ impl Native {
 		let mut out = format!(
 			"arch: {}
 CPUs: {}
+GLIBC_TUNABLES: {}
 {}",
 			self.arch,
 			self.cpus,
+			self.tunables.as_deref().unwrap_or("(unset)"),
 			self.host.describe()
 		);
 		if let Some(preload) = &self.preload {

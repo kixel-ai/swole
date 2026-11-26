@@ -352,8 +352,8 @@ impl Counts {
 	}
 }
 
-/// How many times sim counts a benchmark beside which the process had another thread, since
-/// what the threads run while its call does depends on the scheduler.
+/// How many times sim counts a benchmark beside which the process had another thread, or might
+/// have, since what the threads run while its call does depends on the scheduler.
 const SAMPLES: usize = 5;
 
 /// What counts each job, and the fingerprint its counts carry.
@@ -426,21 +426,36 @@ pub(crate) fn indent(text: &str) -> String {
 
 /// A note naming the benchmarks beside which other threads ran, if any, and what that did.
 pub(crate) fn threaded(counts: &Counts, mode: Mode) -> String {
-	if counts.threaded.is_empty() {
-		return String::new();
+	let mut out = String::new();
+	if !counts.threaded.is_empty() {
+		let names: Vec<&str> = counts.threaded.iter().map(String::as_str).collect();
+		out += &match mode {
+			Mode::Sim => format!(
+				"\nOther threads ran beside {}, so each count is the median of {SAMPLES}, with their least and most, which \
+				 the scheduler moves.\n",
+				names.join(", ")
+			),
+			_ => format!(
+				"\nOther threads ran beside {}, whose counts the scheduler makes noisy.\n",
+				names.join(", ")
+			),
+		};
 	}
-	let names: Vec<&str> = counts.threaded.iter().map(String::as_str).collect();
-	match mode {
-		Mode::Sim => format!(
-			"\nOther threads ran beside {}, so each count is the median of {SAMPLES}, with their least and most, which \
-			 the scheduler moves.\n",
-			names.join(", ")
-		),
-		_ => format!(
-			"\nOther threads ran beside {}, whose counts the scheduler makes noisy.\n",
-			names.join(", ")
-		),
+	// Sampled without having been seen to run other threads: swole could not watch them.
+	let unwatched: Vec<&str> = counts
+		.spread
+		.keys()
+		.filter(|name| !counts.threaded.contains(*name))
+		.map(String::as_str)
+		.collect();
+	if !unwatched.is_empty() {
+		out += &format!(
+			"\nswole cannot see whether other threads ran beside {}, so each count is the median of {SAMPLES}, with \
+			 their least and most.\n",
+			unwatched.join(", ")
+		);
 	}
+	out
 }
 
 /// The Valgrind every count and the fingerprint's probe run under: Callgrind, counting only
@@ -572,11 +587,19 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 	}
 	if matches!(counter.kind, CounterKind::Valgrind) {
 		// Under Valgrind, a job beside whose benchmarks other threads ran counts again, its
-		// samples' spread standing for what the scheduler moves.
+		// samples' spread standing for what the scheduler moves. So does one whose threads
+		// swole cannot see: CodSpeed's, and a program's, whose harness no `SWOLE_BENCH` watches.
+		let mut repeated: BTreeSet<String> = counts.threaded.clone();
 		let again: Vec<&Job> = jobs
 			.iter()
 			.zip(&first)
-			.filter(|(_, found)| found.iter().any(|found| found.threaded))
+			.filter(|(job, found)| {
+				let unwatched = job.codspeed || job.expect.is_none();
+				if unwatched {
+					repeated.extend(found.iter().map(|found| found.name.clone()));
+				}
+				unwatched || found.iter().any(|found| found.threaded)
+			})
 			.map(|(job, _)| job)
 			.collect();
 		for round in 1..SAMPLES {
@@ -585,8 +608,8 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 			}
 			let more = run(&again, &work.join((round + 1).to_string()), &preload, parallel, counter)?;
 			for found in more.iter().flatten() {
-				// A benchmark that ran alone in its first count keeps that one count.
-				if counts.threaded.contains(&found.name) {
+				// A watched benchmark that ran alone in its first count keeps that one count.
+				if repeated.contains(&found.name) {
 					samples.entry(found.name.clone()).or_default().push(found.count);
 				}
 			}
@@ -969,9 +992,10 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 		));
 	}
 	let stdout = dir.join("stdout");
-	let threaded = perf::threaded(
-		&std::fs::read_to_string(&stdout).map_err(|e| format!("cannot read {}: {e}", stdout.display()))?,
-	);
+	// A program may write any bytes; only the harness's marker lines are read.
+	let threaded = perf::threaded(&String::from_utf8_lossy(
+		&std::fs::read(&stdout).map_err(|e| format!("cannot read {}: {e}", stdout.display()))?,
+	));
 	let mut measured = Vec::new();
 	let mut entries: Vec<_> = std::fs::read_dir(dir)
 		.map_err(|e| format!("cannot read {}: {e}", dir.display()))?

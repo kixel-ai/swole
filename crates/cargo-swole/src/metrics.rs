@@ -219,12 +219,17 @@ pub fn number(value: f64) -> Value {
 	Number::from_f64(rounded).map_or(Value::Null, Value::Number)
 }
 
-/// Each benchmark's count, a line each.
+/// Each benchmark's count, a line each, with the least and most of its samples when it took more
+/// than one.
 pub fn table(counts: &Counts) -> String {
 	let width = counts.counts.values().map(|n| n.to_string().len()).max().unwrap_or(0);
 	let mut out = String::new();
 	for (name, count) in &counts.counts {
-		writeln!(out, "{count:>width$}  {name}").expect("a String takes every write");
+		match counts.spread.get(name) {
+			Some((least, most)) => writeln!(out, "{count:>width$}  {name}  ({least} to {most})"),
+			None => writeln!(out, "{count:>width$}  {name}"),
+		}
+		.expect("a String takes every write");
 	}
 	out
 }

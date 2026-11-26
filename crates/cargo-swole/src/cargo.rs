@@ -650,7 +650,7 @@ pub fn manifest_path(args: &[String]) -> Option<&str> {
 /// returns each with how Cargo launches it: `cargo bench` runs each through this executable as
 /// its runner, which records the launch rather than running it.
 fn build(dir: &Path, args: &[String]) -> Result<Vec<(Target, Launch)>, String> {
-	let exe = std::env::current_exe().map_err(|e| format!("cannot find swole's own executable: {e}"))?;
+	let exe = crate::perf::helper()?;
 	let exe = exe.to_str().ok_or("swole's own path is not UTF-8")?;
 	// A launch's environment holds whatever secrets the caller exported, so it goes to a
 	// directory only this user can read, removed once read.
