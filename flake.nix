@@ -109,6 +109,7 @@
                 cargo-shear
                 cargo-sort
                 actionlint
+                yq-go
                 taplo
                 nixfmt
               ]
