@@ -1,5 +1,6 @@
 [toolchain]
-# moq's build toolchain, the oldest a consumer builds the harness with. flake.nix reads this file.
+# moq's build toolchain, the oldest a consumer builds the harness with, so no Dependabot bump:
+# move it with moq. flake.nix reads this file.
 channel = "1.98.1"
 # No rust-docs: what every CI job would unpack for nothing.
 profile = "minimal"
