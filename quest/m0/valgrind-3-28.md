@@ -9,6 +9,7 @@ swole counts under Valgrind 3.28.0 (released 2026-10-23): `flake.nix` pins `3.28
 - The nix group's Dependabot PR fails evaluation once nixpkgs moves Valgrind, since `flake.nix` throws on any version but its pin; take this quest in that PR's place, or on that PR.
 - 3.28 advertises LZCNT on amd64 through its CPUID emulation, so code that picks an implementation at runtime may count differently: the fingerprint's Valgrind version starts new series, as intended. Re-check the README's `GenuineIntel` family/model paragraph against a run under 3.28.
 - Its new `VALGRIND_RUNNING_VERSION` client request adds nothing swole needs: the fingerprint already reads `valgrind --version`.
+- Maintainer kept this follow-up when picking https://github.com/kixel-ai/swole/pull/8 to merge (2026-11-26).
 
 ## Waiting
 
