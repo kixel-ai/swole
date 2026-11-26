@@ -58,6 +58,10 @@ const ITERATIONS: &str = "SWOLE_ITERATIONS";
 /// them, and the benchmark's name.
 const COUNTED: &str = "swole counted ";
 
+/// What a count over [`ITERATIONS`] prints before how many calls its values cover, and the
+/// benchmark's name.
+const CALLS: &str = "swole calls ";
+
 /// What a run swole measures natively prints before what the process used over the benchmark's
 /// calls, or over each sample's, from `getrusage`.
 const RUSAGE: &str = "swole rusage ";
@@ -139,22 +143,25 @@ fn run() -> Result<(), String> {
 	}
 	let mut counters = counters.map(open).transpose()?;
 	for (name, case) in cases {
-		let meter = __private::Meter::new(&name, counters.take(), watched)?;
+		let mut meter = __private::Meter::new(&name, counters.take(), watched)?;
 		let mut sampler = (case.build)();
 		if warm.is_some() {
 			// Counted as bench times it: after the samples that warm it up, uncounted, one call
 			// that waits out its setup, then batches doubled from one up to the iterations.
 			sampler.time(1);
 			let mut batch = 1;
-			loop {
-				sampler.time(batch);
+			let last = loop {
+				let nanos = sampler.time(batch);
 				if batch >= iterations {
-					break;
+					break u128::from(nanos) * u128::from(iterations) / u128::from(batch);
 				}
 				batch *= 2;
-			}
+			};
+			// Counted calls, each bracketed apart, take far longer than timed ones, so they stop
+			// once they have taken as long as the iterations did uncounted.
+			meter.budget(std::time::Duration::from_nanos(u64::try_from(last).unwrap_or(u64::MAX)));
 		}
-		sampler.count(&meter, iterations);
+		let calls = sampler.count(&meter, iterations);
 		drop(sampler);
 		let watch = meter.finish().map_err(|err| format!("{name}: {err}"))?;
 		// The records start on a fresh line, as a benchmark's own output may not have ended one,
@@ -183,6 +190,9 @@ fn run() -> Result<(), String> {
 		}
 		if let Some(values) = watch.counted {
 			let values: Vec<String> = values.iter().map(u64::to_string).collect();
+			if warm.is_some() {
+				record(format_args!("{CALLS}{calls} {name}"))?;
+			}
 			record(format_args!("{COUNTED}{} {name}", values.join(" ")))?;
 		}
 		if !quiet {
@@ -341,7 +351,7 @@ pub mod __private {
 	use std::fmt::Display;
 	use std::time::{Duration, Instant};
 
-	use std::cell::RefCell;
+	use std::cell::{Cell, RefCell};
 
 	pub use core::hint::black_box;
 	pub use inventory;
@@ -384,9 +394,9 @@ pub mod __private {
 
 	/// A case set up, which runs its benchmark once counted or many times timed.
 	pub trait Sampler {
-		/// Calls the benchmark `iterations` times, counting only the calls between the meter's
-		/// requests.
-		fn count(&mut self, meter: &Meter, iterations: u64);
+		/// Calls the benchmark `iterations` times, or until the meter's budget is spent, counting
+		/// only the calls between the meter's requests, and returns how many calls the count covers.
+		fn count(&mut self, meter: &Meter, iterations: u64) -> u64;
 		/// Calls the benchmark `iterations` times, returning the nanoseconds its timed part took.
 		fn time(&mut self, iterations: u64) -> u64;
 	}
@@ -400,6 +410,10 @@ pub mod __private {
 		counters: Option<crate::Counters>,
 		/// What the case's calls used and whether other threads ran, when swole runs it.
 		watch: Option<RefCell<Watching>>,
+		/// How long counted calls may go on, from the first, when bounded.
+		budget: Option<Duration>,
+		/// When the budget runs out, once the first counted call started.
+		deadline: Cell<Option<Instant>>,
 	}
 
 	/// What a meter saw over a case's calls.
@@ -437,12 +451,33 @@ pub mod __private {
 					error: None,
 				})
 			});
-			Ok(Self { name, counters, watch })
+			Ok(Self {
+				name,
+				counters,
+				watch,
+				budget: None,
+				deadline: Cell::new(None),
+			})
+		}
+
+		/// Bounds the counted calls to `budget` of wall time from the first, at least one.
+		pub(crate) fn budget(&mut self, budget: Duration) {
+			self.budget = Some(budget);
+		}
+
+		/// Whether the budget has run out, so no further call should be counted.
+		pub fn spent(&self) -> bool {
+			self.deadline.get().is_some_and(|deadline| Instant::now() >= deadline)
 		}
 
 		/// Zeroes the counts and starts counting.
 		#[inline(always)]
 		pub fn start(&self) {
+			if let Some(budget) = self.budget
+				&& self.deadline.get().is_none()
+			{
+				self.deadline.set(Some(Instant::now() + budget));
+			}
 			if let Some(watch) = &self.watch {
 				watch.borrow_mut().before();
 			}
@@ -560,26 +595,36 @@ pub mod __private {
 	}
 
 	impl<I, O, M: FnMut() -> I, F: FnMut(I) -> O> Sampler for Fresh<M, F> {
-		fn count(&mut self, meter: &Meter, iterations: u64) {
+		fn count(&mut self, meter: &Meter, iterations: u64) -> u64 {
 			// A count around each call, whatever the case's shape, so each call carries the same
 			// fixed start and stop cost on every side of a comparison.
+			let mut calls = 0;
 			if self.batched::<I, O>() {
 				// Clones prepared as `time` prepares them: all of them before the first call.
 				let inputs: Vec<I> = (0..iterations).map(|_| (self.make)()).collect();
 				for input in inputs {
+					if meter.spent() {
+						break;
+					}
 					meter.start();
 					black_box((self.call)(input));
 					meter.stop();
+					calls += 1;
 				}
-				return;
+				return calls;
 			}
 			for _ in 0..iterations {
+				if meter.spent() {
+					break;
+				}
 				let input = (self.make)();
 				meter.start();
 				let output = black_box((self.call)(input));
 				meter.stop();
 				drop(output);
+				calls += 1;
 			}
+			calls
 		}
 
 		fn time(&mut self, iterations: u64) -> u64 {
@@ -623,9 +668,13 @@ pub mod __private {
 	type Step<I> = Box<dyn FnMut(&mut I)>;
 
 	impl<I, O, F: FnMut(&mut I) -> O> Sampler for Kept<I, F> {
-		fn count(&mut self, meter: &Meter, iterations: u64) {
+		fn count(&mut self, meter: &Meter, iterations: u64) -> u64 {
 			// A count around each call, as `Fresh` counts.
+			let mut calls = 0;
 			for _ in 0..iterations {
+				if meter.spent() {
+					break;
+				}
 				if let Some(before) = &mut self.before {
 					before(&mut self.input);
 				}
@@ -636,7 +685,9 @@ pub mod __private {
 				if let Some(after) = &mut self.after {
 					after(&mut self.input);
 				}
+				calls += 1;
 			}
+			calls
 		}
 
 		fn time(&mut self, iterations: u64) -> u64 {
@@ -675,11 +726,12 @@ pub mod __private {
 	}
 
 	impl<I, M: FnMut() -> I, F: FnMut(I, Iterations) -> Duration> Sampler for FreshTimed<M, F> {
-		fn count(&mut self, meter: &Meter, iterations: u64) {
+		fn count(&mut self, meter: &Meter, iterations: u64) -> u64 {
 			let input = (self.make)();
 			meter.start();
 			black_box((self.call)(input, Iterations(iterations)));
 			meter.stop();
+			iterations
 		}
 
 		fn time(&mut self, iterations: u64) -> u64 {
@@ -696,10 +748,11 @@ pub mod __private {
 	}
 
 	impl<I, F: FnMut(&mut I, Iterations) -> Duration> Sampler for KeptTimed<I, F> {
-		fn count(&mut self, meter: &Meter, iterations: u64) {
+		fn count(&mut self, meter: &Meter, iterations: u64) -> u64 {
 			meter.start();
 			black_box((self.call)(&mut self.input, Iterations(iterations)));
 			meter.stop();
+			iterations
 		}
 
 		fn time(&mut self, iterations: u64) -> u64 {

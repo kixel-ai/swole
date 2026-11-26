@@ -323,7 +323,9 @@ fn count(job: &Job, perf: &perf::Perf, preload: &Path, iterations: u64, dir: &Pa
 				return Ok(Counted::Unwatched);
 			}
 			[reading] if reading.threaded => return Ok(Counted::Threaded),
-			[reading] => values.push(reading.values.clone()),
+			// Over the calls the harness counted, which stop once they take as long as the
+			// sample's did, or the iterations, from a harness too old to say.
+			[reading] => values.push((reading.values.clone(), reading.calls.unwrap_or(iterations))),
 			_ => {
 				return Err(format!(
 					"{} counted more than one benchmark; its output is in {}",
@@ -333,7 +335,7 @@ fn count(job: &Job, perf: &perf::Perf, preload: &Path, iterations: u64, dir: &Pa
 			}
 		}
 	}
-	Ok(Counted::Measures(perf::measures(&perf.passes, &values, iterations)))
+	Ok(Counted::Measures(perf::measures(&perf.passes, &values)))
 }
 
 /// Jobs by the benchmark each runs.

@@ -989,7 +989,8 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 			first.name
 		));
 	}
-	let mut details = perf::measures(passes, &values, 1);
+	let values: Vec<(Vec<u64>, u64)> = values.into_iter().map(|values| (values, 1)).collect();
+	let mut details = perf::measures(passes, &values);
 	let count = details
 		.iter()
 		.find(|measure| measure.name == "instructions:u")

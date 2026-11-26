@@ -31,6 +31,9 @@ const THREADED: &str = "swole threaded ";
 /// thread; one too old to watch prints neither.
 const ALONE: &str = "swole alone ";
 
+/// What a harness target counting over iterations prints before how many calls its count covers.
+const CALLS: &str = "swole calls ";
+
 /// Where the kernel lists its PMUs.
 const PMUS: &str = "/sys/bus/event_source/devices";
 
@@ -589,6 +592,9 @@ pub fn launch(command: &mut std::process::Command, pmu: &Pmu, pass: &Pass, fixed
 pub struct Reading {
 	pub name: String,
 	pub values: Vec<u64>,
+	/// How many calls the values cover, when the harness said, as one counting over iterations
+	/// does.
+	pub calls: Option<u64>,
 	pub usage: Option<Usage>,
 	pub threaded: bool,
 }
@@ -597,10 +603,19 @@ pub struct Reading {
 pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 	let threads = threads(stdout);
 	let mut usage = None;
+	let mut calls = None;
 	let mut readings = Vec::new();
 	for line in stdout.lines() {
 		if let Some(fields) = line.strip_prefix(RUSAGE) {
 			usage = Some(Usage::parse(fields)?);
+		} else if let Some(rest) = line.strip_prefix(CALLS) {
+			calls = Some(
+				rest.split(' ')
+					.next()
+					.and_then(|n| n.parse::<u64>().ok())
+					.filter(|&n| n > 0)
+					.ok_or_else(|| format!("a harness target printed {CALLS}{rest}, which no harness prints"))?,
+			);
 		} else if let Some(rest) = line.strip_prefix(COUNTED) {
 			let malformed =
 				|| format!("a harness target printed {COUNTED}{rest}, which no harness prints for {counters} counters");
@@ -625,6 +640,7 @@ pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 			readings.push(Reading {
 				name: name.to_owned(),
 				values,
+				calls: calls.take(),
 				usage: usage.take(),
 				threaded,
 			});
@@ -637,6 +653,7 @@ pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 			readings.push(Reading {
 				name: name.clone(),
 				values: Vec::new(),
+				calls: None,
 				usage: None,
 				threaded,
 			});
@@ -730,14 +747,18 @@ impl Usage {
 	}
 }
 
-/// Each counter `passes` read, a call's share over `calls` calls, then what derives from them:
-/// instructions a cycle, in each ring both count.
-pub fn measures(passes: &[Pass], values: &[Vec<u64>], calls: u64) -> Vec<crate::Measure> {
+/// Each counter `passes` read, a call's share over each pass's calls, then what derives from
+/// them: instructions a cycle, in each ring both count.
+pub fn measures(passes: &[Pass], values: &[(Vec<u64>, u64)]) -> Vec<crate::Measure> {
 	let mut out: Vec<crate::Measure> = passes
 		.iter()
 		.zip(values)
-		.flat_map(|(pass, values)| pass.events().zip(values))
-		.map(|(event, &value)| crate::Measure::new(&event.name, value as f64 / calls as f64, event.unit()))
+		.flat_map(|(pass, (values, calls))| {
+			pass.events()
+				.zip(values)
+				.map(move |(event, &value)| (event, value, *calls))
+		})
+		.map(|(event, value, calls)| crate::Measure::new(&event.name, value as f64 / calls as f64, event.unit()))
 		.collect();
 	for ring in ["u", "k"] {
 		let find = |name: &str| out.iter().find(|m| m.name == format!("{name}:{ring}")).map(|m| m.value);
@@ -1129,7 +1150,7 @@ mod tests {
 	#[test]
 	fn reads_what_a_harness_counted() {
 		let out = "swole threaded a.rs::g\nswole alone a.rs::f[1 2]\nswole rusage 1 2 3 4 5 6 7\nswole counted 4096 9 a.rs::f[1 2]\n\
-		           swole ran a.rs::f[1 2]\nown output\nswole counted 12 0 a.rs::g\n";
+		           swole ran a.rs::f[1 2]\nown output\nswole calls 3 a.rs::g\nswole counted 12 0 a.rs::g\n";
 		let usage = Usage {
 			user_ns: 1,
 			system_ns: 2,
@@ -1145,12 +1166,14 @@ mod tests {
 				Reading {
 					name: "a.rs::f[1 2]".to_owned(),
 					values: vec![4096, 9],
+					calls: None,
 					usage: Some(usage),
 					threaded: false
 				},
 				Reading {
 					name: "a.rs::g".to_owned(),
 					values: vec![12, 0],
+					calls: Some(3),
 					usage: None,
 					threaded: true
 				}
@@ -1162,6 +1185,7 @@ mod tests {
 			[Reading {
 				name: "a.rs::h".to_owned(),
 				values: Vec::new(),
+				calls: None,
 				usage: None,
 				threaded: true
 			}]
@@ -1169,6 +1193,13 @@ mod tests {
 		// A thread record a fragment without a newline swallowed is no record.
 		assert!(readings("own outputswole threaded a.rs::f\nswole counted 1 2 a.rs::f\n", 2).is_err());
 		assert!(readings("swole counted 1 a.rs::f\n", 2).is_err());
+		assert!(
+			readings(
+				"swole alone a.rs::f\nswole calls 0 a.rs::f\nswole counted 1 2 a.rs::f\n",
+				2
+			)
+			.is_err()
+		);
 		assert!(readings("swole counted x 1 a.rs::f\n", 2).is_err());
 		assert!(readings("swole counted 1 2\n", 2).is_err());
 		assert!(readings("swole rusage 1 2\n", 2).is_err());
@@ -1188,7 +1219,7 @@ mod tests {
 				generic(&pmu, "cycles", PERF_TYPE_HARDWARE, 0, false),
 			]],
 		};
-		let measures = measures(&[pass], &[vec![300, 100]], 2);
+		let measures = measures(&[pass], &[(vec![300, 100], 2)]);
 		let shown: Vec<(&str, f64)> = measures.iter().map(|m| (m.name.as_str(), m.value)).collect();
 		assert_eq!(shown, [("instructions:u", 150.0), ("cycles:u", 50.0), ("IPC:u", 3.0)]);
 	}
