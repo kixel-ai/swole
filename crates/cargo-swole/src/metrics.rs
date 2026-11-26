@@ -211,7 +211,7 @@ pub fn report(counts: &Counts, base: Option<&Counts>, counter: &Counter, sha: Op
 		}
 		benchmarks.insert(name.clone(), entry);
 	}
-	Report::new(counter.mode(), &counts.fingerprint, &counter.host, sha, benchmarks)
+	Report::new(counter.mode(), &counts.fingerprint, &counts.host, sha, benchmarks)
 }
 
 /// A measure's value as JSON: a whole number as one, else five significant digits, more than any
@@ -316,6 +316,7 @@ mod tests {
 	fn counts(names: &[(&str, u64)]) -> Counts {
 		Counts {
 			fingerprint: "x86_64-0123456789ab".to_owned(),
+			host: String::new(),
 			counts: names.iter().map(|(name, ir)| ((*name).to_owned(), *ir)).collect(),
 			spread: Default::default(),
 			threaded: Default::default(),

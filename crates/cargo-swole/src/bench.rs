@@ -50,16 +50,14 @@ const UNIT: &str = "ns";
 pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	// Probed before anything builds, so the run says first what it can measure.
 	let native = Native::probe(Mode::Bench)?;
-	let host = native.label();
 	eprint!("{}", crate::indent(&native.host.describe()));
 	if let Err(why) = &native.host.perf {
 		eprintln!("swole: no perf counters, since {why}: timing by wall clock, with rusage");
 	}
-	eprintln!("swole: fingerprint {host}");
 	let perf = native.host.perf.as_ref().ok();
-	// Each counting pass runs under the preload built to count threads alone, which tells whether
-	// another thread ran beside a call, whose work the counters, reading the calling thread alone,
-	// would not see, and leaves the clock and randomness the host's, as the timing passes have them.
+	// Both timed and counting passes run under the preload built to count threads alone when perf
+	// is available, which detects even short-lived workers spawned and joined inside a timed sample
+	// or counter pass while keeping the host's clock and randomness untouched.
 	let preload = perf.map(|_| crate::preload::threads()).transpose()?;
 	// Held until the base is timed, so no other compare checks out another commit under it.
 	let checkout = base.map(|base| Checkout::new(base, options)).transpose()?;
@@ -149,6 +147,8 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	// Whether another thread ran beside each benchmark, where every side was watched or one
 	// was seen threaded.
 	let mut seen = BTreeMap::new();
+	// Distinct libc identities reported by benchmark processes across the run.
+	let mut libcs = BTreeSet::new();
 	let total = names.len();
 	for (index, name) in names.into_iter().enumerate() {
 		let started = Instant::now();
@@ -158,11 +158,13 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 		let pmu = perf.map(|perf| &perf.pmu);
 		let (timed, iterations, used, timed_threaded) = match (&base, &head) {
 			(Some(base), Some(head)) => {
-				let mut base = Process::spawn(base, pmu, &dir.join("base"))?;
-				let mut head = Process::spawn(head, pmu, &dir.join("head"))?;
+				let mut base = Process::spawn(base, pmu, preload.as_deref(), &dir.join("base"))?;
+				let mut head = Process::spawn(head, pmu, preload.as_deref(), &dir.join("head"))?;
 				let (iterations, pairs) = paired(&mut base, &mut head, &mut coin)?;
 				let base_threaded = base.threaded || pairs.iter().any(|(b, _)| b.threaded);
 				let head_threaded = head.threaded || pairs.iter().any(|(_, h)| h.threaded);
+				libcs.extend(base.libc.take());
+				libcs.extend(head.libc.take());
 				base.finish()?;
 				head.finish()?;
 				let nanos: Vec<(u64, u64)> = pairs.iter().map(|(b, h)| (b.nanos, h.nanos)).collect();
@@ -182,9 +184,10 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					(None, Some(head)) => (Which::Head, head),
 					_ => unreachable!("every name is one side's"),
 				};
-				let mut process = Process::spawn(job, pmu, &dir.join(side.name()))?;
+				let mut process = Process::spawn(job, pmu, preload.as_deref(), &dir.join(side.name()))?;
 				let (iterations, samples) = alone(&mut process)?;
 				let side_threaded = process.threaded || samples.iter().any(|sample| sample.threaded);
+				libcs.extend(process.libc.take());
 				process.finish()?;
 				let nanos: Vec<u64> = samples.iter().map(|sample| sample.nanos).collect();
 				let timed = Times::alone(side, iterations, &nanos).map_err(|err| format!("{name}: {err}"))?;
@@ -213,18 +216,21 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				Vec::new()
 			} else {
 				match (perf, &preload) {
-					(Some(perf), Some(preload)) => match count(job, perf, preload, iterations, &dir.join(side.name()))?
-					{
-						Counted::Measures(measures) => measures,
-						Counted::Threaded => {
-							threaded.insert(name.clone());
-							Vec::new()
+					(Some(perf), Some(preload)) => {
+						let (counted, count_libc) = count(job, perf, preload, iterations, &dir.join(side.name()))?;
+						libcs.extend(count_libc);
+						match counted {
+							Counted::Measures(measures) => measures,
+							Counted::Threaded => {
+								threaded.insert(name.clone());
+								Vec::new()
+							}
+							Counted::Unwatched => {
+								watched = false;
+								Vec::new()
+							}
 						}
-						Counted::Unwatched => {
-							watched = false;
-							Vec::new()
-						}
-					},
+					}
 					_ => {
 						watched = false;
 						Vec::new()
@@ -253,6 +259,12 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	}
 	// Every process exited cleanly, so the run's output is no longer evidence.
 	std::fs::remove_dir_all(&work).map_err(|e| format!("cannot remove {}: {e}", work.display()))?;
+	let native = match crate::fingerprint::single_libc(libcs.iter().map(String::as_str))? {
+		Some(bench_libc) => native.with_libc(Some(bench_libc)),
+		None => native,
+	};
+	let host = native.label();
+	eprintln!("swole: fingerprint {host}");
 	let paired = checkout.is_some();
 	print!("{}", table(&times, paired));
 	if !threaded.is_empty() {
@@ -302,8 +314,15 @@ enum Counted {
 
 /// Counts `job`'s benchmark with each of `perf`'s passes, in a process of its own for each under
 /// the library at `preload`, over `iterations` calls, its output under `dir`.
-fn count(job: &Job, perf: &perf::Perf, preload: &Path, iterations: u64, dir: &Path) -> Result<Counted, String> {
+fn count(
+	job: &Job,
+	perf: &perf::Perf,
+	preload: &Path,
+	iterations: u64,
+	dir: &Path,
+) -> Result<(Counted, Option<String>), String> {
 	let mut values = Vec::new();
+	let mut libcs = BTreeSet::new();
 	for (i, pass) in perf.passes.iter().enumerate() {
 		let dir = dir.join(format!("pass-{}", i + 1));
 		std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -341,12 +360,20 @@ fn count(job: &Job, perf: &perf::Perf, preload: &Path, iterations: u64, dir: &Pa
 					"swole: {}'s swole harness is too old to count, so it has no counters",
 					job.label
 				);
-				return Ok(Counted::Unwatched);
+				return Ok((Counted::Unwatched, None));
 			}
-			[reading] if reading.threaded => return Ok(Counted::Threaded),
-			// Over the calls the harness counted (stratified over the sample's iterations), or
-			// `iterations` for a harness too old to emit `swole calls`.
-			[reading] => values.push((reading.values.clone(), reading.calls.unwrap_or(iterations))),
+			[reading] => {
+				if let Some(raw) = &reading.libc {
+					libcs.insert(crate::fingerprint::libc_from_record(raw)?);
+				}
+				if reading.threaded {
+					let libc = crate::fingerprint::single_libc(libcs.iter().map(String::as_str))?;
+					return Ok((Counted::Threaded, libc));
+				}
+				// Over the calls the harness counted (stratified over the sample's iterations), or
+				// `iterations` for a harness too old to emit `swole calls`.
+				values.push((reading.values.clone(), reading.calls.unwrap_or(iterations)));
+			}
 			_ => {
 				return Err(format!(
 					"{} counted more than one benchmark; its output is in {}",
@@ -356,7 +383,8 @@ fn count(job: &Job, perf: &perf::Perf, preload: &Path, iterations: u64, dir: &Pa
 			}
 		}
 	}
-	Ok(Counted::Measures(perf::measures(&perf.passes, &values)))
+	let libc = crate::fingerprint::single_libc(libcs.iter().map(String::as_str))?;
+	Ok((Counted::Measures(perf::measures(&perf.passes, &values)), libc))
 }
 
 /// Jobs by the benchmark each runs.
@@ -747,20 +775,28 @@ struct Process {
 	stdout: BufReader<ChildStdout>,
 	/// The target's own output, apart from its samples.
 	log: std::fs::File,
-	/// Whether any sample (including warmup/calibration) observed another thread alive.
+	/// Whether any sample (including warmup/calibration) observed another thread alive or started.
 	threaded: bool,
+	/// The loaded libc identity reported by this benchmark process on Linux.
+	libc: Option<String>,
 }
 
 impl Process {
 	/// Starts `job`'s target timing its benchmark, pinned to `pmu`'s CPUs when given so timing and
-	/// counters measure the same cores on hybrid hosts, its output in `dir`, and waits until its
-	/// benchmark is set up: a sample of one call, which no time keeps, answers only after setup,
-	/// so no kept sample's wall time takes it in.
-	fn spawn(job: &Job, pmu: Option<&perf::Pmu>, dir: &Path) -> Result<Self, String> {
+	/// counters measure the same cores on hybrid hosts, preloading `preload` (threads-only) when
+	/// perf counters are available so short-lived workers spawned during timed samples are detected,
+	/// its output in `dir`, and waits until its benchmark is set up: a sample of one call, which
+	/// no time keeps, answers only after setup, so no kept sample's wall time takes it in.
+	fn spawn(job: &Job, pmu: Option<&perf::Pmu>, preload: Option<&Path>, dir: &Path) -> Result<Self, String> {
 		let label = job.label.clone();
 		let mut command = job.command();
 		if let Some(pmu) = pmu {
 			perf::pin_command(&mut command, pmu);
+		}
+		command.env(cargo::HARNESS_TIME, "1");
+		if let Some(preload) = preload {
+			let env = crate::environment(&command, preload, &label, false)?;
+			command.env_clear().envs(env);
 		}
 		std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 		let file = |name: &str| {
@@ -768,7 +804,6 @@ impl Process {
 				.map_err(|e| format!("cannot create {}: {e}", dir.join(name).display()))
 		};
 		let mut child = command
-			.env(cargo::HARNESS_TIME, "1")
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
 			.stderr(file("stderr")?)
@@ -784,6 +819,7 @@ impl Process {
 			stdout,
 			log: file("stdout")?,
 			threaded: false,
+			libc: None,
 		};
 		let first = process.sample(1)?;
 		process.threaded |= first.threaded;
@@ -884,6 +920,25 @@ impl Side for Process {
 				usage = Some(perf::Usage::parse(&fields).map_err(|err| format!("{}: {err}", self.label))?);
 				continue;
 			}
+			if let Some(raw) = line
+				.strip_prefix(perf::LIBC.as_bytes())
+				.and_then(|rest| rest.strip_suffix(b"\n"))
+			{
+				let raw =
+					std::str::from_utf8(raw).map_err(|_| format!("{}: printed a non-UTF-8 libc record", self.label))?;
+				let resolved =
+					crate::fingerprint::libc_from_record(raw).map_err(|err| format!("{}: {err}", self.label))?;
+				if let Some(existing) = &self.libc
+					&& existing != &resolved
+				{
+					return Err(format!(
+						"{}: reported conflicting libc builds ({existing}, {resolved})",
+						self.label
+					));
+				}
+				self.libc = Some(resolved);
+				continue;
+			}
 			if line.starts_with(perf::THREADED.as_bytes()) {
 				threaded = true;
 				continue;
@@ -938,7 +993,7 @@ mod tests {
 			expect: None,
 			codspeed: false,
 		};
-		let mut process = Process::spawn(&job, None, &dir).unwrap();
+		let mut process = Process::spawn(&job, None, None, &dir).unwrap();
 		assert_eq!(process.sample(7).unwrap().nanos, 7);
 		process.finish().unwrap();
 		assert_eq!(std::fs::read(dir.join("stdout")).unwrap(), b"\xff\n\xff\n");

@@ -396,6 +396,67 @@ pub fn threads() -> Result<usize, String> {
 	Ok(tasks.count())
 }
 
+/// The libc loaded by this benchmark process, as `<tag> <canonical-path>` (e.g.
+/// `glibc-2.44 /nix/store/.../libc.so.6` or `- /lib/ld-musl-x86_64.so.1`) or `static` when
+/// statically linked, so the runner fingerprints the benchmark's own libc rather than the runner's.
+pub fn libc() -> Option<String> {
+	use std::os::unix::ffi::OsStrExt;
+	#[repr(C)]
+	struct DlInfo {
+		dli_fname: *const std::ffi::c_char,
+		dli_fbase: *mut std::ffi::c_void,
+		dli_sname: *const std::ffi::c_char,
+		dli_saddr: *mut std::ffi::c_void,
+	}
+	unsafe extern "C" {
+		fn getpid() -> i32;
+		fn dladdr(addr: *const std::ffi::c_void, info: *mut DlInfo) -> i32;
+	}
+	let empty = || DlInfo {
+		dli_fname: std::ptr::null(),
+		dli_fbase: std::ptr::null_mut(),
+		dli_sname: std::ptr::null(),
+		dli_saddr: std::ptr::null_mut(),
+	};
+	let mut pid_info = empty();
+	let mut own_info = empty();
+	// SAFETY: `getpid` and `libc` are valid code addresses; both structs are writable.
+	let pid_ok = unsafe { dladdr(getpid as *const std::ffi::c_void, &mut pid_info) };
+	let own_ok = unsafe { dladdr(libc as *const std::ffi::c_void, &mut own_info) };
+	if pid_ok == 0 || pid_info.dli_fname.is_null() || (own_ok != 0 && pid_info.dli_fbase == own_info.dli_fbase) {
+		return Some("static".to_owned());
+	}
+	// SAFETY: `dladdr` sets `dli_fname` to a NUL-terminated path when non-null.
+	let fname = unsafe { std::ffi::CStr::from_ptr(pid_info.dli_fname) };
+	if fname.to_bytes().is_empty() {
+		return Some("static".to_owned());
+	}
+	let path = std::path::Path::new(std::ffi::OsStr::from_bytes(fname.to_bytes()));
+	let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+	let path = canonical.to_str().filter(|p| !p.contains(['\n', '\r']))?;
+	// SAFETY: `gnu_get_libc_version` is looked up dynamically so non-glibc builds still link.
+	let ver_sym = unsafe { dlsym(RTLD_DEFAULT, c"gnu_get_libc_version".as_ptr()) };
+	let tag = if !ver_sym.is_null() {
+		// SAFETY: glibc defines `gnu_get_libc_version() -> *const c_char`.
+		let ver_fn: unsafe extern "C" fn() -> *const std::ffi::c_char = unsafe { std::mem::transmute(ver_sym) };
+		let ptr = unsafe { ver_fn() };
+		if ptr.is_null() {
+			"-".to_owned()
+		} else {
+			// SAFETY: `gnu_get_libc_version` returns a static NUL-terminated string.
+			let ver = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy();
+			if ver.is_empty() || ver.chars().any(char::is_whitespace) {
+				"-".to_owned()
+			} else {
+				format!("glibc-{ver}")
+			}
+		}
+	} else {
+		"-".to_owned()
+	};
+	Some(format!("{tag} {path}"))
+}
+
 const RTLD_LAZY: i32 = 1;
 const RTLD_NOLOAD: i32 = 4;
 const RTLD_DEFAULT: *mut std::ffi::c_void = std::ptr::null_mut();

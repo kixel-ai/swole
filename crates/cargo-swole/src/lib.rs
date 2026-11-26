@@ -130,11 +130,14 @@ fn cli(args: &[String]) -> Result<(), String> {
 			(_, None) => {
 				let counter = Counter::new(mode)?;
 				let counts = measure(Path::new("."), &options, &counter, true)?;
+				if mode == Mode::Quick {
+					eprintln!("swole: fingerprint {}", counts.fingerprint);
+				}
 				print!("{}", metrics::table(&counts));
 				print!("{}", threaded(&counts));
 				print!("{}", metrics::details(None, &counts.details));
 				if let Some(out) = &options.out {
-					metrics::File::counts(&counts, counter.measure()).write(out)?;
+					metrics::File::counts(&counts, counter.measure(&counts.fingerprint)).write(out)?;
 					eprintln!("swole: wrote {}", out.display());
 				}
 				if let Some(report) = &options.report {
@@ -329,6 +332,8 @@ impl Measure {
 /// Each benchmark's headline count under one fingerprint, and every other measure of it.
 pub(crate) struct Counts {
 	pub fingerprint: String,
+	/// The fingerprint's inputs, a line each, reflecting the benchmark process's loaded libc.
+	pub host: String,
 	/// The median of a benchmark's samples, or its one count.
 	pub counts: BTreeMap<String, u64>,
 	/// The least and most of the samples of each benchmark counted more than once.
@@ -344,6 +349,7 @@ impl Counts {
 	pub(crate) fn none(counter: &Counter) -> Self {
 		Self {
 			fingerprint: counter.fingerprint.clone(),
+			host: counter.host.clone(),
 			counts: BTreeMap::new(),
 			spread: BTreeMap::new(),
 			threaded: BTreeSet::new(),
@@ -366,7 +372,11 @@ pub(crate) struct Counter {
 
 enum CounterKind {
 	Valgrind,
-	Perf { pmu: perf::Pmu, passes: Vec<perf::Pass> },
+	Perf {
+		native: Box<Native>,
+		pmu: perf::Pmu,
+		passes: Vec<perf::Pass>,
+	},
 }
 
 impl Counter {
@@ -375,38 +385,41 @@ impl Counter {
 		let counter = match mode {
 			Mode::Sim => {
 				let fingerprint = Fingerprint::probe()?;
-				Self {
+				let counter = Self {
 					kind: CounterKind::Valgrind,
 					fingerprint: fingerprint.label(),
 					host: fingerprint.describe(),
-				}
+				};
+				eprintln!("swole: fingerprint {}", counter.fingerprint);
+				counter
 			}
 			Mode::Quick => {
 				let native = Native::probe(mode)?;
 				let perf = native.host.perf.as_ref().map_err(|why| quick_needs(why))?;
 				eprint!("{}", indent(&native.host.describe()));
+				let pmu = perf.pmu.clone();
 				let passes = perf.passes.clone();
 				Self {
 					fingerprint: native.label(),
 					host: native.describe(),
 					kind: CounterKind::Perf {
-						pmu: perf.pmu.clone(),
+						native: Box::new(native),
+						pmu,
 						passes,
 					},
 				}
 			}
 			Mode::Bench => unreachable!("bench times rather than counts"),
 		};
-		eprintln!("swole: fingerprint {}", counter.fingerprint);
 		Ok(counter)
 	}
 
 	/// The headline measure, as `metrics.json` names it: instructions in user space, natively,
 	/// or Valgrind's, which are user space's too.
-	pub(crate) fn measure(&self) -> String {
+	pub(crate) fn measure(&self, fingerprint: &str) -> String {
 		match self.kind {
-			CounterKind::Valgrind => format!("instructions ({})", self.fingerprint),
-			CounterKind::Perf { .. } => format!("instructions:u ({})", self.fingerprint),
+			CounterKind::Valgrind => format!("instructions ({fingerprint})"),
+			CounterKind::Perf { .. } => format!("instructions:u ({fingerprint})"),
 		}
 	}
 
@@ -587,6 +600,14 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 	let all: Vec<&Job> = jobs.iter().collect();
 	let first = run(&all, &work.join("1"), &preload, parallel, counter)?;
 	let mut counts = Counts::none(counter);
+	if let CounterKind::Perf { native, .. } = &counter.kind
+		&& let Some(bench_libc) =
+			fingerprint::single_libc(first.iter().flatten().filter_map(|found| found.libc.as_deref()))?
+	{
+		let resolved = native.with_libc(Some(bench_libc));
+		counts.fingerprint = resolved.label();
+		counts.host = resolved.describe();
+	}
 	// Each benchmark's samples, and the details of its first.
 	let mut samples: BTreeMap<String, Vec<u64>> = BTreeMap::new();
 	for found in first.iter().flatten() {
@@ -770,7 +791,7 @@ fn run(
 						let dir = work.join(index.to_string());
 						let result = match &counter.kind {
 							CounterKind::Valgrind => one(job, &dir, preload),
-							CounterKind::Perf { pmu, passes } => native(job, &dir, preload, pmu, passes),
+							CounterKind::Perf { pmu, passes, .. } => native(job, &dir, preload, pmu, passes),
 						};
 						let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
 						match &result {
@@ -893,6 +914,8 @@ struct Found {
 	threaded: bool,
 	/// Whether its harness said whether it had, as one too old to watch does not.
 	watched: bool,
+	/// The loaded libc identity reported by the benchmark process on Linux.
+	libc: Option<String>,
 	/// Every measure of it, when its count took more than instructions.
 	details: Vec<Measure>,
 }
@@ -937,6 +960,7 @@ pub(crate) fn environment(
 fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf::Pass]) -> Measured {
 	let label = &job.label;
 	let mut values = Vec::new();
+	let mut libcs = BTreeSet::new();
 	let mut first: Option<perf::Reading> = None;
 	for (i, pass) in passes.iter().enumerate() {
 		let dir = dir.join(format!("pass-{}", i + 1));
@@ -981,6 +1005,9 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 				));
 			}
 		};
+		if let Some(raw) = &reading.libc {
+			libcs.insert(fingerprint::libc_from_record(raw)?);
+		}
 		values.push(reading.values.clone());
 		match &mut first {
 			Some(first) => first.threaded |= reading.threaded,
@@ -995,6 +1022,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 			first.name
 		));
 	}
+	let libc = fingerprint::single_libc(libcs.iter().map(String::as_str))?;
 	let values: Vec<(Vec<u64>, u64)> = values.into_iter().map(|values| (values, 1)).collect();
 	let mut details = perf::measures(passes, &values);
 	let count = details
@@ -1010,6 +1038,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 		count,
 		threaded: first.threaded,
 		watched: true,
+		libc,
 		details,
 	}])
 }
@@ -1077,6 +1106,7 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 			watched: threads.contains_key(&name),
 			name,
 			count,
+			libc: None,
 			details: Vec::new(),
 		}));
 	}

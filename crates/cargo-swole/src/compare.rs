@@ -48,7 +48,7 @@ pub fn compare(base: &str, options: &Options, mode: Mode) -> Result<(), String> 
 	);
 	let picked = pick(&dir, &both, &args, base)?;
 	// A wanted benchmark may be new at the head or gone from it, but must be on one side.
-	let before = count(&dir, &both, &counter, &picked, base)?;
+	let mut before = count(&dir, &both, &counter, &picked, base)?;
 	checkout(&top, &tree, &head)?;
 	eprintln!(
 		"swole: counting the working tree ({}) in {}",
@@ -57,7 +57,7 @@ pub fn compare(base: &str, options: &Options, mode: Mode) -> Result<(), String> 
 	);
 	let head_picked = pick(&dir, &both, &args, "the working tree")?;
 	neither(base, &picked, &head_picked)?;
-	let after = count(&dir, &both, &counter, &head_picked, "the working tree")?;
+	let mut after = count(&dir, &both, &counter, &head_picked, "the working tree")?;
 	drop(lock);
 	if let Some(wanted) = &options.benchmarks {
 		missing(wanted, |name| {
@@ -67,7 +67,19 @@ pub fn compare(base: &str, options: &Options, mode: Mode) -> Result<(), String> 
 	if before.counts.is_empty() && after.counts.is_empty() {
 		return Err("no benchmark ran".to_owned());
 	}
-	print!("{}", table(&before, &after)?);
+	// An empty side ran no benchmark process and therefore observed no benchmark libc.
+	if before.counts.is_empty() {
+		before.fingerprint = after.fingerprint.clone();
+		before.host = after.host.clone();
+	} else if after.counts.is_empty() {
+		after.fingerprint = before.fingerprint.clone();
+		after.host = before.host.clone();
+	}
+	let rendered = table(&before, &after)?;
+	if mode == Mode::Quick {
+		eprintln!("swole: fingerprint {}", after.fingerprint);
+	}
+	print!("{rendered}");
 	let mut threaded = Counts::none(&counter);
 	threaded.threaded = before.threaded.union(&after.threaded).cloned().collect();
 	threaded.spread = before.spread.clone().into_iter().chain(after.spread.clone()).collect();
@@ -776,6 +788,7 @@ mod tests {
 	fn counts(fingerprint: &str, names: &[(&str, u64)]) -> Counts {
 		Counts {
 			fingerprint: fingerprint.to_owned(),
+			host: String::new(),
 			counts: names.iter().map(|(name, ir)| ((*name).to_owned(), *ir)).collect(),
 			spread: BTreeMap::new(),
 			threaded: BTreeSet::new(),

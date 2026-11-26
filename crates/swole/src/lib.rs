@@ -77,6 +77,9 @@ const THREADED: &str = "swole threaded ";
 /// no other thread, so swole tells a harness that watched from one too old to.
 const ALONE: &str = "swole alone ";
 
+/// What a run swole measures natively prints before the benchmark process's loaded libc identity.
+const LIBC: &str = "swole libc ";
+
 #[cfg(target_os = "linux")]
 mod perf;
 
@@ -148,7 +151,8 @@ fn run() -> Result<(), String> {
 	for (name, case) in cases {
 		// `bench` collects rusage from its timed samples and discards counter-pass rusage, so skip
 		// per-call getrusage syscalls when `SWOLE_ITERATIONS` is set.
-		let record_usage = counters.is_some() && warm.is_none();
+		let counting = counters.is_some();
+		let record_usage = counting && warm.is_none();
 		let meter = __private::Meter::new(&name, counters.take(), watched, record_usage)?;
 		let mut sampler = (case.build)();
 		if warm.is_some() {
@@ -183,6 +187,9 @@ fn run() -> Result<(), String> {
 			};
 			writeln!(out, "{line}").map_err(|e| format!("cannot write to stdout: {e}"))
 		};
+		if counting && let Some(libc) = libc() {
+			record(format_args!("{LIBC}{libc}"))?;
+		}
 		match watch.threaded {
 			Some(true) => record(format_args!("{THREADED}{name}"))?,
 			Some(false) => record(format_args!("{ALONE}{name}"))?,
@@ -245,6 +252,14 @@ fn threads() -> Result<usize, String> {
 	Ok(1)
 }
 
+/// The loaded libc of this benchmark process on Linux.
+fn libc() -> Option<String> {
+	#[cfg(target_os = "linux")]
+	return perf::libc();
+	#[cfg(not(target_os = "linux"))]
+	None
+}
+
 /// Elsewhere swole opens no perf counters.
 #[cfg(not(target_os = "linux"))]
 enum Counters {}
@@ -273,6 +288,7 @@ fn serve(
 	mut out: impl Write,
 	watch_threads: bool,
 ) -> Result<(), String> {
+	let mut reported_libc = false;
 	let mut reported_threaded = false;
 	for line in commands.lines() {
 		let line = line.map_err(|e| format!("cannot read a sample's iterations: {e}"))?;
@@ -281,6 +297,8 @@ fn serve(
 			.ok()
 			.filter(|&n| n > 0)
 			.ok_or(format!("cannot sample {line:?} iterations"))?;
+		let before_live = watch_threads && !reported_threaded && threads()? > 1;
+		let before_started = (watch_threads && !reported_threaded).then(started).flatten();
 		#[cfg(all(unix, target_pointer_width = "64"))]
 		let start = rusage::Usage::now();
 		let nanos = sampler.time(iterations);
@@ -294,7 +312,18 @@ fn serve(
 		};
 		#[cfg(not(all(unix, target_pointer_width = "64")))]
 		let used = "";
-		let threaded_line = if watch_threads && !reported_threaded && threads()? > 1 {
+		let libc_line = if watch_threads && !reported_libc {
+			reported_libc = true;
+			libc().map_or_else(String::new, |libc| format!("\n{LIBC}{libc}"))
+		} else {
+			String::new()
+		};
+		let saw_thread = watch_threads
+			&& !reported_threaded
+			&& (before_live
+				|| threads()? > 1
+				|| before_started.is_some_and(|before| started().is_some_and(|after| after > before)));
+		let threaded_line = if saw_thread {
 			reported_threaded = true;
 			format!("\n{THREADED}{name}")
 		} else {
@@ -302,7 +331,7 @@ fn serve(
 		};
 		// One write, which takes stdout's lock once, so a thread the benchmark left printing
 		// cannot write between the records.
-		write!(out, "{threaded_line}{used}\n{SAMPLE}{nanos}\n")
+		write!(out, "{libc_line}{threaded_line}{used}\n{SAMPLE}{nanos}\n")
 			.and_then(|()| out.flush())
 			.map_err(|e| format!("cannot write a sample: {e}"))?;
 	}

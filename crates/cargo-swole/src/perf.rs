@@ -34,6 +34,9 @@ const ALONE: &str = "swole alone ";
 /// What a harness target counting over iterations prints before how many calls its count covers.
 const CALLS: &str = "swole calls ";
 
+/// What a harness target prints before the loaded libc of the benchmark process.
+pub const LIBC: &str = "swole libc ";
+
 /// Where the kernel lists its PMUs.
 const PMUS: &str = "/sys/bus/event_source/devices";
 
@@ -122,6 +125,7 @@ pub struct Pmu {
 }
 
 /// What this host lets swole count, which the native fingerprint holds.
+#[derive(Clone)]
 pub struct Host {
 	/// `kernel.perf_event_paranoid`, when the kernel has one.
 	pub paranoid: Option<i32>,
@@ -134,6 +138,7 @@ pub struct Host {
 }
 
 /// The counters this host lets swole open on a job.
+#[derive(Clone)]
 pub struct Perf {
 	pub pmu: Pmu,
 	/// Whether it counts the kernel as well as user space, as tier L1 lets bench.
@@ -609,7 +614,7 @@ pub fn launch(command: &mut std::process::Command, pmu: &Pmu, pass: &Pass, fixed
 }
 
 /// What one benchmark's count read: its counters' values in the order of its pass, what the
-/// process used over its calls, and whether another thread was there.
+/// process used over its calls, whether another thread was there, and the benchmark's loaded libc.
 #[derive(Debug, PartialEq)]
 pub struct Reading {
 	pub name: String,
@@ -619,6 +624,7 @@ pub struct Reading {
 	pub calls: Option<u64>,
 	pub usage: Option<Usage>,
 	pub threaded: bool,
+	pub libc: Option<String>,
 }
 
 /// What a harness target's output says each benchmark it counted with `counters` counters read.
@@ -626,10 +632,13 @@ pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 	let threads = threads(stdout);
 	let mut usage = None;
 	let mut calls = None;
+	let mut libc = None;
 	let mut readings = Vec::new();
 	for line in stdout.lines() {
 		if let Some(fields) = line.strip_prefix(RUSAGE) {
 			usage = Some(Usage::parse(fields)?);
+		} else if let Some(rest) = line.strip_prefix(LIBC) {
+			libc = Some(rest.to_owned());
 		} else if let Some(rest) = line.strip_prefix(CALLS) {
 			let (n, name) = rest
 				.split_once(' ')
@@ -664,6 +673,7 @@ pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 				calls: calls.take().filter(|&(of, _)| of == name).map(|(_, n)| n),
 				usage: usage.take(),
 				threaded,
+				libc: libc.clone(),
 			});
 		}
 	}
@@ -677,6 +687,7 @@ pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 				calls: None,
 				usage: None,
 				threaded,
+				libc: libc.clone(),
 			});
 		}
 	}
@@ -1185,7 +1196,7 @@ mod tests {
 
 	#[test]
 	fn reads_what_a_harness_counted() {
-		let out = "swole threaded a.rs::g\nswole alone a.rs::f[1 2]\nswole rusage 1 2 3 4 5 6 7\nswole counted 4096 9 a.rs::f[1 2]\n\
+		let out = "swole libc glibc-2.44 /lib/libc.so.6\nswole threaded a.rs::g\nswole alone a.rs::f[1 2]\nswole rusage 1 2 3 4 5 6 7\nswole counted 4096 9 a.rs::f[1 2]\n\
 		           swole ran a.rs::f[1 2]\nown output\nswole calls 3 a.rs::g\nswole counted 12 0 a.rs::g\n";
 		let usage = Usage {
 			user_ns: 1,
@@ -1204,26 +1215,29 @@ mod tests {
 					values: vec![4096, 9],
 					calls: None,
 					usage: Some(usage),
-					threaded: false
+					threaded: false,
+					libc: Some("glibc-2.44 /lib/libc.so.6".to_owned()),
 				},
 				Reading {
 					name: "a.rs::g".to_owned(),
 					values: vec![12, 0],
 					calls: Some(3),
 					usage: None,
-					threaded: true
+					threaded: true,
+					libc: Some("glibc-2.44 /lib/libc.so.6".to_owned()),
 				}
 			]
 		);
 		// A threaded case's harness reads no counters, and says it was threaded.
 		assert_eq!(
-			readings("\nswole threaded a.rs::h\nswole ran a.rs::h\n", 2).unwrap(),
+			readings("\nswole libc static\nswole threaded a.rs::h\nswole ran a.rs::h\n", 2).unwrap(),
 			[Reading {
 				name: "a.rs::h".to_owned(),
 				values: Vec::new(),
 				calls: None,
 				usage: None,
-				threaded: true
+				threaded: true,
+				libc: Some("static".to_owned()),
 			}]
 		);
 		// A thread record a fragment without a newline swallowed is no record.

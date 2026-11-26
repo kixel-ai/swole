@@ -81,6 +81,7 @@ impl Fingerprint {
 /// tier, PMU, and counters its probe found, so a series never mixes two kinds of host or two
 /// sets of counters; the loaded libc and glibc tunables every benchmark inherits, which pick its
 /// string and memory routines; and for quick, the preload, whose code runs inside each count.
+#[derive(Clone)]
 pub struct Native {
 	pub arch: &'static str,
 	/// The CPU's model, as the system describes it.
@@ -110,6 +111,13 @@ impl Native {
 			tunables: std::env::var("GLIBC_TUNABLES").ok(),
 			preload: (mode == crate::Mode::Quick).then(crate::preload::hash),
 		})
+	}
+
+	/// Returns a copy of this host description using the loaded libc reported by the benchmarks.
+	pub fn with_libc(&self, libc: Option<String>) -> Self {
+		let mut updated = self.clone();
+		updated.libc = libc;
+		updated
 	}
 
 	/// Every input, a line each, as the label hashes them.
@@ -202,6 +210,72 @@ fn libc() -> Result<Option<String>, String> {
 #[cfg(not(target_os = "linux"))]
 fn libc() -> Result<Option<String>, String> {
 	Ok(None)
+}
+
+/// Resolves a benchmark process's `swole libc <record>` line to its formatted libc identity
+/// (e.g. `glibc 2.44 (8e1894f1a26c)` or `static`), hashing the library file once per path.
+pub fn libc_from_record(record: &str) -> Result<String, String> {
+	if record == "static" {
+		return Ok("static".to_owned());
+	}
+	let Some((tag, path)) = record
+		.split_once(' ')
+		.filter(|(tag, path)| !tag.is_empty() && !path.is_empty())
+	else {
+		return Err(format!("a harness target printed malformed libc record {record:?}"));
+	};
+	let digest = hash_file(std::path::Path::new(path))?;
+	if let Some(version) = tag.strip_prefix("glibc-") {
+		Ok(format!("glibc {version} ({digest})"))
+	} else if tag == "-" {
+		Ok(digest)
+	} else {
+		Ok(format!("{tag} ({digest})"))
+	}
+}
+
+/// FNV-1a digest of the file at `path`, cached by `(path, len, mtime)` so a suite of many
+/// benchmarks hashes the shared `libc.so.6` once per run.
+fn hash_file(path: &std::path::Path) -> Result<String, String> {
+	use std::collections::HashMap;
+	use std::path::PathBuf;
+	use std::sync::{Mutex, OnceLock};
+	use std::time::SystemTime;
+
+	type Key = (PathBuf, u64, Option<SystemTime>);
+	static CACHE: OnceLock<Mutex<HashMap<Key, String>>> = OnceLock::new();
+	let meta = std::fs::metadata(path).map_err(|e| format!("cannot stat libc {}: {e}", path.display()))?;
+	let key: Key = (path.to_path_buf(), meta.len(), meta.modified().ok());
+	let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+	if let Some(digest) = cache.lock().expect("libc cache lock is never poisoned").get(&key) {
+		return Ok(digest.clone());
+	}
+	let bytes = std::fs::read(path).map_err(|e| format!("cannot read libc {}: {e}", path.display()))?;
+	let mut hash = Fnv::default();
+	hash.bytes(&bytes);
+	let digest = format!("{:012x}", hash.0 >> 16);
+	cache
+		.lock()
+		.expect("libc cache lock is never poisoned")
+		.insert(key, digest.clone());
+	Ok(digest)
+}
+
+/// Validates that all observed benchmark libc identities agree on one libc build, returning it
+/// when at least one was reported, or failing when benchmarks loaded different libc builds.
+pub fn single_libc<'a>(seen: impl IntoIterator<Item = &'a str>) -> Result<Option<String>, String> {
+	let unique: std::collections::BTreeSet<&str> = seen.into_iter().collect();
+	match unique.len() {
+		0 => Ok(None),
+		1 => Ok(unique.into_iter().next().map(str::to_owned)),
+		_ => {
+			let list: Vec<&str> = unique.into_iter().collect();
+			Err(format!(
+				"benchmarks loaded different libc builds ({}), so they cannot share one fingerprint",
+				list.join(", ")
+			))
+		}
+	}
 }
 
 /// The CPU's model as Linux describes each logical CPU, by the fields that name it.
@@ -387,5 +461,34 @@ mod tests {
 		a.libc = Some("glibc 2.39 (000000000001)".to_owned());
 		b.libc = Some("glibc 2.40 (000000000002)".to_owned());
 		assert_ne!(a.label(), b.label());
+	}
+
+	#[test]
+	fn libc_from_record_hashes_benchmark_libc_and_rejects_mixed_builds() {
+		let exe = std::env::current_exe().unwrap();
+		let dir = exe.with_file_name(format!("swole-libc-test-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let a_path = dir.join("libc-a.so");
+		let b_path = dir.join("libc-b.so");
+		std::fs::write(&a_path, b"fake libc build A").unwrap();
+		std::fs::write(&b_path, b"fake libc build B").unwrap();
+
+		let a = libc_from_record(&format!("glibc-2.43 {}", a_path.display())).unwrap();
+		let b = libc_from_record(&format!("glibc-2.44 {}", b_path.display())).unwrap();
+		assert!(a.starts_with("glibc 2.43 ("), "{a}");
+		assert!(b.starts_with("glibc 2.44 ("), "{b}");
+		assert_ne!(a, b);
+		assert_eq!(libc_from_record("static").unwrap(), "static");
+		assert!(libc_from_record("malformed").is_err());
+
+		assert_eq!(single_libc([a.as_str(), a.as_str()]).unwrap(), Some(a.clone()));
+		assert_eq!(single_libc(std::iter::empty::<&str>()).unwrap(), None);
+		let err = single_libc([a.as_str(), b.as_str()]).unwrap_err();
+		assert!(err.contains("different libc builds"), "{err}");
+
+		let base = Native::probe(crate::Mode::Bench).unwrap();
+		assert_ne!(base.with_libc(Some(a)).label(), base.with_libc(Some(b)).label());
+
+		std::fs::remove_dir_all(&dir).unwrap();
 	}
 }

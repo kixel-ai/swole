@@ -175,8 +175,9 @@ counters it reads follow what the host lets swole count. So `quick` and `bench` 
 architecture, the CPU's model as `/proc/cpuinfo` or macOS's `machdep.cpu.brand_string` names
 it, how many CPUs the run may use, and everything the [capability probe](#capabilities) finds:
 `kernel.perf_event_paranoid`, whether swole holds `CAP_PERFMON`, the PMUs the kernel lists, the
-core PMU and its counters, and the passes the probe packed them into; on Linux, the loaded libc
-and `GLIBC_TUNABLES`, which pick glibc's string and memory routines; and for `quick`, the preload. `swole fingerprint quick` and `swole fingerprint bench` print each label, then its
+core PMU and its counters, and the passes the probe packed them into; on Linux, the libc loaded
+by the benchmark processes (refusing runs that mix different libc builds) and `GLIBC_TUNABLES`,
+which pick glibc's string and memory routines; and for `quick`, the preload. `swole fingerprint quick` and `swole fingerprint bench` print each label, then its
 inputs on stderr.
 
 Valgrind 3.27.1 on x86_64 presents one fixed Intel CPU, not the host's: an AMD Ryzen 9 9950X
@@ -340,7 +341,7 @@ inputs built between calls take far longer. A benchmark takes samples for a seco
 least, after a first call that waits out its setup, and its time is their median per call, which the samples a preemption
 spoiled cannot move. It has no interval: load that slows many samples in a row makes them no
 independent evidence of it, so one would look far tighter than a repeat run bears out. A target
-written with CodSpeed's crates fails the run: only a count measures those. The run's processes are neither preloaded nor padded, so their randomness,
+written with CodSpeed's crates fails the run: only a count measures those. The run's processes are neither padded nor shimmed for randomness or time, so their randomness,
 clock, and addresses are the host's own.
 
 `swole bench <base>` builds `<base>` in the worktree a compare keeps, then the working tree,
@@ -380,10 +381,10 @@ to the probed core PMU's CPUs so times and counters measure the same cores on hy
 counts each side's benchmark with every counter the [probe](#capabilities) found, one process for
 each pass, each calling the benchmark as many times as a sample did and counting a deterministic
 stratified subset of up to 64 of those calls (the same calls in every pass and on both sides), a
-counter's share of a call. Those counter processes run under the preload built to count the threads
-a process starts and nothing else (without 1 MiB stack padding), so their clock and randomness stay
-the host's, as the timing's do; its count (and the timing process's thread check) tells whether
-another thread ran beside a call: such a benchmark keeps its time but has no counters, which read
+counter's share of a call. Both the timing and counter processes run under the preload built to
+count the threads a process starts and nothing else (without 1 MiB stack padding), so their clock
+and randomness stay the host's while detecting even short-lived workers spawned and joined inside a
+timed sample or counter pass: such a benchmark keeps its time but has no counters, which read
 the calling thread alone, and a note under the table names it. A table after the times
 prints every measure of each benchmark, beside the base's and its change when paired, and
 `--report` writes them all. A side whose harness predates counters, as a base from before an
