@@ -85,6 +85,7 @@ fn times_each_harness_benchmark() {
 		[
 			"alone",
 			"borrowed",
+			"dropped",
 			"generic[4000]",
 			"handed",
 			"inner::nested[a]",
@@ -140,6 +141,15 @@ fn times_each_harness_benchmark() {
 			"{unstable} {instructions}"
 		);
 		assert!(head("alone")["IPC:u"]["value"].as_f64().unwrap() > 0.0);
+		// A drop to run after each call changes nothing counted: each count, of each side,
+		// starts and stops around every call alike.
+		for counter in ["instructions:u", "instructions:k"] {
+			let Some(alone) = head("alone")[counter]["value"].as_f64() else {
+				continue;
+			};
+			let dropped = head("dropped")[counter]["value"].as_f64().unwrap();
+			assert!((dropped - alone).abs() <= alone / 100.0, "{counter}: {dropped} {alone}");
+		}
 	} else {
 		assert!(head("alone").get("instructions:u").is_none());
 	}

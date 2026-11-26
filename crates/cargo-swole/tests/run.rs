@@ -273,6 +273,7 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 		[
 			"alone",
 			"borrowed",
+			"dropped",
 			"generic[4000]",
 			"handed",
 			"inner::nested[a]",
@@ -311,6 +312,7 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 	near("unstable[1000]", alone);
 	near("unstable[8000]", 8 * alone);
 	near("borrowed", alone);
+	near("dropped", alone);
 	near("generic[4000]", alone);
 	near("word[word]", alone);
 	near("stepped", alone);
@@ -385,7 +387,7 @@ fn counts_with_perf_counters_what_valgrind_does() {
 	assert!(sim.status.success(), "{}", String::from_utf8_lossy(&sim.stderr));
 	let valgrind = table(&sim.stdout);
 	assert_eq!(perf.keys().collect::<Vec<_>>(), valgrind.keys().collect::<Vec<_>>());
-	assert_eq!(perf.len(), 16);
+	assert_eq!(perf.len(), 17);
 	let file = "crates/swole/benches/fixture.rs::";
 	let threaded = [
 		format!("{file}handed"),

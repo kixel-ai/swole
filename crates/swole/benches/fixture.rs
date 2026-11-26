@@ -1,6 +1,6 @@
-//! The benchmarks swole's tests count and time: a loop of known length alone, by
-//! argument, in a module, in an order that changes, behind a setup and between steps whose own
-//! work must go uncounted, on another thread, which must count, and timing itself.
+//! The benchmarks swole's tests count and time: a loop of known length alone, by argument, with
+//! an output to drop, in a module, in an order that changes, behind a setup and between steps
+//! whose own work must go uncounted, on another thread, which must count, and timing itself.
 
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +20,20 @@ fn spin(n: u64) -> u64 {
 #[bench]
 fn alone() -> u64 {
 	spin(1000)
+}
+
+/// An output with a drop to run, which does nothing.
+struct Dropped;
+
+impl Drop for Dropped {
+	fn drop(&mut self) {}
+}
+
+/// Counts as `alone` does: an output's drop changes neither its count nor how counting brackets
+/// its calls.
+#[bench]
+fn dropped() -> (u64, Dropped) {
+	(spin(1000), Dropped)
 }
 
 /// Its literals are `u64`s, as `sized` takes them, which the first would overflow as an `i32`.

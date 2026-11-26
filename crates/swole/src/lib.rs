@@ -498,16 +498,8 @@ pub mod __private {
 
 	impl<I, O, M: FnMut() -> I, F: FnMut(I) -> O> Sampler for Fresh<M, F> {
 		fn count(&mut self, meter: &Meter, iterations: u64) {
-			if iterations > 1 && !self.setup && !std::mem::needs_drop::<I>() && !std::mem::needs_drop::<O>() {
-				// As a sample times them: one count around every call.
-				let mut inputs: Vec<I> = (0..iterations).map(|_| (self.make)()).collect();
-				meter.start();
-				for input in inputs.drain(..) {
-					black_box((self.call)(input));
-				}
-				meter.stop();
-				return;
-			}
+			// A count around each call, whatever the case's shape, so each call carries the same
+			// fixed start and stop cost on every side of a comparison.
 			for _ in 0..iterations {
 				let input = (self.make)();
 				meter.start();
@@ -559,14 +551,7 @@ pub mod __private {
 
 	impl<I, O, F: FnMut(&mut I) -> O> Sampler for Kept<I, F> {
 		fn count(&mut self, meter: &Meter, iterations: u64) {
-			if iterations > 1 && self.before.is_none() && self.after.is_none() && !std::mem::needs_drop::<O>() {
-				meter.start();
-				for _ in 0..iterations {
-					black_box((self.call)(&mut self.input));
-				}
-				meter.stop();
-				return;
-			}
+			// A count around each call, as `Fresh` counts.
 			for _ in 0..iterations {
 				if let Some(before) = &mut self.before {
 					before(&mut self.input);
