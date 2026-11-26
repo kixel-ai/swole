@@ -14,7 +14,7 @@ Afk choice 2026-11-26 ([kixel-ai/swole#6](https://github.com/kixel-ai/swole/pull
 
 Recommendations for the implementer:
 
-- **L0 uncore & energy** (active only when the host exposes L0 and the pass holds a whole-socket lease through [exclusive cores](/quest/m0/exclusive-cores.md)' lease mechanism, since uncore and RAPL counters are socket/package-wide; a pass that cannot take the lease fails the run rather than reporting socket-wide counts on a shared host):
+- **L0 uncore & energy** (active only when the host exposes L0 and the pass holds a whole-socket lease through [exclusive cores](/quest/m0/exclusive-cores.md)' lease mechanism, since uncore and RAPL counters are socket/package-wide; a pass that cannot take a host-enforced lease fails the run rather than reporting socket-wide counts on a shared host):
   - Probe `/sys/bus/event_source/devices/` for `power` / `power_core` (RAPL `energy-pkg`, `energy-cores` with their `*.scale` and `*.unit` sysfs files) and uncore memory/L3 PMUs (`amd_l3`, `amd_df`, `amd_umc_*` on AMD; `uncore_imc_*` on Intel), failing loudly if a probed sysfs event cannot open.
   - Report energy in joules (or microjoules) per iteration and memory bandwidth / L3 misses per benchmark.
 - **L-1 off-CPU & contention**:
