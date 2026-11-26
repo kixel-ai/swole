@@ -12,7 +12,7 @@ Baseline from the first run, [kixel-ai/swole#7](https://github.com/kixel-ai/swol
 - `quest messages --since 2026-10-25` ran in a swole checkout on desktop, fedora, mini, nixos, and kixtop. It dropped entries from directories no origin names: 51 on desktop, 5 on fedora, 1 on mini, 2 on nixos, and 6 on kixtop.
 - Loaded sizes:
   - `AGENTS.md`: 1,675 bytes after the run (1,833 before).
-  - `CONTRIBUTING.md`: 876 bytes, read on demand.
+  - `CONTRIBUTING.md`: 885 bytes, read on demand.
   - Skill stubs: 8 per harness, 827 description characters in all.
   - Claude Code loads the root `AGENTS.md` natively, since no `CLAUDE.md` exists. Codex joins it with the machine's 3,980-byte `~/.codex/AGENTS.md`, about 5.7 KB of its 32 KiB `project_doc_max_bytes`.
 - Guidance was read 2026-11-26: every page `quest guide prompting` links, plus Claude's Opus 5.5 prompting page and Claude Code's permissions page. The newest-GPT page covers `gpt-6.2-astra`, while `quest review` runs `gpt-6.2-sol`.
