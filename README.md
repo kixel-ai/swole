@@ -175,8 +175,8 @@ counters it reads follow what the host lets swole count. So `quick` and `bench` 
 architecture, the CPU's model as `/proc/cpuinfo` or macOS's `machdep.cpu.brand_string` names
 it, how many CPUs the run may use, and everything the [capability probe](#capabilities) finds:
 `kernel.perf_event_paranoid`, whether swole holds `CAP_PERFMON`, the PMUs the kernel lists, the
-core PMU and its counters, and the passes the probe packed them into; `GLIBC_TUNABLES`, which
-picks glibc's string and memory routines; and for `quick`, the preload. `swole fingerprint quick` and `swole fingerprint bench` print each label, then its
+core PMU and its counters, and the passes the probe packed them into; on Linux, the loaded libc
+and `GLIBC_TUNABLES`, which pick glibc's string and memory routines; and for `quick`, the preload. `swole fingerprint quick` and `swole fingerprint bench` print each label, then its
 inputs on stderr.
 
 Valgrind 3.27.1 on x86_64 presents one fixed Intel CPU, not the host's: an AMD Ryzen 9 9950X
@@ -375,14 +375,16 @@ Beside each time, `bench` reports what the process used over its samples, from `
 Linux and macOS: user and system CPU time, minor and major page faults, and voluntary and
 involuntary context switches, each a call's share, and the process's peak resident memory.
 Each covers a sample's whole, steps and inputs built between calls included, which the clock
-leaves out. Where the host has perf counters, it then counts each side's benchmark with every
-counter the [probe](#capabilities) found, one process for each pass, each calling the
-benchmark as many times as a sample did and counting about 64 of those calls, spread evenly
-over them, the same calls in every pass and on both sides, a counter's share of a call. Those processes run
-pinned to the PMU's CPUs, and under the preload built to count the threads a process starts
-and nothing else, so their clock and randomness stay the host's, as the timing's do; its count
-tells whether another thread ran beside a call: such a benchmark keeps its time but has no counters, which read the
-calling thread alone, and a note under the table names it. A table after the times
+leaves out. Where the host has perf counters, `bench` pins both the timing and counting processes
+to the probed core PMU's CPUs so times and counters measure the same cores on hybrid hosts, and
+counts each side's benchmark with every counter the [probe](#capabilities) found, one process for
+each pass, each calling the benchmark as many times as a sample did and counting a deterministic
+stratified subset of up to 64 of those calls (the same calls in every pass and on both sides), a
+counter's share of a call. Those counter processes run under the preload built to count the threads
+a process starts and nothing else (without 1 MiB stack padding), so their clock and randomness stay
+the host's, as the timing's do; its count (and the timing process's thread check) tells whether
+another thread ran beside a call: such a benchmark keeps its time but has no counters, which read
+the calling thread alone, and a note under the table names it. A table after the times
 prints every measure of each benchmark, beside the base's and its change when paired, and
 `--report` writes them all. A side whose harness predates counters, as a base from before an
 upgrade, says so and has none; one whose harness predates rusage has none of that.

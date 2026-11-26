@@ -164,9 +164,10 @@ tells swole whether another thread, whose work the counters cannot see, ran besi
 then prints a `swole rusage` line of what the process used over the call and
 `swole counted <value>... <name>`, each counter's value in the order swole opened them, before
 `swole ran <name>`. The benchmark itself needs no privilege: swole opens the counters with its
-own. With `SWOLE_ITERATIONS` as well, it first replays the uncounted calls `swole bench` warms
-it up with before timing, one call and then batches doubled from one up to that many, then calls
-it that many times, counting about 64 of the calls spread evenly over them, every
-`ceil(that many / 64)`th from the first, and prints `swole calls <n> <name>`, how many its counts
-cover, or a benchmark that times itself once, for that many iterations. `swole quick` and `swole bench`
-set them, as the [README](../../README.md#quick) says.
+own. `swole quick` sets `SWOLE_COUNTERS` alone (counting one call without warm-up). `swole bench` sets
+both `SWOLE_COUNTERS` and `SWOLE_ITERATIONS`: the harness first replays the uncounted calls `bench`
+warms it up with before timing, one call and then batches doubled from one up to that many, then
+calls it that many times, counting a deterministic stratified subset of up to 64 of those calls
+(while watching every call for worker threads), and prints `swole calls <n> <name>`, how many its
+counts cover, or a benchmark that times itself once, for that many iterations. See the
+[README](../../README.md#quick).

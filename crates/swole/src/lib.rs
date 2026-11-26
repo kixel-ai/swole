@@ -130,23 +130,26 @@ fn run() -> Result<(), String> {
 		return Err(format!("{TIME} times one benchmark, which {ONLY} names"));
 	}
 	if timed {
-		let (_, case) = cases.pop_first().expect("one case is left");
-		return serve((case.build)(), std::io::stdin().lock(), std::io::stdout());
+		let (name, case) = cases.pop_first().expect("one case is left");
+		return serve(&name, (case.build)(), std::io::stdin().lock(), std::io::stdout(), true);
 	}
 	let counters = split(COUNTERS)?;
 	let warm = number(ITERATIONS)?;
 	let iterations = warm.unwrap_or(1);
-	if counters.is_some() && cases.len() != 1 {
+	if counters.is_some() && !watched {
 		return Err(format!("{COUNTERS} counts one benchmark, which {ONLY} names"));
 	}
-	if iterations != 1 && counters.is_none() {
+	if warm.is_some() && counters.is_none() {
 		return Err(format!(
 			"{ITERATIONS} counts with perf counters, which {COUNTERS} has swole open"
 		));
 	}
 	let mut counters = counters.map(open).transpose()?;
 	for (name, case) in cases {
-		let meter = __private::Meter::new(&name, counters.take(), watched)?;
+		// `bench` collects rusage from its timed samples and discards counter-pass rusage, so skip
+		// per-call getrusage syscalls when `SWOLE_ITERATIONS` is set.
+		let record_usage = counters.is_some() && warm.is_none();
+		let meter = __private::Meter::new(&name, counters.take(), watched, record_usage)?;
 		let mut sampler = (case.build)();
 		if warm.is_some() {
 			// Counted as bench times it: after the samples that warm it up, uncounted, one call
@@ -161,12 +164,7 @@ fn run() -> Result<(), String> {
 				batch *= 2;
 			}
 		}
-		// Counted calls, each bracketed apart, take far longer than timed ones, so a count over
-		// many iterations brackets only every `stride`th, the rest running between them
-		// uncounted, so every pass and both sides of a comparison count the same calls of the same
-		// workload.
-		let stride = iterations.div_ceil(COUNTED_CALLS);
-		let calls = sampler.count(&meter, iterations, stride);
+		let calls = sampler.count(&meter, iterations);
 		drop(sampler);
 		let watch = meter.finish().map_err(|err| format!("{name}: {err}"))?;
 		// The records start on a fresh line, as a benchmark's own output may not have ended one,
@@ -268,7 +266,14 @@ fn number(key: &str) -> Result<Option<u64>, String> {
 /// Times `sampler` once for each line of `commands`, an iteration count, printing each sample's
 /// nanoseconds to `out` until `commands` ends, after what the process used over it. Each sample's
 /// line starts a line of its own, so a benchmark's own unfinished line never runs into it.
-fn serve(mut sampler: Box<dyn __private::Sampler>, commands: impl BufRead, mut out: impl Write) -> Result<(), String> {
+fn serve(
+	name: &str,
+	mut sampler: Box<dyn __private::Sampler>,
+	commands: impl BufRead,
+	mut out: impl Write,
+	watch_threads: bool,
+) -> Result<(), String> {
+	let mut reported_threaded = false;
 	for line in commands.lines() {
 		let line = line.map_err(|e| format!("cannot read a sample's iterations: {e}"))?;
 		let iterations = line
@@ -289,9 +294,15 @@ fn serve(mut sampler: Box<dyn __private::Sampler>, commands: impl BufRead, mut o
 		};
 		#[cfg(not(all(unix, target_pointer_width = "64")))]
 		let used = "";
+		let threaded_line = if watch_threads && !reported_threaded && threads()? > 1 {
+			reported_threaded = true;
+			format!("\n{THREADED}{name}")
+		} else {
+			String::new()
+		};
 		// One write, which takes stdout's lock once, so a thread the benchmark left printing
 		// cannot write between the records.
-		write!(out, "{used}\n{SAMPLE}{nanos}\n")
+		write!(out, "{threaded_line}{used}\n{SAMPLE}{nanos}\n")
 			.and_then(|()| out.flush())
 			.map_err(|e| format!("cannot write a sample: {e}"))?;
 	}
@@ -399,11 +410,64 @@ pub mod __private {
 
 	/// A case set up, which runs its benchmark once counted or many times timed.
 	pub trait Sampler {
-		/// Calls the benchmark `iterations` times, counting every `stride`th call, from the first,
-		/// between the meter's requests, and returns how many calls the count covers.
-		fn count(&mut self, meter: &Meter, iterations: u64, stride: u64) -> u64;
+		/// Calls the benchmark `iterations` times, counting a deterministic stratified subset of
+		/// at most `COUNTED_CALLS` calls between the meter's requests while watching every call
+		/// for worker threads, and returns how many calls the count covers.
+		fn count(&mut self, meter: &Meter, iterations: u64) -> u64;
 		/// Calls the benchmark `iterations` times, returning the nanoseconds its timed part took.
 		fn time(&mut self, iterations: u64) -> u64;
+	}
+
+	/// A deterministic, phase-free subset of `iterations` calls: every call when `iterations <=
+	/// COUNTED_CALLS`, else one call per equal stratum at a deterministic SplitMix64-jittered
+	/// offset, so every pass and both sides of a comparison count the same calls without locking
+	/// onto periodic work (power-of-two, even/odd, etc.).
+	pub(crate) struct Pick {
+		iterations: u64,
+		count: u64,
+		stratum: u64,
+		next: u64,
+	}
+
+	impl Pick {
+		pub(crate) fn new(iterations: u64) -> Self {
+			let count = iterations.min(crate::COUNTED_CALLS);
+			let mut pick = Self {
+				iterations,
+				count,
+				stratum: 0,
+				next: 0,
+			};
+			pick.next = pick.at(0);
+			pick
+		}
+
+		fn at(&self, s: u64) -> u64 {
+			if self.count == 0 || s >= self.count {
+				return u64::MAX;
+			}
+			if self.iterations <= crate::COUNTED_CALLS {
+				return s;
+			}
+			let lo = (u128::from(s) * u128::from(self.iterations) / u128::from(self.count)) as u64;
+			let hi = (u128::from(s + 1) * u128::from(self.iterations) / u128::from(self.count)) as u64;
+			let mut z = s.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ self.iterations;
+			z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+			z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+			z ^= z >> 31;
+			lo + z % (hi - lo)
+		}
+
+		#[inline(always)]
+		pub(crate) fn take(&mut self, i: u64) -> bool {
+			if i == self.next {
+				self.stratum += 1;
+				self.next = self.at(self.stratum);
+				true
+			} else {
+				false
+			}
+		}
 	}
 
 	/// Brackets one case with Callgrind's client requests, so Valgrind run with
@@ -430,6 +494,11 @@ pub mod __private {
 	/// What a meter has seen so far.
 	struct Watching {
 		threaded: bool,
+		/// Whether `/proc/self/task` has been scanned at least once.
+		checked: bool,
+		/// Last observed `swole_threads_started()` count, so `/proc/self/task` is rescanned only
+		/// when a new thread was created or when no preload is loaded.
+		last_started: Option<u64>,
 		/// How many threads the preload saw start before the current call.
 		started: Option<u64>,
 		#[cfg(all(unix, target_pointer_width = "64"))]
@@ -440,15 +509,24 @@ pub mod __private {
 
 	impl Meter {
 		/// A meter of the case `name`, which also starts and stops `counters`, when given, and
-		/// when `watched`, sees whether other threads ran.
-		pub(crate) fn new(name: &str, counters: Option<crate::Counters>, watched: bool) -> Result<Self, String> {
+		/// when `watched`, sees whether other threads ran (recording `rusage` when `record_usage`).
+		pub(crate) fn new(
+			name: &str,
+			counters: Option<crate::Counters>,
+			watched: bool,
+			record_usage: bool,
+		) -> Result<Self, String> {
 			let name = CString::new(name).map_err(|_| format!("{name:?} holds a NUL"))?;
+			#[cfg(not(all(unix, target_pointer_width = "64")))]
+			let _ = record_usage;
 			let watch = watched.then(|| {
 				RefCell::new(Watching {
 					threaded: false,
+					checked: false,
+					last_started: None,
 					started: None,
 					#[cfg(all(unix, target_pointer_width = "64"))]
-					usage: counters.as_ref().map(|_| Default::default()),
+					usage: record_usage.then(Default::default),
 					error: None,
 				})
 			});
@@ -483,6 +561,19 @@ pub mod __private {
 			}
 		}
 
+		/// Watches an uncounted call (skipped by stratified sampling) for worker threads without
+		/// opening counters or scanning `/proc/self/task` unless a new thread was started.
+		#[inline(always)]
+		pub(crate) fn uncounted<R>(&self, f: impl FnOnce() -> R) -> R {
+			let Some(watch) = &self.watch else {
+				return f();
+			};
+			let before = watch.borrow_mut().begin_uncounted();
+			let out = f();
+			watch.borrow_mut().end_uncounted(before);
+			out
+		}
+
 		/// What the meter saw over every call, once they have run.
 		pub(crate) fn finish(self) -> Result<Watched, String> {
 			let Some(watch) = self.watch else {
@@ -492,7 +583,8 @@ pub mod __private {
 					counted: None,
 				});
 			};
-			let watch = watch.into_inner();
+			let mut watch = watch.into_inner();
+			watch.look();
 			if let Some(err) = watch.error {
 				return Err(err);
 			}
@@ -518,25 +610,51 @@ pub mod __private {
 	}
 
 	impl Watching {
-		/// Before a call: whether another thread is there already, and what was used so far.
+		/// Checks `/proc/self/task` once initially, and again only when no preload is active or
+		/// when `swole_threads_started()` changed since the last scan.
+		#[inline(always)]
+		fn check_threads(&mut self) -> Option<u64> {
+			let now = crate::started();
+			if !self.checked || now.is_none() || now != self.last_started {
+				self.look();
+				self.checked = true;
+				self.last_started = now;
+			}
+			now
+		}
+
+		/// Before a counted call: whether another thread is there already, and what was used so far.
 		fn before(&mut self) {
-			self.look();
-			self.started = crate::started();
+			self.started = self.check_threads();
 			#[cfg(all(unix, target_pointer_width = "64"))]
 			if let Some((start, _)) = &mut self.usage {
 				*start = crate::rusage::Usage::now();
 			}
 		}
 
-		/// After a call: what it used, and whether another thread is there, or was started and is gone.
+		/// After a counted call: what it used, and whether another thread is there, or was started and is gone.
 		fn after(&mut self) {
 			#[cfg(all(unix, target_pointer_width = "64"))]
 			if let Some((start, used)) = &mut self.usage {
 				crate::rusage::Usage::now().add_since(*start, used);
 			}
-			self.look();
-			if crate::started() != self.started {
+			let now = self.check_threads();
+			if now != self.started {
 				self.threaded = true;
+			}
+		}
+
+		#[inline(always)]
+		fn begin_uncounted(&mut self) -> Option<u64> {
+			self.check_threads()
+		}
+
+		#[inline(always)]
+		fn end_uncounted(&mut self, before: Option<u64>) {
+			let now = crate::started();
+			if now != before {
+				self.threaded = true;
+				self.last_started = now;
 			}
 		}
 
@@ -575,16 +693,17 @@ pub mod __private {
 	}
 
 	impl<I, O, M: FnMut() -> I, F: FnMut(I) -> O> Sampler for Fresh<M, F> {
-		fn count(&mut self, meter: &Meter, iterations: u64, stride: u64) -> u64 {
+		fn count(&mut self, meter: &Meter, iterations: u64) -> u64 {
 			// A count around each counted call, whatever the case's shape, so each carries the
 			// same fixed start and stop cost on every side of a comparison.
+			let mut pick = Pick::new(iterations);
 			let mut calls = 0;
 			if self.batched::<I, O>() {
 				// Clones prepared as `time` prepares them: all of them before the first call.
 				let inputs: Vec<I> = (0..iterations).map(|_| (self.make)()).collect();
 				for (i, input) in (0..).zip(inputs) {
-					if i % stride != 0 {
-						black_box((self.call)(input));
+					if !pick.take(i) {
+						meter.uncounted(|| black_box((self.call)(input)));
 						continue;
 					}
 					meter.start();
@@ -596,8 +715,9 @@ pub mod __private {
 			}
 			for i in 0..iterations {
 				let input = (self.make)();
-				if i % stride != 0 {
-					drop(black_box((self.call)(input)));
+				if !pick.take(i) {
+					let output = meter.uncounted(|| black_box((self.call)(input)));
+					drop(output);
 					continue;
 				}
 				meter.start();
@@ -650,22 +770,23 @@ pub mod __private {
 	type Step<I> = Box<dyn FnMut(&mut I)>;
 
 	impl<I, O, F: FnMut(&mut I) -> O> Sampler for Kept<I, F> {
-		fn count(&mut self, meter: &Meter, iterations: u64, stride: u64) -> u64 {
+		fn count(&mut self, meter: &Meter, iterations: u64) -> u64 {
 			// A count around each counted call, as `Fresh` counts.
+			let mut pick = Pick::new(iterations);
 			let mut calls = 0;
 			for i in 0..iterations {
 				if let Some(before) = &mut self.before {
 					before(&mut self.input);
 				}
-				let counted = i % stride == 0;
-				if counted {
+				let output = if pick.take(i) {
 					meter.start();
-				}
-				let output = black_box((self.call)(&mut self.input));
-				if counted {
+					let output = black_box((self.call)(&mut self.input));
 					meter.stop();
 					calls += 1;
-				}
+					output
+				} else {
+					meter.uncounted(|| black_box((self.call)(&mut self.input)))
+				};
 				drop(output);
 				if let Some(after) = &mut self.after {
 					after(&mut self.input);
@@ -710,7 +831,7 @@ pub mod __private {
 	}
 
 	impl<I, M: FnMut() -> I, F: FnMut(I, Iterations) -> Duration> Sampler for FreshTimed<M, F> {
-		fn count(&mut self, meter: &Meter, iterations: u64, _: u64) -> u64 {
+		fn count(&mut self, meter: &Meter, iterations: u64) -> u64 {
 			// It runs its iterations itself, so one count covers them all.
 			let input = (self.make)();
 			meter.start();
@@ -733,7 +854,7 @@ pub mod __private {
 	}
 
 	impl<I, F: FnMut(&mut I, Iterations) -> Duration> Sampler for KeptTimed<I, F> {
-		fn count(&mut self, meter: &Meter, iterations: u64, _: u64) -> u64 {
+		fn count(&mut self, meter: &Meter, iterations: u64) -> u64 {
 			// It runs its iterations itself, so one count covers them all.
 			meter.start();
 			black_box((self.call)(&mut self.input, Iterations(iterations)));
@@ -961,7 +1082,7 @@ mod tests {
 
 	#[test]
 	fn a_name_with_a_nul_is_refused() {
-		assert!(Meter::new("a\0b", None, false).is_err());
+		assert!(Meter::new("a\0b", None, false, false).is_err());
 	}
 
 	#[test]
@@ -1000,7 +1121,7 @@ mod tests {
 		sampler.time(2);
 		assert_eq!(*log.borrow(), ["make", "call", "drop", "make", "call", "drop"]);
 		log.borrow_mut().clear();
-		sampler.count(&Meter::new("a", None, false).unwrap(), 1, 1);
+		sampler.count(&Meter::new("a", None, false, false).unwrap(), 1);
 		assert_eq!(*log.borrow(), ["make", "call", "drop"]);
 
 		// With nothing to drop, setup still runs just before each call, since it may reset what
@@ -1025,24 +1146,37 @@ mod tests {
 			assert_eq!(*log.borrow(), order);
 			// A count prepares them in the same order.
 			log.borrow_mut().clear();
-			sampler.count(&Meter::new("a", None, false).unwrap(), 2, 1);
+			sampler.count(&Meter::new("a", None, false, false).unwrap(), 2);
 			assert_eq!(*log.borrow(), order);
 		}
 	}
 
 	#[test]
-	fn a_count_over_iterations_runs_them_all_and_counts_every_strideth() {
+	fn a_count_over_iterations_runs_them_all_with_stratified_phase_free_picks() {
 		let calls = Rc::new(RefCell::new(0u64));
 		let made = calls.clone();
 		let mut sampler = fresh(|| 1u64, move |n: u64| *made.borrow_mut() += n);
-		let meter = Meter::new("a", None, false).unwrap();
-		assert_eq!(sampler.count(&meter, 5, 2), 3);
+		let meter = Meter::new("a", None, false, false).unwrap();
+		assert_eq!(sampler.count(&meter, 5), 5);
 		assert_eq!(*calls.borrow(), 5);
 		let kept_calls = Rc::new(RefCell::new(0u64));
 		let made = kept_calls.clone();
 		let mut sampler = kept(0u64, move |_: &mut u64| *made.borrow_mut() += 1, None, None);
-		assert_eq!(sampler.count(&meter, 7, 3), 3);
-		assert_eq!(*kept_calls.borrow(), 7);
+		assert_eq!(sampler.count(&meter, 1024), COUNTED_CALLS);
+		assert_eq!(*kept_calls.borrow(), 1024);
+
+		// Stratified jittered picks stay deterministic and avoid locking onto periodic phases.
+		let sample = |iterations: u64| -> Vec<u64> {
+			let mut pick = __private::Pick::new(iterations);
+			(0..iterations).filter(|&i| pick.take(i)).collect()
+		};
+		let picked = sample(1024);
+		assert_eq!(picked.len(), COUNTED_CALLS as usize);
+		assert_eq!(picked, sample(1024));
+		for period in [2u64, 4, 8, 16] {
+			let residues: std::collections::BTreeSet<u64> = picked.iter().map(|&i| i % period).collect();
+			assert!(residues.len() > 1, "period {period} locked to {residues:?}");
+		}
 	}
 
 	#[test]
@@ -1063,10 +1197,10 @@ mod tests {
 		let each = ["before", "call", "drop", "after"];
 		assert_eq!(*log.borrow(), [each, each].concat());
 		log.borrow_mut().clear();
-		sampler.count(&Meter::new("a", None, false).unwrap(), 1, 1);
+		sampler.count(&Meter::new("a", None, false, false).unwrap(), 1);
 		assert_eq!(*log.borrow(), each);
 		log.borrow_mut().clear();
-		sampler.count(&Meter::new("a", None, false).unwrap(), 2, 1);
+		sampler.count(&Meter::new("a", None, false, false).unwrap(), 2);
 		assert_eq!(*log.borrow(), [each, each].concat());
 
 		// Without steps, every output still drops before the next call, so a guard it holds never
@@ -1106,20 +1240,25 @@ mod tests {
 		let sampler = kept_timed((), |_: &mut (), iterations: Iterations| {
 			Duration::from_nanos(10 * iterations.get())
 		});
-		serve(sampler, "1\n4\n".as_bytes(), &mut out).unwrap();
+		serve("a", sampler, "1\n4\n".as_bytes(), &mut out, false).unwrap();
 		let out = String::from_utf8(out).unwrap();
 		let lines: Vec<&str> = out.lines().filter(|line| !line.is_empty()).collect();
-		assert_eq!(lines.len(), 4, "{out}");
-		assert_eq!([lines[1], lines[3]], ["swole sample 10", "swole sample 40"]);
-		// What the process used over each sample comes first, so an older swole reads it as the
-		// benchmark's own output.
-		for usage in [lines[0], lines[2]] {
-			let fields = usage.strip_prefix(RUSAGE).unwrap().split(' ');
-			let fields: Vec<u64> = fields.map(|n| n.parse().unwrap()).collect();
-			assert_eq!(fields.len(), 7, "{usage}");
+		#[cfg(all(unix, target_pointer_width = "64"))]
+		{
+			assert_eq!(lines.len(), 4, "{out}");
+			assert_eq!([lines[1], lines[3]], ["swole sample 10", "swole sample 40"]);
+			// What the process used over each sample comes first, so an older swole reads it as the
+			// benchmark's own output.
+			for usage in [lines[0], lines[2]] {
+				let fields = usage.strip_prefix(RUSAGE).unwrap().split(' ');
+				let fields: Vec<u64> = fields.map(|n| n.parse().unwrap()).collect();
+				assert_eq!(fields.len(), 7, "{usage}");
+			}
 		}
+		#[cfg(not(all(unix, target_pointer_width = "64")))]
+		assert_eq!(lines, ["swole sample 10", "swole sample 40"]);
 		for bad in ["0\n", "x\n", " 1\n"] {
-			let err = serve(nothing(), bad.as_bytes(), Vec::new()).unwrap_err();
+			let err = serve("a", nothing(), bad.as_bytes(), Vec::new(), false).unwrap_err();
 			assert!(err.contains("cannot sample"), "{bad:?}: {err}");
 		}
 	}

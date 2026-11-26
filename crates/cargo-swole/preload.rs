@@ -215,6 +215,7 @@ fn refuse(line: &[u8]) -> ! {
 extern "C" fn init() {
 	loaded();
 	create();
+	let _ = thrd_create_real();
 	// SAFETY: glibc's own registration, which pthread_atfork wraps; this library is never
 	// unloaded, so it names no DSO.
 	unsafe { __register_atfork(None, None, Some(loaded), core::ptr::null_mut()) };
@@ -760,6 +761,49 @@ pub unsafe extern "C" fn pthread_create(
 ) -> c_int {
 	// SAFETY: the caller's arguments, passed on.
 	let made = unsafe { create()(thread, attr, start, arg) };
+	if made == 0 {
+		STARTED.fetch_add(1, Relaxed);
+	}
+	made
+}
+
+/// glibc's C11 `thrd_create`, which calls internal `__pthread_create` directly and bypasses the
+/// interposed `pthread_create`.
+type ThrdCreate = unsafe extern "C" fn(*mut u64, extern "C" fn(*mut c_void) -> c_int, *mut c_void) -> c_int;
+
+/// Finds `thrd_create` once at load time (returning `None` on a libc that lacks C11 threads).
+fn thrd_create_real() -> Option<ThrdCreate> {
+	static FOUND: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+	// Sentinel indicating lookup already ran and found no symbol.
+	let missing = 1usize as *mut c_void;
+	let mut found = FOUND.load(Relaxed);
+	if found.is_null() {
+		// SAFETY: the name is NUL-terminated, and RTLD_NEXT is a handle dlsym takes.
+		let sym = unsafe { dlsym(RTLD_NEXT, c"thrd_create".as_ptr()) };
+		found = if sym.is_null() { missing } else { sym };
+		FOUND.store(found, Relaxed);
+	}
+	if found == missing {
+		None
+	} else {
+		// SAFETY: glibc's `thrd_create` has this signature.
+		Some(unsafe { core::mem::transmute::<*mut c_void, ThrdCreate>(found) })
+	}
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thrd_create(
+	thr: *mut u64,
+	func: extern "C" fn(*mut c_void) -> c_int,
+	arg: *mut c_void,
+) -> c_int {
+	let Some(real) = thrd_create_real() else {
+		// SAFETY: abort takes nothing and never returns.
+		unsafe { abort() }
+	};
+	// SAFETY: the caller's arguments, passed on.
+	let made = unsafe { real(thr, func, arg) };
+	// C11 `thrd_success` is 0.
 	if made == 0 {
 		STARTED.fetch_add(1, Relaxed);
 	}

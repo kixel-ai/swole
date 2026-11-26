@@ -79,8 +79,8 @@ impl Fingerprint {
 /// The environment a native measure, quick's count or bench's time, is comparable within: the
 /// CPU's model, how many CPUs swole may run on, and what the host lets swole count, the perf
 /// tier, PMU, and counters its probe found, so a series never mixes two kinds of host or two
-/// sets of counters; the glibc tunables every benchmark inherits, which pick its string and
-/// memory routines; and for quick, the preload, whose code runs inside each count.
+/// sets of counters; the loaded libc and glibc tunables every benchmark inherits, which pick its
+/// string and memory routines; and for quick, the preload, whose code runs inside each count.
 pub struct Native {
 	pub arch: &'static str,
 	/// The CPU's model, as the system describes it.
@@ -88,6 +88,8 @@ pub struct Native {
 	/// How many CPUs swole may run on.
 	pub cpus: usize,
 	pub host: crate::perf::Host,
+	/// The loaded libc identity and hash on Linux, so counts never mix across libc builds.
+	pub libc: Option<String>,
 	/// `GLIBC_TUNABLES`, as every benchmark inherits it.
 	pub tunables: Option<String>,
 	/// The preload's hash, for a count that runs with it.
@@ -104,6 +106,7 @@ impl Native {
 				.map_err(|e| format!("cannot count the CPUs: {e}"))?
 				.get(),
 			host: crate::perf::Host::probe(mode)?,
+			libc: libc()?,
 			tunables: std::env::var("GLIBC_TUNABLES").ok(),
 			preload: (mode == crate::Mode::Quick).then(crate::preload::hash),
 		})
@@ -115,12 +118,15 @@ impl Native {
 			"arch: {}
 CPUs: {}
 GLIBC_TUNABLES: {}
-{}",
+",
 			self.arch,
 			self.cpus,
-			self.tunables.as_deref().unwrap_or("(unset)"),
-			self.host.describe()
+			self.tunables.as_deref().unwrap_or("(unset)")
 		);
+		if let Some(libc) = &self.libc {
+			out.push_str(&format!("libc: {libc}\n"));
+		}
+		out.push_str(&self.host.describe());
 		if let Some(preload) = &self.preload {
 			out.push_str(&format!(
 				"preload: {preload}
@@ -137,6 +143,65 @@ GLIBC_TUNABLES: {}
 		hash.write(&self.describe());
 		format!("{}-{:012x}", self.arch, hash.0 >> 16)
 	}
+}
+
+/// The loaded libc on Linux, by version (when glibc) and a hash of its library bytes, so native
+/// counts never collide across different libc builds on the same CPU.
+#[cfg(target_os = "linux")]
+fn libc() -> Result<Option<String>, String> {
+	#[repr(C)]
+	struct DlInfo {
+		dli_fname: *const std::ffi::c_char,
+		dli_fbase: *mut std::ffi::c_void,
+		dli_sname: *const std::ffi::c_char,
+		dli_saddr: *mut std::ffi::c_void,
+	}
+	unsafe extern "C" {
+		fn getpid() -> i32;
+		fn dladdr(addr: *const std::ffi::c_void, info: *mut DlInfo) -> i32;
+		#[cfg(target_env = "gnu")]
+		fn gnu_get_libc_version() -> *const std::ffi::c_char;
+	}
+	let mut info = DlInfo {
+		dli_fname: std::ptr::null(),
+		dli_fbase: std::ptr::null_mut(),
+		dli_sname: std::ptr::null(),
+		dli_saddr: std::ptr::null_mut(),
+	};
+	// SAFETY: `getpid` is a valid code address in libc; `info` is writable.
+	let ok = unsafe { dladdr(getpid as *const std::ffi::c_void, &mut info) };
+	let digest = if ok != 0 && !info.dli_fname.is_null() {
+		// SAFETY: `dladdr` sets `dli_fname` to a NUL-terminated path when non-null.
+		let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
+		let path = std::path::Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
+			path.to_bytes(),
+		));
+		let bytes = std::fs::read(path).map_err(|e| format!("cannot read libc {}: {e}", path.display()))?;
+		let mut hash = Fnv::default();
+		hash.bytes(&bytes);
+		Some(format!("{:012x}", hash.0 >> 16))
+	} else {
+		None
+	};
+	#[cfg(target_env = "gnu")]
+	let version = {
+		// SAFETY: `gnu_get_libc_version` returns a static NUL-terminated string.
+		let ver = unsafe { std::ffi::CStr::from_ptr(gnu_get_libc_version()) };
+		Some(format!("glibc {}", ver.to_string_lossy()))
+	};
+	#[cfg(not(target_env = "gnu"))]
+	let version: Option<String> = None;
+	Ok(match (version, digest) {
+		(Some(version), Some(digest)) => Some(format!("{version} ({digest})")),
+		(Some(version), None) => Some(version),
+		(None, Some(digest)) => Some(digest),
+		(None, None) => None,
+	})
+}
+
+#[cfg(not(target_os = "linux"))]
+fn libc() -> Result<Option<String>, String> {
+	Ok(None)
 }
 
 /// The CPU's model as Linux describes each logical CPU, by the fields that name it.
@@ -310,5 +375,17 @@ mod tests {
 		for changed in [tuned, other, cpu, preload] {
 			assert_ne!(changed.label(), base);
 		}
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn native_fingerprint_includes_loaded_libc() {
+		let found = libc().unwrap();
+		assert!(found.is_some(), "expected loaded libc on Linux");
+		let mut a = Native::probe(crate::Mode::Bench).unwrap();
+		let mut b = Native::probe(crate::Mode::Bench).unwrap();
+		a.libc = Some("glibc 2.39 (000000000001)".to_owned());
+		b.libc = Some("glibc 2.40 (000000000002)".to_owned());
+		assert_ne!(a.label(), b.label());
 	}
 }

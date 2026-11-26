@@ -25,7 +25,7 @@ const COUNTED: &str = "swole counted ";
 pub const RUSAGE: &str = "swole rusage ";
 
 /// What a harness target prints before the name of a benchmark beside which it had another thread.
-const THREADED: &str = "swole threaded ";
+pub const THREADED: &str = "swole threaded ";
 
 /// What a harness target prints before the name of a benchmark beside which it had no other
 /// thread; one too old to watch prints neither.
@@ -138,8 +138,8 @@ pub struct Perf {
 	pub pmu: Pmu,
 	/// Whether it counts the kernel as well as user space, as tier L1 lets bench.
 	pub kernel: bool,
-	/// How many general-purpose counters the PMU schedules at once.
-	pub slots: usize,
+	/// How many general-purpose counters the PMU schedules at once, when branch counters can probe it.
+	pub slots: Option<usize>,
 	/// Every event it counts, in the passes that count them all: hardware ones packed into groups
 	/// that each fit the PMU at once, and software ones beside the first.
 	pub passes: Vec<Pass>,
@@ -201,13 +201,15 @@ impl Host {
 					"user space"
 				};
 				writeln!(out, "perf: tier {tier}, counting {rings}").expect("a String takes every write");
-				writeln!(
-					out,
-					"PMU: {} on CPUs {}, {} general-purpose counters",
-					perf.pmu.name,
-					list(&perf.pmu.cpus),
-					perf.slots
-				)
+				match perf.slots {
+					Some(slots) => writeln!(
+						out,
+						"PMU: {} on CPUs {}, {slots} general-purpose counters",
+						perf.pmu.name,
+						list(&perf.pmu.cpus),
+					),
+					None => writeln!(out, "PMU: {} on CPUs {}", perf.pmu.name, list(&perf.pmu.cpus)),
+				}
 				.expect("a String takes every write");
 				for (i, pass) in perf.passes.iter().enumerate() {
 					let names: Vec<&str> = pass.events().map(|event| event.name.as_str()).collect();
@@ -271,8 +273,7 @@ impl Perf {
 				let branches = vec![generic(&pmu, "branches", PERF_TYPE_HARDWARE, 4, false); n];
 				matches!(trial(&branches), Ok(true))
 			})
-			.last()
-			.ok_or_else(|| format!("PMU {} schedules not even one branch counter", pmu.name))?;
+			.last();
 		let mut units: Vec<Vec<Event>> = Vec::new();
 		let mut absent = Vec::new();
 		for (name, kind, config) in GENERIC {
@@ -542,6 +543,27 @@ impl Pmu {
 	}
 }
 
+/// Pins `command` to `pmu`'s CPUs just before it `exec`s, so timing and counters measure the same
+/// cores on hybrid hosts.
+pub fn pin_command(command: &mut std::process::Command, pmu: &Pmu) {
+	#[cfg(target_os = "linux")]
+	{
+		use std::os::unix::process::CommandExt;
+		let mask = mask(&pmu.cpus);
+		// SAFETY: between fork and exec it makes only one system call, which allocates nothing.
+		unsafe {
+			command.pre_exec(move || {
+				if sched_setaffinity(0, mask.len() * 8, mask.as_ptr()) != 0 {
+					return Err(std::io::Error::last_os_error());
+				}
+				Ok(())
+			});
+		}
+	}
+	#[cfg(not(target_os = "linux"))]
+	let _ = (command, pmu);
+}
+
 /// Has `command` run on `pmu`'s CPUs, at the addresses of its last run when `fixed`, and open
 /// `pass`'s counters on itself just before it `exec`s, telling the harness how many.
 pub fn launch(command: &mut std::process::Command, pmu: &Pmu, pass: &Pass, fixed: bool) {
@@ -747,7 +769,7 @@ impl Usage {
 }
 
 /// Each counter `passes` read, a call's share over each pass's calls, then what derives from
-/// them: instructions a cycle, in each ring both count.
+/// them: instructions a cycle, in each ring where both counters ran in the same group.
 pub fn measures(passes: &[Pass], values: &[(Vec<u64>, u64)]) -> Vec<crate::Measure> {
 	let mut out: Vec<crate::Measure> = passes
 		.iter()
@@ -760,15 +782,30 @@ pub fn measures(passes: &[Pass], values: &[(Vec<u64>, u64)]) -> Vec<crate::Measu
 		.map(|(event, value, calls)| crate::Measure::new(&event.name, value as f64 / calls as f64, event.unit()))
 		.collect();
 	for ring in ["u", "k"] {
-		let find = |name: &str| out.iter().find(|m| m.name == format!("{name}:{ring}")).map(|m| m.value);
-		if let (Some(instructions), Some(cycles)) = (find("instructions"), find("cycles"))
-			&& cycles > 0.0
-		{
-			out.push(crate::Measure::new(
-				&format!("IPC:{ring}"),
-				instructions / cycles,
-				"instructions/cycle",
-			));
+		let inst_name = format!("instructions:{ring}");
+		let cyc_name = format!("cycles:{ring}");
+		let ratio = passes.iter().zip(values).find_map(|(pass, (values, _))| {
+			let mut offset = 0;
+			for group in &pass.groups {
+				let slice = &values[offset..offset + group.len()];
+				offset += group.len();
+				let find = |name: &str| {
+					group
+						.iter()
+						.zip(slice)
+						.find(|(event, _)| event.name == name)
+						.map(|(_, &value)| value)
+				};
+				if let (Some(instructions), Some(cycles)) = (find(&inst_name), find(&cyc_name))
+					&& cycles > 0
+				{
+					return Some(instructions as f64 / cycles as f64);
+				}
+			}
+			None
+		});
+		if let Some(ipc) = ratio {
+			out.push(crate::Measure::new(&format!("IPC:{ring}"), ipc, "instructions/cycle"));
 		}
 	}
 	out
@@ -1208,7 +1245,7 @@ mod tests {
 	}
 
 	#[test]
-	fn derives_instructions_a_cycle() {
+	fn derives_instructions_a_cycle_only_within_one_group() {
 		let pmu = Pmu {
 			name: "cpu".to_owned(),
 			extended: 0,
@@ -1221,8 +1258,21 @@ mod tests {
 				generic(&pmu, "cycles", PERF_TYPE_HARDWARE, 0, false),
 			]],
 		};
-		let measures = measures(&[pass], &[(vec![300, 100], 2)]);
-		let shown: Vec<(&str, f64)> = measures.iter().map(|m| (m.name.as_str(), m.value)).collect();
+		let same = measures(&[pass], &[(vec![300, 100], 2)]);
+		let shown: Vec<(&str, f64)> = same.iter().map(|m| (m.name.as_str(), m.value)).collect();
 		assert_eq!(shown, [("instructions:u", 150.0), ("cycles:u", 50.0), ("IPC:u", 3.0)]);
+
+		// Separate passes (different processes) must not derive IPC across them.
+		let split = [
+			Pass {
+				groups: vec![vec![generic(&pmu, "instructions", PERF_TYPE_HARDWARE, 1, false)]],
+			},
+			Pass {
+				groups: vec![vec![generic(&pmu, "cycles", PERF_TYPE_HARDWARE, 0, false)]],
+			},
+		];
+		let split_measures = measures(&split, &[(vec![300], 2), (vec![100], 2)]);
+		let split_shown: Vec<(&str, f64)> = split_measures.iter().map(|m| (m.name.as_str(), m.value)).collect();
+		assert_eq!(split_shown, [("instructions:u", 150.0), ("cycles:u", 50.0)]);
 	}
 }

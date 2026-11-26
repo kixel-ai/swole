@@ -155,18 +155,26 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 		let dir = work.join(index.to_string());
 		let base = before.as_mut().and_then(|jobs| jobs.remove(&name));
 		let head = after.remove(&name);
-		let (timed, iterations, used) = match (&base, &head) {
+		let pmu = perf.map(|perf| &perf.pmu);
+		let (timed, iterations, used, timed_threaded) = match (&base, &head) {
 			(Some(base), Some(head)) => {
-				let mut base = Process::spawn(base, &dir.join("base"))?;
-				let mut head = Process::spawn(head, &dir.join("head"))?;
+				let mut base = Process::spawn(base, pmu, &dir.join("base"))?;
+				let mut head = Process::spawn(head, pmu, &dir.join("head"))?;
 				let (iterations, pairs) = paired(&mut base, &mut head, &mut coin)?;
+				let base_threaded = base.threaded || pairs.iter().any(|(b, _)| b.threaded);
+				let head_threaded = head.threaded || pairs.iter().any(|(_, h)| h.threaded);
 				base.finish()?;
 				head.finish()?;
 				let nanos: Vec<(u64, u64)> = pairs.iter().map(|(b, h)| (b.nanos, h.nanos)).collect();
 				let base_used = usage(pairs.iter().map(|(b, _)| b));
 				let head_used = usage(pairs.iter().map(|(_, h)| h));
 				let timed = Times::pairs(iterations, &nanos).map_err(|err| format!("{name}: {err}"))?;
-				(timed, iterations, [base_used, head_used])
+				(
+					timed,
+					iterations,
+					[base_used, head_used],
+					[base_threaded, head_threaded],
+				)
 			}
 			(base, head) => {
 				let (side, job) = match (base, head) {
@@ -174,8 +182,9 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					(None, Some(head)) => (Which::Head, head),
 					_ => unreachable!("every name is one side's"),
 				};
-				let mut process = Process::spawn(job, &dir.join(side.name()))?;
+				let mut process = Process::spawn(job, pmu, &dir.join(side.name()))?;
 				let (iterations, samples) = alone(&mut process)?;
+				let side_threaded = process.threaded || samples.iter().any(|sample| sample.threaded);
 				process.finish()?;
 				let nanos: Vec<u64> = samples.iter().map(|sample| sample.nanos).collect();
 				let timed = Times::alone(side, iterations, &nanos).map_err(|err| format!("{name}: {err}"))?;
@@ -188,27 +197,38 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					} else {
 						[None, used]
 					},
+					if side == Which::Base {
+						[side_threaded, false]
+					} else {
+						[false, side_threaded]
+					},
 				)
 			}
 		};
 		let mut watched = true;
 		for (i, (side, job)) in [(Which::Base, &base), (Which::Head, &head)].into_iter().enumerate() {
 			let Some(job) = job else { continue };
-			let mut measures = match (perf, &preload) {
-				(Some(perf), Some(preload)) => match count(job, perf, preload, iterations, &dir.join(side.name()))? {
-					Counted::Measures(measures) => measures,
-					Counted::Threaded => {
-						threaded.insert(name.clone());
-						Vec::new()
-					}
-					Counted::Unwatched => {
+			let mut measures = if timed_threaded[i] {
+				threaded.insert(name.clone());
+				Vec::new()
+			} else {
+				match (perf, &preload) {
+					(Some(perf), Some(preload)) => match count(job, perf, preload, iterations, &dir.join(side.name()))?
+					{
+						Counted::Measures(measures) => measures,
+						Counted::Threaded => {
+							threaded.insert(name.clone());
+							Vec::new()
+						}
+						Counted::Unwatched => {
+							watched = false;
+							Vec::new()
+						}
+					},
+					_ => {
 						watched = false;
 						Vec::new()
 					}
-				},
-				_ => {
-					watched = false;
-					Vec::new()
 				}
 			};
 			if let Some((used, calls)) = &used[i] {
@@ -294,7 +314,8 @@ fn count(job: &Job, perf: &perf::Perf, preload: &Path, iterations: u64, dir: &Pa
 		let mut command = job.command();
 		perf::launch(&mut command, &perf.pmu, pass, false);
 		command.env(perf::ITERATIONS, iterations.to_string());
-		let env = crate::environment(&command, preload, &job.label)?;
+		// Bench keeps ASLR and unpadded stacks; preload threads.so without 1 MiB padding.
+		let env = crate::environment(&command, preload, &job.label, false)?;
 		let status = command
 			.env_clear()
 			.envs(env)
@@ -323,8 +344,8 @@ fn count(job: &Job, perf: &perf::Perf, preload: &Path, iterations: u64, dir: &Pa
 				return Ok(Counted::Unwatched);
 			}
 			[reading] if reading.threaded => return Ok(Counted::Threaded),
-			// Over the calls the harness counted, which stop once they take as long as the
-			// sample's did, or the iterations, from a harness too old to say.
+			// Over the calls the harness counted (stratified over the sample's iterations), or
+			// `iterations` for a harness too old to emit `swole calls`.
 			[reading] => values.push((reading.values.clone(), reading.calls.unwrap_or(iterations))),
 			_ => {
 				return Err(format!(
@@ -354,6 +375,8 @@ struct Sample {
 	wall: Duration,
 	/// What the process used over the sample, when its harness says.
 	usage: Option<perf::Usage>,
+	/// Whether the timing process observed another thread alive during this sample.
+	threaded: bool,
 }
 
 /// A benchmark set up in a process of one side, which runs a sample when asked.
@@ -724,15 +747,21 @@ struct Process {
 	stdout: BufReader<ChildStdout>,
 	/// The target's own output, apart from its samples.
 	log: std::fs::File,
+	/// Whether any sample (including warmup/calibration) observed another thread alive.
+	threaded: bool,
 }
 
 impl Process {
-	/// Starts `job`'s target timing its benchmark, its output in `dir`, and waits until its
+	/// Starts `job`'s target timing its benchmark, pinned to `pmu`'s CPUs when given so timing and
+	/// counters measure the same cores on hybrid hosts, its output in `dir`, and waits until its
 	/// benchmark is set up: a sample of one call, which no time keeps, answers only after setup,
 	/// so no kept sample's wall time takes it in.
-	fn spawn(job: &Job, dir: &Path) -> Result<Self, String> {
+	fn spawn(job: &Job, pmu: Option<&perf::Pmu>, dir: &Path) -> Result<Self, String> {
 		let label = job.label.clone();
 		let mut command = job.command();
+		if let Some(pmu) = pmu {
+			perf::pin_command(&mut command, pmu);
+		}
 		std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 		let file = |name: &str| {
 			std::fs::File::create(dir.join(name))
@@ -754,8 +783,10 @@ impl Process {
 			stdin,
 			stdout,
 			log: file("stdout")?,
+			threaded: false,
 		};
-		process.sample(1)?;
+		let first = process.sample(1)?;
+		process.threaded |= first.threaded;
 		Ok(process)
 	}
 
@@ -786,6 +817,7 @@ impl Process {
 			stdin,
 			mut stdout,
 			mut log,
+			..
 		} = self;
 		drop(stdin);
 		std::io::copy(&mut stdout, &mut log).map_err(|e| format!("cannot keep {label}'s output: {e}"))?;
@@ -809,6 +841,7 @@ impl Side for Process {
 		// Bytes, since the benchmark's own output need not be UTF-8.
 		let mut line = Vec::new();
 		let mut usage = None;
+		let mut threaded = false;
 		loop {
 			line.clear();
 			match self.stdout.read_until(b'\n', &mut line) {
@@ -835,10 +868,12 @@ impl Side for Process {
 							String::from_utf8_lossy(nanos)
 						)
 					})?;
+				self.threaded |= threaded;
 				return Ok(Sample {
 					nanos,
 					wall: started.elapsed(),
 					usage: usage.take(),
+					threaded,
 				});
 			}
 			if let Some(fields) = line
@@ -847,6 +882,10 @@ impl Side for Process {
 			{
 				let fields = String::from_utf8_lossy(fields);
 				usage = Some(perf::Usage::parse(&fields).map_err(|err| format!("{}: {err}", self.label))?);
+				continue;
+			}
+			if line.starts_with(perf::THREADED.as_bytes()) {
+				threaded = true;
 				continue;
 			}
 			self.log
@@ -880,6 +919,7 @@ mod tests {
 				nanos,
 				wall: Duration::from_nanos(nanos + self.step * iterations),
 				usage: None,
+				threaded: false,
 			})
 		}
 	}
@@ -898,7 +938,7 @@ mod tests {
 			expect: None,
 			codspeed: false,
 		};
-		let mut process = Process::spawn(&job, &dir).unwrap();
+		let mut process = Process::spawn(&job, None, &dir).unwrap();
 		assert_eq!(process.sample(7).unwrap().nanos, 7);
 		process.finish().unwrap();
 		assert_eq!(std::fs::read(dir.join("stdout")).unwrap(), b"\xff\n\xff\n");

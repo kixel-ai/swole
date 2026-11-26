@@ -644,6 +644,9 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 				}
 			}
 			for found in more.iter().flatten() {
+				if found.threaded {
+					counts.threaded.insert(found.name.clone());
+				}
 				samples.entry(found.name.clone()).or_default().push(found.count);
 			}
 		}
@@ -897,12 +900,13 @@ struct Found {
 /// What one job measured, or why it failed.
 type Measured = Result<Vec<Found>, String>;
 
-/// The whole environment `command` launches with, spelled out so its size is known exactly:
-/// the library at `preload` first in `LD_PRELOAD`, and padded, so it starts at the same place.
+/// The whole environment `command` launches with, with `preload` first in `LD_PRELOAD`, and when
+/// `padded`, padded to [`LAUNCH`] bytes so a counted process starts at the same stack address.
 pub(crate) fn environment(
 	command: &Command,
 	preload: &Path,
 	label: &str,
+	padded: bool,
 ) -> Result<BTreeMap<OsString, OsString>, String> {
 	let mut env: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
 	for (key, value) in command.get_envs() {
@@ -918,10 +922,12 @@ pub(crate) fn environment(
 		preloads.push(others);
 	}
 	env.insert("LD_PRELOAD".into(), preloads);
-	let args: Vec<&OsStr> = std::iter::once(command.get_program())
-		.chain(command.get_args())
-		.collect();
-	pad(&mut env, &args).map_err(|err| format!("{label}: {err}"))?;
+	if padded {
+		let args: Vec<&OsStr> = std::iter::once(command.get_program())
+			.chain(command.get_args())
+			.collect();
+		pad(&mut env, &args).map_err(|err| format!("{label}: {err}"))?;
+	}
 	Ok(env)
 }
 
@@ -941,7 +947,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 		let stderr = std::fs::File::create(&errors).map_err(|e| format!("cannot create {}: {e}", errors.display()))?;
 		let mut command = job.command();
 		perf::launch(&mut command, pmu, pass, true);
-		let env = environment(&command, preload, label)?;
+		let env = environment(&command, preload, label, true)?;
 		command
 			.env_clear()
 			.envs(env)
@@ -1031,7 +1037,7 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 	if let Some(cwd) = command.get_current_dir() {
 		valgrind.current_dir(cwd);
 	}
-	let mut env = environment(&command, preload, label)?;
+	let mut env = environment(&command, preload, label, true)?;
 	// A `--program`'s shell inherits swole's environment, whose counter settings are a native count's.
 	env.remove(OsStr::new(perf::COUNTERS));
 	env.remove(OsStr::new(perf::ITERATIONS));

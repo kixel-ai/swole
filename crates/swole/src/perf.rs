@@ -376,14 +376,18 @@ pub fn preloaded() -> Result<(), String> {
 /// How many threads swole's preload saw the process start, or `None` without it: a thread a
 /// case starts and joins within its call is gone before the case's end can list it.
 pub fn started() -> Option<u64> {
-	// SAFETY: the name is a C string; RTLD_DEFAULT searches every loaded library.
-	let symbol = unsafe { dlsym(RTLD_DEFAULT, c"swole_threads_started".as_ptr()) };
-	if symbol.is_null() {
-		return None;
-	}
-	// SAFETY: the preload defines the symbol as a function of this signature.
-	let started: extern "C" fn() -> u64 = unsafe { std::mem::transmute(symbol) };
-	Some(started())
+	static STARTED: std::sync::OnceLock<Option<extern "C" fn() -> u64>> = std::sync::OnceLock::new();
+	let started = *STARTED.get_or_init(|| {
+		// SAFETY: the name is a C string; RTLD_DEFAULT searches every loaded library.
+		let symbol = unsafe { dlsym(RTLD_DEFAULT, c"swole_threads_started".as_ptr()) };
+		if symbol.is_null() {
+			None
+		} else {
+			// SAFETY: the preload defines the symbol as a function of this signature.
+			Some(unsafe { std::mem::transmute::<*mut std::ffi::c_void, extern "C" fn() -> u64>(symbol) })
+		}
+	});
+	started.map(|f| f())
 }
 
 /// How many threads the process has now.
