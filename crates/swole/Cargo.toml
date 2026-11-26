@@ -1,16 +1,16 @@
 [package]
-name = "rust2-bench-harness"
-description = "Benchmarks as plain functions marked #[bench], counted by rust2-bench under Valgrind"
-version = "0.0.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/kixel-ai/rust2"
-# A git dependency until a consumer needs it published.
+name = "swole"
+description = "Benchmarks as plain functions marked #[bench], counted under Valgrind and timed by swole"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# A git dependency until first publish.
 publish = false
 
 [dependencies]
 inventory = "0.3.25"
-rust2-bench-macros = { path = "macros" }
+swole-macros = { path = "../swole-macros" }
 
 [[bench]]
 name = "fixture"

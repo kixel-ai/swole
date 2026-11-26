@@ -1,4 +1,4 @@
-//! rust2-bench: counts each benchmark's instructions under stock Valgrind, one process a job,
+//! swole: counts each benchmark's instructions under stock Valgrind, one process a job,
 //! in parallel, for Kixel Quest's `metrics.json` and for a local base-versus-head compare, or
 //! natively with Linux perf counters, for a quick local compare, and times them by wall clock,
 //! alone or paired with a base commit's.
@@ -26,16 +26,16 @@ use fingerprint::Fingerprint;
 const PROBE: &str = "__cpu";
 
 const USAGE: &str = "\
-usage: rust2-bench run [options] [-- cargo bench args...]
-       rust2-bench compare <base> [options] [-- cargo bench args...]
-       rust2-bench time [<base>] [options] [-- cargo bench args...]
-       rust2-bench fingerprint
+usage: swole run [options] [-- cargo bench args...]
+       swole compare <base> [options] [-- cargo bench args...]
+       swole time [<base>] [options] [-- cargo bench args...]
+       swole fingerprint
 
 run counts the working tree's benchmarks; compare counts <base>, a commit, then the working
-tree, both in one worktree of their own under ~/.cache/rust2-bench, and prints each change. time
+tree, both in one worktree of their own under ~/.cache/swole, and prints each change. time
 times the working tree's by wall clock, one at a time, or with <base> each paired with the base's.
 
-Benchmarks are the Cargo workspace's, written with rust2-bench-harness or CodSpeed's
+Benchmarks are the Cargo workspace's, written with swole's harness or CodSpeed's
 compatibility crates, unless --program names them.
 
 options:
@@ -44,17 +44,22 @@ options:
   --allow-missing      with --benchmarks, report each name no benchmark has and count the rest,
                        failing only when none is there, as a bisect step needs (run only)
   --out <file>         write the counts or times as Kixel Quest's metrics.json (run and time)
-  --perf               count rust2-bench-harness's benchmarks natively with Linux perf
+  --perf               count swole harness benchmarks natively with Linux perf
                        counters, not under Valgrind: faster, comparable only on this host,
                        and never written out
   --jobs <n>           how many jobs run at once (default: every core, or with --perf,
                        every core of the PMU it counts on)
   --build <command>    a shell command that builds the programs, run first (with --program)
   --program <command>  a shell command that runs a program whose benchmarks run through
-                       rust2-bench-harness or CodSpeed's instrument hooks; repeat for each";
+                       swole or CodSpeed's instrument hooks; repeat for each";
 
-fn main() -> ExitCode {
-	let args: Vec<String> = std::env::args().skip(1).collect();
+/// Runs swole's command line, as either of its binaries.
+pub fn main() -> ExitCode {
+	let mut args: Vec<String> = std::env::args().skip(1).collect();
+	// Cargo runs `cargo swole <args>` as `cargo-swole swole <args>`.
+	if args.first().map(String::as_str) == Some("swole") {
+		args.remove(0);
+	}
 	if args.first().map(String::as_str) == Some(PROBE) {
 		print!("{}", fingerprint::cpu());
 		return ExitCode::SUCCESS;
@@ -63,7 +68,7 @@ fn main() -> ExitCode {
 		return match cargo::capture(&args[1..]) {
 			Ok(()) => ExitCode::SUCCESS,
 			Err(err) => {
-				eprintln!("rust2-bench: {err}");
+				eprintln!("swole: {err}");
 				ExitCode::FAILURE
 			}
 		};
@@ -71,7 +76,7 @@ fn main() -> ExitCode {
 	match cli(&args) {
 		Ok(()) => ExitCode::SUCCESS,
 		Err(err) => {
-			eprintln!("rust2-bench: {err}");
+			eprintln!("swole: {err}");
 			ExitCode::FAILURE
 		}
 	}
@@ -87,7 +92,7 @@ fn cli(args: &[String]) -> Result<(), String> {
 			print!("{}", threaded(&counts.threaded));
 			if let Some(out) = &options.out {
 				metrics::File::counts(&counts).write(out)?;
-				eprintln!("rust2-bench: wrote {}", out.display());
+				eprintln!("swole: wrote {}", out.display());
 			}
 			Ok(())
 		}
@@ -136,7 +141,7 @@ fn cli(args: &[String]) -> Result<(), String> {
 
 /// What to count, and how.
 #[derive(Clone)]
-pub struct Options {
+pub(crate) struct Options {
 	/// The only benchmarks to count, when given.
 	benchmarks: Option<BTreeSet<String>>,
 	/// Whether a wanted benchmark no benchmark is gets reported rather than failing the run.
@@ -205,9 +210,7 @@ impl Options {
 			);
 		}
 		if options.perf && !options.programs.is_empty() {
-			return Err(
-				"--perf counts a Cargo workspace's benchmarks of rust2-bench-harness, not --program's".to_owned(),
-			);
+			return Err("--perf counts a Cargo workspace's benchmarks of swole's harness, not --program's".to_owned());
 		}
 		Ok(options)
 	}
@@ -223,7 +226,7 @@ fn names(text: &str) -> BTreeSet<String> {
 }
 
 /// One Valgrind process: its command, and the one benchmark it must measure, when known.
-pub struct Job {
+pub(crate) struct Job {
 	label: String,
 	command: Command,
 	expect: Option<String>,
@@ -232,7 +235,7 @@ pub struct Job {
 }
 
 /// Each benchmark's instruction count, under one fingerprint.
-pub struct Counts {
+pub(crate) struct Counts {
 	pub fingerprint: String,
 	pub counts: BTreeMap<String, u64>,
 	/// The benchmarks beside which other threads ran, whose perf counts are noisy.
@@ -271,22 +274,22 @@ fn valgrind() -> Result<Command, String> {
 	Ok(command)
 }
 
-/// rust2-bench's directory in the user's cache, created when missing, as a canonical path.
-pub fn cache() -> Result<PathBuf, String> {
+/// swole's directory in the user's cache, created when missing, as a canonical path.
+pub(crate) fn cache() -> Result<PathBuf, String> {
 	let cache = std::env::var_os("XDG_CACHE_HOME")
 		.map(PathBuf::from)
 		.or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".cache")))
-		.ok_or("neither XDG_CACHE_HOME nor HOME is set, so rust2-bench's cache has nowhere to go")?
-		.join("rust2-bench");
+		.ok_or("neither XDG_CACHE_HOME nor HOME is set, so swole's cache has nowhere to go")?
+		.join("swole");
 	std::fs::create_dir_all(&cache).map_err(|e| format!("cannot create {}: {e}", cache.display()))?;
 	cache
 		.canonicalize()
 		.map_err(|e| format!("cannot resolve {}: {e}", cache.display()))
 }
 
-/// Valgrind on rust2-bench's own `PATH`, found once, so the fingerprint and every count run
+/// Valgrind on swole's own `PATH`, found once, so the fingerprint and every count run
 /// the same one even when a job's environment sets another `PATH`.
-pub fn valgrind_path() -> Result<&'static Path, String> {
+pub(crate) fn valgrind_path() -> Result<&'static Path, String> {
 	static PATH: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
 	PATH.get_or_init(|| {
 		use std::os::unix::fs::PermissionsExt;
@@ -324,7 +327,7 @@ fn measure(dir: &Path, options: &Options, strict: bool) -> Result<Counts, String
 		.canonicalize()
 		.map_err(|e| format!("cannot resolve {}: {e}", dir.display()))?;
 	let (counter, fingerprint) = counter(options)?;
-	eprintln!("rust2-bench: fingerprint {fingerprint}");
+	eprintln!("swole: fingerprint {fingerprint}");
 	let preload = preload::install()?;
 	fits(&std::fs::read_to_string("/proc/self/limits").map_err(|e| format!("cannot read /proc/self/limits: {e}"))?)?;
 	let mut jobs = if options.programs.is_empty() {
@@ -339,7 +342,7 @@ fn measure(dir: &Path, options: &Options, strict: bool) -> Result<Counts, String
 		)?
 	} else {
 		if let Some(build) = &options.build {
-			eprintln!("rust2-bench: {build}");
+			eprintln!("swole: {build}");
 			// Its output goes to stderr, so stdout holds only the counts.
 			let status = shell(build, dir)
 				.stdout(std::io::stderr())
@@ -362,7 +365,7 @@ fn measure(dir: &Path, options: &Options, strict: bool) -> Result<Counts, String
 	};
 	if let (Counter::Perf(_), Some(job)) = (&counter, jobs.iter().find(|job| job.codspeed)) {
 		return Err(format!(
-			"--perf counts benchmarks of rust2-bench-harness, and {} is of CodSpeed's crates, which only Valgrind counts",
+			"--perf counts benchmarks of swole's harness, and {} is of CodSpeed's crates, which only Valgrind counts",
 			job.label
 		));
 	}
@@ -403,7 +406,7 @@ fn measure(dir: &Path, options: &Options, strict: bool) -> Result<Counts, String
 
 /// Fails naming each wanted benchmark `has` says no benchmark is, so a bisect step never
 /// reads a suspect it could not count as clean.
-pub fn missing(wanted: &BTreeSet<String>, has: impl Fn(&String) -> bool) -> Result<(), String> {
+pub(crate) fn missing(wanted: &BTreeSet<String>, has: impl Fn(&String) -> bool) -> Result<(), String> {
 	absent(wanted, has, false).map(drop)
 }
 
@@ -423,14 +426,11 @@ fn absent(wanted: &BTreeSet<String>, has: impl Fn(&String) -> bool, allow: bool)
 /// summary when it runs in one.
 fn report(absent: &[&str]) -> Result<(), String> {
 	use std::io::Write;
-	eprintln!(
-		"rust2-bench: no benchmark is named {}; counted the rest",
-		absent.join(", ")
-	);
+	eprintln!("swole: no benchmark is named {}; counted the rest", absent.join(", "));
 	let Some(summary) = std::env::var_os("GITHUB_STEP_SUMMARY").filter(|path| !path.is_empty()) else {
 		return Ok(());
 	};
-	let mut text = String::from("rust2-bench counted no benchmark named:\n\n");
+	let mut text = String::from("swole counted no benchmark named:\n\n");
 	for name in absent {
 		text.push_str(&format!("- `{name}`\n"));
 	}
@@ -452,8 +452,8 @@ fn shell(command: &str, dir: &Path) -> Command {
 
 /// A new directory for one run's jobs in the tree at `dir`, apart from any other run's, so
 /// two runs in one tree never read each other's profiles.
-pub fn work(dir: &Path) -> Result<PathBuf, String> {
-	let parent = dir.join("target/rust2-bench");
+pub(crate) fn work(dir: &Path) -> Result<PathBuf, String> {
+	let parent = dir.join("target/swole");
 	std::fs::create_dir_all(&parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
 	let pid = std::process::id();
 	for n in 0.. {
@@ -504,7 +504,7 @@ fn run(
 						let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
 						match &result {
 							Ok(measured) => eprintln!(
-								"rust2-bench: [{finished}/{total}] {label}: {} benchmark(s), {} instructions, {:.1}s",
+								"swole: [{finished}/{total}] {label}: {} benchmark(s), {} instructions, {:.1}s",
 								measured.len(),
 								measured.iter().map(|(_, ir, _)| ir).sum::<u64>(),
 								started.elapsed().as_secs_f64()
@@ -548,7 +548,7 @@ fn run(
 }
 
 /// The prefix of the variables [`pad`] fills.
-const PAD: &str = "RUST2_BENCH_PAD_";
+const PAD: &str = "SWOLE_PAD_";
 
 /// How many variables [`pad`] fills: a fixed number, so the count of pointers is fixed too, and
 /// enough that none passes the 128 KiB Linux takes in one.
@@ -582,7 +582,7 @@ fn pad(env: &mut BTreeMap<OsString, OsString>, args: &[&OsStr]) -> Result<(), St
 	// Each variable's name, `=`, NUL, and pointer.
 	let used = launch(env, args) + (0..PADS).map(|i| name(i).len() + 2 + 8).sum::<usize>();
 	let fill = LAUNCH.checked_sub(used).ok_or(format!(
-		"its arguments and environment take {used} bytes, more than the {LAUNCH} rust2-bench pads every job's to"
+		"its arguments and environment take {used} bytes, more than the {LAUNCH} swole pads every job's to"
 	))?;
 	for i in 0..PADS {
 		let size = fill / PADS + usize::from(i < fill % PADS);
@@ -682,7 +682,7 @@ fn native(job: Job, dir: &Path, preload: &Path, pmu: &perf::Pmu) -> Measured {
 	match (expect, measured.as_slice()) {
 		(Some(name), [(only, _, _)]) if *only == name => Ok(measured),
 		(_, []) => Err(format!(
-			"{label} printed no perf count: its rust2-bench-harness is older than --perf; its output is in {}",
+			"{label} printed no perf count: its swole harness is older than --perf; its output is in {}",
 			dir.display()
 		)),
 		_ => {
@@ -705,7 +705,7 @@ fn one(job: Job, dir: &Path, preload: &Path) -> Measured {
 		expect,
 		..
 	} = job;
-	// A `--program`'s shell inherits rust2-bench's environment, whose perf setting is a native count's.
+	// A `--program`'s shell inherits swole's environment, whose perf setting is a native count's.
 	command.env_remove(perf::PERF);
 	std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 	let file = |name: &str| {
@@ -811,7 +811,7 @@ mod tests {
 		let env = |pairs: &[(&str, &str)]| -> BTreeMap<OsString, OsString> {
 			pairs.iter().map(|(key, value)| (key.into(), value.into())).collect()
 		};
-		let mut short = env(&[("CARGO_MANIFEST_DIR", "/a/rs/net"), ("RUST2_BENCH_PAD_03", "stale")]);
+		let mut short = env(&[("CARGO_MANIFEST_DIR", "/a/rs/net"), ("SWOLE_PAD_03", "stale")]);
 		let mut long = env(&[
 			("CARGO_MANIFEST_DIR", "/a/much/longer/checkout/rs/net"),
 			("GITHUB_REF", "refs/heads/kixel-bisect/1/abc"),

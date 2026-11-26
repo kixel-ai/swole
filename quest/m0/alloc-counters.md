@@ -6,7 +6,7 @@
 
 ## Plan
 
-Decided 2026-11-25 (maintainer, `/quest-plan` in rust2):
+Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
 - ✅ Include zero-privilege heap allocation counters via a dedicated allocator-interposer library, built and loaded like `preload.rs`, in the core `swole` epic. Every OS exposes this without root or `CAP_PERFMON`, it is deterministic for single-threaded code whose allocations do not depend on the host clock (which `bench` uses), while thread scheduling can change which thread allocates what in multithreaded code, and it catches allocation regressions that wall-clock and instruction counts often mask.
 
@@ -21,4 +21,4 @@ Recommendations for the implementer:
 
 ## Required
 
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m2/swole/modes-and-counters.md) - reports allocation metrics in the unified CLI tables and `metrics.json`
+- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - reports allocation metrics in the unified CLI tables and `metrics.json`

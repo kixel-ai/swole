@@ -37,7 +37,7 @@ const MIN_SAMPLES: usize = 10;
 const MAX_ITERATIONS: u64 = 1 << 40;
 
 /// What a timed harness target prints, alone on a line, before each sample's nanoseconds.
-const SAMPLE: &str = "rust2-bench sample ";
+const SAMPLE: &str = "swole sample ";
 
 /// The unit every time is in.
 const UNIT: &str = "ns";
@@ -55,7 +55,7 @@ pub fn time(base: Option<&str>, options: &Options) -> Result<(), String> {
 		return Err("time runs one benchmark at a time, so a time is never another's load: --jobs is run's".to_owned());
 	}
 	let host = host()?;
-	eprintln!("rust2-bench: host {host}");
+	eprintln!("swole: host {host}");
 	// Held until the base is timed, so no other compare checks out another commit under it.
 	let checkout = base.map(|base| Checkout::new(base, options)).transpose()?;
 	// Each side builds only the packages and targets of the Cargo args its revision has.
@@ -69,18 +69,18 @@ pub fn time(base: Option<&str>, options: &Options) -> Result<(), String> {
 	let before = match before {
 		Some((checkout, Some(cargo))) => {
 			eprintln!(
-				"rust2-bench: building {} ({}) in {}",
+				"swole: building {} ({}) in {}",
 				checkout.base,
 				checkout.short(),
 				checkout.dir.display()
 			);
 			let jobs = cargo::jobs(&checkout.dir, &cargo, Lacking::Counted)?;
-			// A base from before a rewrite to rust2-bench-harness has only CodSpeed's benchmarks,
+			// A base from before a rewrite to swole has only CodSpeed's benchmarks,
 			// which a time leaves out, so every benchmark of the head times alone.
 			let (codspeed, jobs): (Vec<Job>, Vec<Job>) = jobs.into_iter().partition(|job| job.codspeed);
 			if !codspeed.is_empty() {
 				eprintln!(
-					"rust2-bench: the base's {} benchmark(s) of CodSpeed's crates time as none",
+					"swole: the base's {} benchmark(s) of CodSpeed's crates time as none",
 					codspeed.len()
 				);
 			}
@@ -88,7 +88,7 @@ pub fn time(base: Option<&str>, options: &Options) -> Result<(), String> {
 		}
 		Some((checkout, None)) => {
 			eprintln!(
-				"rust2-bench: {} has nothing the cargo args select, so times none",
+				"swole: {} has nothing the cargo args select, so times none",
 				checkout.base
 			);
 			Some(BTreeMap::new())
@@ -97,7 +97,7 @@ pub fn time(base: Option<&str>, options: &Options) -> Result<(), String> {
 	};
 	let after = match head {
 		Some(cargo) => {
-			eprintln!("rust2-bench: building the working tree");
+			eprintln!("swole: building the working tree");
 			// With a base, the head may have no benchmark target left, its base's all removed.
 			let lacking = if before.is_some() {
 				Lacking::Targets
@@ -107,13 +107,13 @@ pub fn time(base: Option<&str>, options: &Options) -> Result<(), String> {
 			by_name(cargo::jobs(Path::new("."), &cargo, lacking)?)
 		}
 		None => {
-			eprintln!("rust2-bench: the working tree has nothing the cargo args select, so times none");
+			eprintln!("swole: the working tree has nothing the cargo args select, so times none");
 			BTreeMap::new()
 		}
 	};
 	if let Some(job) = after.values().find(|job| job.codspeed) {
 		return Err(format!(
-			"{} is a benchmark of CodSpeed's crates, which only a count measures: write it with rust2-bench-harness, \
+			"{} is a benchmark of CodSpeed's crates, which only a count measures: write it with swole, \
 			 or leave its target out with cargo's --bench",
 			job.label
 		));
@@ -165,7 +165,7 @@ pub fn time(base: Option<&str>, options: &Options) -> Result<(), String> {
 			}
 		};
 		eprintln!(
-			"rust2-bench: [{}/{total}] {name}: {}, {:.1}s",
+			"swole: [{}/{total}] {name}: {}, {:.1}s",
 			index + 1,
 			timed.summary(),
 			started.elapsed().as_secs_f64()
@@ -177,7 +177,7 @@ pub fn time(base: Option<&str>, options: &Options) -> Result<(), String> {
 	print!("{}", table(&times, checkout.is_some()));
 	if let Some(out) = &options.out {
 		file(&times, &host, checkout.as_ref().map(|checkout| checkout.sha.as_str())).write(out)?;
-		eprintln!("rust2-bench: wrote {}", out.display());
+		eprintln!("swole: wrote {}", out.display());
 	}
 	Ok(())
 }
@@ -622,7 +622,7 @@ impl Process {
 		let status = match self.child.wait() {
 			// A harness from before timing runs the benchmark once and exits cleanly.
 			Ok(status) if status.success() => {
-				"it exited without timing, as a rust2-bench-harness too old to time does".to_owned()
+				"it exited without timing, as a swole harness too old to time does".to_owned()
 			}
 			Ok(status) => status.to_string(),
 			Err(e) => format!("cannot wait for it: {e}"),
@@ -736,12 +736,9 @@ mod tests {
 	fn keeps_a_benchmark_output_that_is_not_utf8() {
 		// Beside the test's own executable, in the build's target directory, not a shared one.
 		let exe = std::env::current_exe().unwrap();
-		let dir = exe.with_file_name(format!("rust2-bench-bytes-{}", std::process::id()));
+		let dir = exe.with_file_name(format!("swole-bytes-{}", std::process::id()));
 		let mut command = std::process::Command::new("sh");
-		command.args([
-			"-c",
-			r"while read n; do printf '\377\n'; echo rust2-bench sample $n; done",
-		]);
+		command.args(["-c", r"while read n; do printf '\377\n'; echo swole sample $n; done"]);
 		let job = Job {
 			label: "bytes".to_owned(),
 			command,

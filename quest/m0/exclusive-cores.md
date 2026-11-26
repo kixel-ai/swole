@@ -6,7 +6,7 @@
 
 ## Plan
 
-Decided 2026-11-25 (maintainer, `/quest-plan` in rust2):
+Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
 - ✅ Include exclusive core reservation for `swole bench` in the `swole` epic to cut shared-host timing noise and agent turn time.
 
@@ -19,7 +19,7 @@ Recommendations for the implementer:
 
 ## Required
 
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m2/swole/modes-and-counters.md) - integrates into `swole bench` job execution
+- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - integrates into `swole bench` job execution
 
 ## Hosts
 

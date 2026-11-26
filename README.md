@@ -1,26 +1,34 @@
-# rust2-bench
+# swole
 
 Counts each benchmark's instructions under stock Valgrind, one Valgrind process a job, in
 parallel across the host's cores, and writes them as Kixel Quest's `metrics.json` or
 compares a base commit with the working tree. It counts on any x86_64 Linux host: hosted CI, a
 self-hosted runner, or an agent's own, with no third-party service in the loop. It replaces
 CodSpeed's runner over the benchmarks as they are written for it, and counts benchmarks
-written as plain `#[bench]` functions with [its harness](harness/README.md), which it also
+written as plain `#[bench]` functions with [its harness](crates/swole/README.md), which it also
 [times](#time) by wall clock on any Linux or macOS host, alone or paired with a base commit's.
 
+Three crates:
+
+- [`swole`](crates/swole/README.md), the harness a benchmark target puts in its `[dev-dependencies]`;
+- `swole-macros`, its `#[bench]` attribute;
+- `cargo-swole`, the runner, installed as both `swole` and `cargo swole`.
+
 ```bash
-nix run github:kixel-ai/rust2#bench -- run --out metrics.json   # or, without Nix:
-cargo install --locked --git https://github.com/kixel-ai/rust2 rust2-bench   # Valgrind from PATH
-rust2-bench run [--benchmarks <file> [--allow-missing]] [--out metrics.json] [--jobs <n>] [-- <cargo bench args>]
-rust2-bench compare <base> [--benchmarks <file>] [--jobs <n>] [-- <cargo bench args>]
-rust2-bench run --perf    # or compare <base> --perf: natively, with Linux perf counters
-rust2-bench time [<base>] [--benchmarks <file>] [--out metrics.json] [-- <cargo bench args>]
-rust2-bench fingerprint
+nix run github:kixel-ai/swole -- run --out metrics.json   # or, without Nix:
+cargo install --locked --git https://github.com/kixel-ai/swole cargo-swole   # Valgrind from PATH
+swole run [--benchmarks <file> [--allow-missing]] [--out metrics.json] [--jobs <n>] [-- <cargo bench args>]
+swole compare <base> [--benchmarks <file>] [--jobs <n>] [-- <cargo bench args>]
+swole run --perf    # or compare <base> --perf: natively, with Linux perf counters
+swole time [<base>] [--benchmarks <file>] [--out metrics.json] [-- <cargo bench args>]
+swole fingerprint
 ```
+
+`cargo swole <command>` is the same as `swole <command>`.
 
 ## What it counts
 
-In a Cargo workspace, its benchmark targets, written with [rust2-bench-harness](harness/README.md)
+In a Cargo workspace, its benchmark targets, written with [swole](crates/swole/README.md)
 or with CodSpeed's compatibility crates (`codspeed-criterion-compat` 6). It builds them once
 with `--cfg codspeed`, which CodSpeed's crates take, as `cargo codspeed build` does, passing any arguments after `--` to Cargo, such as `-p moq-net --bench
 varint`. Cargo takes rustflags from one source and ignores the rest, so the cfg
@@ -30,7 +38,7 @@ otherwise the only flags. A Cargo config that sets its own, `build.rustflags` or
 the environment, or a `--config`,
 fails the run before anything builds: set `RUSTFLAGS` to the flags the build needs instead.
 Each target lists its benchmarks by running once natively, then each benchmark runs alone in
-its own Valgrind process, through the harness's `RUST2_BENCH` or CodSpeed's
+its own Valgrind process, through the harness's `SWOLE_BENCH` or CodSpeed's
 `CODSPEED_ISOLATED_BENCHMARK`. A target that runs no benchmark through either fails the run,
 as does one that runs some through both: leave it out with `--bench`.
 It builds them with `cargo bench`, with itself as the targets' runner, which records how Cargo
@@ -41,14 +49,14 @@ runner a config or the environment sets, for any target, fails the run before an
 builds, as does, once built, an `[env]` that sets `GLIBC_TUNABLES`, which the fingerprint
 reads from the environment, and an argument for the targets after Cargo's own `--`, which
 neither harness takes: `--benchmarks` chooses benchmarks. Every count, like the
-fingerprint, runs the Valgrind on rust2-bench's own `PATH`, whatever `PATH` a target gets.
+fingerprint, runs the Valgrind on swole's own `PATH`, whatever `PATH` a target gets.
 
 Elsewhere, the programs `--program` names, each a shell command whose program brackets its
-benchmarks itself, with rust2-bench-harness or CodSpeed's
+benchmarks itself, with swole's harness or CodSpeed's
 [instrument hooks](https://github.com/CodSpeedHQ/instrument-hooks), after `--build`'s command
 builds them. Each program is one Valgrind process, which
 follows each `exec`, so a command may go through a shell or `just`.
-[`just ffi count`](../../ffi/justfile) counts rust2's [binding benchmark](../ffi/README.md)
+[`just ffi count`](https://github.com/kixel-ai/rust2/blob/main/ffi/justfile) counts rust2's [binding benchmark](https://github.com/kixel-ai/rust2/blob/main/bench/ffi/README.md)
 this way.
 
 Each benchmark is the Callgrind dump its hooks name after it, between `ZERO_STATS` and
@@ -61,7 +69,7 @@ bisect step never reads a suspect it could not count as clean. With `--allow-mis
 instead names each such name on stderr, and in the job summary under GitHub Actions, counts
 the rest, and fails only when none is there: a bisect step at a commit before a suspect was
 added, or after a rename, keeps its other suspects' counts, and Kixel Quest reads one
-`metrics.json` lacks as unmeasured. The [Valgrind workflow](../../.github/workflows/valgrind.yml)
+`metrics.json` lacks as unmeasured. rust2's [Valgrind workflow](https://github.com/kixel-ai/rust2/blob/main/.github/workflows/valgrind.yml)
 passes it with the benchmarks a bisect dispatches it with. `compare` fails on such a
 name only when neither side has it, since a change may add or remove a benchmark. A program's benchmarks all
 run even when `--benchmarks` names only some; a Cargo benchmark runs only when named.
@@ -70,7 +78,7 @@ benchmark, so no benchmark may take a name with that prefix: it would go uncount
 
 The instrument hooks' `ADD_DESC` after each benchmark, a request only CodSpeed's Valgrind
 fork knows, leaves an `unknown callgrind client request` warning in the job's Valgrind log,
-under `target/rust2-bench/jobs-*`, beside its profiles and output. Each run takes a directory of
+under `target/swole/jobs-*`, beside its profiles and output. Each run takes a directory of
 its own there, so runs in one tree never read each other's profiles, and removes it when it
 succeeds; a failed run keeps it and names it.
 
@@ -78,8 +86,8 @@ succeeds; a failed run keeps it and names it.
 
 A count follows everything before it in the process, down to the allocator's state, so a seed
 or a clock read that differs from run to run moves it. So every process a job runs preloads a
-library, [preload.rs](preload.rs), built with rust2-bench and kept under
-`~/.cache/rust2-bench` (or `$XDG_CACHE_HOME`), which replaces glibc's:
+library, [preload.rs](crates/cargo-swole/preload.rs), built with swole and kept under
+`~/.cache/swole` (or `$XDG_CACHE_HOME`), which replaces glibc's:
 
 - randomness (`getrandom`, `getentropy`, and `syscall(SYS_getrandom)`) with one fixed-seed
   stream, the same in every process, so std's `HashMap` seeds and the `getrandom` crate's
@@ -105,7 +113,7 @@ whether a real timeout or I/O comes first, so a benchmark that races them can st
 The same binary counts differently when its process starts with a longer path or a larger
 environment, since both sit on the initial stack and in the heap, and move the addresses, and
 so the copy loop glibc picks, after them. So every job's arguments and environment are padded
-to 1 MiB with `RUST2_BENCH_PAD_00` to `_15`, which puts its initial stack at the same place
+to 1 MiB with `SWOLE_PAD_00` to `_15`, which puts its initial stack at the same place
 however long its checkout's path or however large the host's environment, such as CI's
 `GITHUB_REF` on another branch. A job whose own take more fails the run, as does a stack limit
 under 4.25 MiB (`ulimit -s 4352`), since Linux takes a quarter of it for them. A `--program`
@@ -130,7 +138,7 @@ the architecture, every CPUID leaf a probe reads under the same Valgrind, `GLIBC
 the benchmarks inherit it, `valgrind --version`, and the preload's bytes, hashed into a label such as
 `x86_64-3059cd1d9e65`. The measure every count records names it, `instructions
 (x86_64-3059cd1d9e65)`, so counts from two environments never share a Kixel Quest series, and
-a hardware change starts a new series instead of reading as a regression. `rust2-bench
+a hardware change starts a new series instead of reading as a regression. `swole
 fingerprint` prints the label, then its inputs on stderr.
 
 Valgrind 3.27.1 on x86_64 presents one fixed Intel CPU, not the host's: an AMD Ryzen 9 9950X
@@ -142,8 +150,8 @@ version moves too, since a new Valgrind can count differently and starts new ser
 
 ## Compare
 
-`rust2-bench compare <base>` counts `<base>` and the working tree in one worktree kept under
-`~/.cache/rust2-bench` (or `$XDG_CACHE_HOME`), each from the directory there that matches where
+`swole compare <base>` counts `<base>` and the working tree in one worktree kept under
+`~/.cache/swole` (or `$XDG_CACHE_HOME`), each from the directory there that matches where
 it runs, and prints a Markdown table of each benchmark's base, head, and change. One directory
 counts both sides, so a path the build compiles in, such as a panic's location, is the same in
 each and moves neither count. The worktree sits outside the repository, so no
@@ -176,12 +184,12 @@ has counted both sides.
 
 ## Perf counters
 
-`--perf` counts each benchmark of [rust2-bench-harness](harness/README.md) natively, without
+`--perf` counts each benchmark of [swole's harness](crates/swole/README.md) natively, without
 Valgrind's 20 to 50 times slowdown, with a Linux perf counter of its user-space instructions
 (`instructions:u`), for a quick compare on one x86_64 Linux host, where the preload is built. A target of CodSpeed's crates, or a
 `--program`, fails the run, as does a host that lets no process count its own instructions,
 such as a VM without its PMU passed through, a `kernel.perf_event_paranoid` above 2, or
-GitHub's hosted runners: rust2-bench opens a counter before it builds anything, and names the
+GitHub's hosted runners: swole opens a counter before it builds anything, and names the
 setting. The counts never leave the host, so `--out` refuses them: a binary that picks a path by
 CPU feature counts differently on another CPU, and CI's series stay on Valgrind's.
 
@@ -207,8 +215,8 @@ alone.
 
 ## Time
 
-`rust2-bench time` builds the workspace's benchmark targets as a count does, then times each
-benchmark of rust2-bench-harness by wall clock, one at a time, each in its own process, which
+`swole time` builds the workspace's benchmark targets as a count does, then times each
+benchmark of swole's harness by wall clock, one at a time, each in its own process, which
 sets it up once and then runs a sample for each request: as many calls as fill a millisecond of
 its timed part, found by doubling from one, or of 50 ms of the whole sample, when steps or
 inputs built between calls take far longer. A benchmark takes samples for a second, and ten at
@@ -218,7 +226,7 @@ independent evidence of it, so one would look far tighter than a repeat run bear
 written with CodSpeed's crates fails the run: only a count measures those. The run's processes are neither preloaded nor padded, so their randomness,
 clock, and addresses are the host's own.
 
-`rust2-bench time <base>` builds `<base>` in the worktree a compare keeps, then the working tree,
+`swole time <base>` builds `<base>` in the worktree a compare keeps, then the working tree,
 and times each benchmark both have in two processes, the base's and the head's, alive together.
 It takes their samples in pairs, one of each side, in an order drawn anew for each pair, so load
 that drifts or recurs on a shared host biases neither side, and load common to both samples of a
@@ -269,4 +277,4 @@ base's as a sample naming its commit:
 A benchmark's name is the one its hooks dump, which for CodSpeed's crates is the file
 relative to the repository, then its group, function, and parameter: the same name CodSpeed
 gave it, so only the measure differs. The harness names its own the same way, by
-[file, module, function, and argument](harness/README.md#names).
+[file, module, function, and argument](crates/swole/README.md#names).

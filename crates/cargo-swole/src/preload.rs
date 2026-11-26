@@ -11,7 +11,7 @@ const LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/preload.so"));
 
 /// What the library logs to Valgrind once it loads: preload.rs's `MARKER`, which a test keeps the
 /// same.
-const MARKER: &str = "rust2-bench preload: deterministic randomness and clock";
+const MARKER: &str = "swole preload: deterministic randomness and clock";
 
 /// The library's hash, which the fingerprint holds, since its code runs inside what is counted.
 pub fn hash() -> String {
@@ -24,7 +24,7 @@ pub fn hash() -> String {
 /// cache, and returns that path. Named by its hash, it is rewritten only when missing or altered.
 pub fn install() -> Result<PathBuf, String> {
 	if LIBRARY.is_empty() {
-		return Err("rust2-bench's preload is built for x86_64 Linux alone, where it counts".to_owned());
+		return Err("swole's preload is built for x86_64 Linux alone, where it counts".to_owned());
 	}
 	let path = crate::cache()?.join(format!("preload-{}.so", hash()));
 	// The loader splits LD_PRELOAD at each.
@@ -52,7 +52,7 @@ pub fn check(dir: &Path, pid: &str, label: &str) -> Result<(), String> {
 		return Ok(());
 	}
 	Err(format!(
-		"{label} measured a benchmark in a process that never loaded rust2-bench's preload, so its count \
+		"{label} measured a benchmark in a process that never loaded swole's preload, so its count \
 		 follows the host's randomness and clock: a static executable, one whose environment drops \
 		 LD_PRELOAD, or a glibc before 2.34 bypasses it; its output is in {}",
 		dir.display()

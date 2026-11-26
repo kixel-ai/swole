@@ -1,4 +1,4 @@
-//! The library rust2-bench preloads into every process a counted job runs, so a benchmark's
+//! The library swole preloads into every process a counted job runs, so a benchmark's
 //! instruction count repeats: randomness comes from a fixed-seed stream, and time from a clock
 //! that starts at the same instant in every process and advances only as the process reads it,
 //! 1 µs a read, and as its timed waits expire, by their timeout.
@@ -8,7 +8,7 @@
 //! It interposes glibc's entry points, so a process that reaches the kernel another way, such as
 //! Go's runtime or a raw `syscall` instruction, bypasses it; a static executable never loads it.
 //!
-//! Built by build.rs as a `no_std` cdylib for x86_64 Linux, the only target rust2-bench
+//! Built by build.rs as a `no_std` cdylib for x86_64 Linux, the only target swole
 //! fingerprints, whose calling convention passes `syscall`'s variadic arguments as it passes
 //! six fixed ones.
 
@@ -36,9 +36,9 @@ const TAI: u64 = REALTIME + 37 * NS;
 /// code that draws until two values differ, such as QUIC's connection IDs.
 const SEED: u64 = 0x7275_7374_3262_656e;
 
-/// What a process logs to Valgrind once this library loads, which rust2-bench requires of every
+/// What a process logs to Valgrind once this library loads, which swole requires of every
 /// process that measured a benchmark.
-const MARKER: &[u8] = b"rust2-bench preload: deterministic randomness and clock\n\0";
+const MARKER: &[u8] = b"swole preload: deterministic randomness and clock\n\0";
 
 const CLOCK_REALTIME: c_int = 0;
 const CLOCK_MONOTONIC: c_int = 1;
@@ -607,7 +607,7 @@ pub unsafe extern "C" fn timerfd_settime(
 	old: *mut Itimerspec,
 ) -> c_int {
 	if absolute(flags, new) {
-		refuse(b"rust2-bench preload: timerfd_settime with TFD_TIMER_ABSTIME is unsupported: arm the timer relative to now\n\0");
+		refuse(b"swole preload: timerfd_settime with TFD_TIMER_ABSTIME is unsupported: arm the timer relative to now\n\0");
 	}
 	let real =
 		real!("timerfd_settime": unsafe extern "C" fn(c_int, c_int, *const Itimerspec, *mut Itimerspec) -> c_int);
@@ -624,7 +624,7 @@ pub unsafe extern "C" fn timer_settime(
 ) -> c_int {
 	if absolute(flags, new) {
 		refuse(
-			b"rust2-bench preload: timer_settime with TIMER_ABSTIME is unsupported: arm the timer relative to now\n\0",
+			b"swole preload: timer_settime with TIMER_ABSTIME is unsupported: arm the timer relative to now\n\0",
 		);
 	}
 	let real = real!("timer_settime" @ "GLIBC_2.3.3": unsafe extern "C" fn(*mut c_void, c_int, *const Itimerspec, *mut Itimerspec) -> c_int);

@@ -1,10 +1,10 @@
 [package]
-name = "rust2-bench-macros"
-description = "The #[bench] attribute of rust2-bench-harness"
-version = "0.0.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/kixel-ai/rust2"
+name = "swole-macros"
+description = "The #[bench] attribute of swole"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false
 
 [lib]

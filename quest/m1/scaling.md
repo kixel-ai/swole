@@ -6,9 +6,9 @@
 
 ## Plan
 
-Decided 2026-11-25 (maintainer, `/quest-plan` in rust2):
+Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
-- ✅ Defer to m3 (rejected: including in the initial m2 `swole` epic; dropping). Easy to layer once multi-metric runs land, and no consumer blocks on it yet. Carried into `kixel-ai/swole`'s quest tree when [Move rust2-bench to kixel-ai/swole](/quest/m1/swole-repo.md) executes.
+- ✅ Defer to m3 (rejected: including in the initial m2 `swole` epic; dropping). Easy to layer once multi-metric runs land, and no consumer blocks on it yet.
 
 Recommendations for the implementer:
 
@@ -18,4 +18,4 @@ Recommendations for the implementer:
 
 ## Required
 
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m2/swole/modes-and-counters.md) - reads multi-metric outputs across parameterized cases
+- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - reads multi-metric outputs across parameterized cases

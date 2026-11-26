@@ -4,12 +4,12 @@
 use std::path::Path;
 
 /// The variable that has a harness target count each benchmark with perf counters of the PMU
-/// of the perf type it holds: rust2-bench-harness's `PERF`.
-pub const PERF: &str = "RUST2_BENCH_PERF";
+/// of the perf type it holds: swole's `PERF`.
+pub const PERF: &str = "SWOLE_PERF";
 
 /// What a harness target prints for each benchmark it counted so: its count, `alone` or
 /// `threads`, and its name.
-const COUNTED: &str = "rust2-bench counted ";
+const COUNTED: &str = "swole counted ";
 
 /// Where the kernel lists its PMUs.
 const PMUS: &str = "/sys/bus/event_source/devices";
@@ -20,12 +20,12 @@ pub struct Pmu {
 	name: String,
 	/// Its perf type, which an event names it by, or 0 on a host with one.
 	kind: u32,
-	/// The CPUs it counts on that rust2-bench may run on, which every job is pinned to.
+	/// The CPUs it counts on that swole may run on, which every job is pinned to.
 	pub cpus: Vec<usize>,
 }
 
 impl Pmu {
-	/// The core PMU of the most CPUs rust2-bench may run on, once this host has shown it lets a
+	/// The core PMU of the most CPUs swole may run on, once this host has shown it lets a
 	/// process count its own instructions there. On a host whose CPUs are of several kinds,
 	/// such as Intel's P- and E-cores, each kind has its own PMU, which counts only on its CPUs.
 	pub fn find() -> Result<Self, String> {
@@ -66,12 +66,9 @@ impl Pmu {
 			_ => cores.remove(0),
 		};
 		if pmu.cpus.is_empty() {
-			return Err(format!(
-				"rust2-bench may run on none of the CPUs PMU {} counts on",
-				pmu.name
-			));
+			return Err(format!("swole may run on none of the CPUs PMU {} counts on", pmu.name));
 		}
-		rust2_bench_harness::__probe_perf(pmu.kind)?;
+		swole::__probe_perf(pmu.kind)?;
 		Ok(pmu)
 	}
 
@@ -123,20 +120,20 @@ unsafe extern "C" {
 	fn personality(persona: u64) -> i32;
 }
 
-/// The CPUs rust2-bench may run on.
+/// The CPUs swole may run on.
 #[cfg(not(target_os = "linux"))]
 fn allowed() -> Result<Vec<usize>, String> {
 	Err("perf counters are Linux's: count under Valgrind instead".to_owned())
 }
 
-/// The CPUs rust2-bench may run on.
+/// The CPUs swole may run on.
 #[cfg(target_os = "linux")]
 fn allowed() -> Result<Vec<usize>, String> {
 	let mut mask = [0u64; 64];
 	// SAFETY: the mask is as large as it says.
 	if unsafe { sched_getaffinity(0, size_of_val(&mask), mask.as_mut_ptr()) } != 0 {
 		return Err(format!(
-			"cannot read the CPUs rust2-bench may run on: {}",
+			"cannot read the CPUs swole may run on: {}",
 			std::io::Error::last_os_error()
 		));
 	}
@@ -198,8 +195,8 @@ mod tests {
 
 	#[test]
 	fn reads_what_a_harness_counted() {
-		let out = "rust2-bench counted 4096 alone a.rs::f[1 2]\nrust2-bench ran a.rs::f[1 2]\n\
-		           own output\nrust2-bench counted 12 threads a.rs::g\n";
+		let out = "swole counted 4096 alone a.rs::f[1 2]\nswole ran a.rs::f[1 2]\n\
+		           own output\nswole counted 12 threads a.rs::g\n";
 		assert_eq!(
 			counted(out).unwrap(),
 			[
@@ -207,8 +204,8 @@ mod tests {
 				("a.rs::g".to_owned(), 12, true)
 			]
 		);
-		assert!(counted("rust2-bench counted 1 maybe a.rs::f\n").is_err());
-		assert!(counted("rust2-bench counted x alone a.rs::f\n").is_err());
-		assert!(counted("rust2-bench counted 1 alone\n").is_err());
+		assert!(counted("swole counted 1 maybe a.rs::f\n").is_err());
+		assert!(counted("swole counted x alone a.rs::f\n").is_err());
+		assert!(counted("swole counted 1 alone\n").is_err());
 	}
 }

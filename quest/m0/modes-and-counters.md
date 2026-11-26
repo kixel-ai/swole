@@ -6,7 +6,7 @@
 
 ## Plan
 
-Decided 2026-11-25 (maintainer, `/quest-plan` in rust2):
+Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
 - ✅ Three modes on one binary:
   - `swole quick [<base>]`: single-shot native execution at 1× speed, parallel across the PMU's cores, with `preload.rs` (fixed RNG/clock), `ADDR_NO_RANDOMIZE`, and padded launch. Collects core `perf` counters (`instructions:u`, `cycles`, `branches`, `branch-misses`, L1/LLC misses) + `rusage` (host-fingerprinted; fails loudly on hosts with no perf counters, directing the user to `swole sim` or `swole bench`).

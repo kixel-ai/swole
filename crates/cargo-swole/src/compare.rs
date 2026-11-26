@@ -40,7 +40,7 @@ pub fn compare(base: &str, options: &Options) -> Result<(), String> {
 	let dir = tree.join(&prefix);
 	checkout(&top, &tree, &sha)?;
 	eprintln!(
-		"rust2-bench: counting {base} ({}) in {}",
+		"swole: counting {base} ({}) in {}",
 		&sha[..12.min(sha.len())],
 		tree.display()
 	);
@@ -49,7 +49,7 @@ pub fn compare(base: &str, options: &Options) -> Result<(), String> {
 	let before = count(&dir, &both, &picked, base)?;
 	checkout(&top, &tree, &head)?;
 	eprintln!(
-		"rust2-bench: counting the working tree ({}) in {}",
+		"swole: counting the working tree ({}) in {}",
 		&head[..12.min(head.len())],
 		tree.display()
 	);
@@ -414,14 +414,14 @@ fn pick_in(dir: &Path, options: &Options, args: &[Arg], side: &str) -> Result<Se
 	}
 	let selection = select(args, &crate::cargo::members(dir, &options.cargo)?)?;
 	for lacked in &selection.lacks {
-		eprintln!("rust2-bench: {side} has no {lacked}, so builds without it");
+		eprintln!("swole: {side} has no {lacked}, so builds without it");
 	}
 	Ok(selection)
 }
 
 /// The selection of a side, which the log calls `side`, that has no `absent` and so builds nothing.
 fn none(args: &[Arg], side: &str, absent: String) -> Result<Selection, String> {
-	eprintln!("rust2-bench: {side} has no {absent}, so builds nothing");
+	eprintln!("swole: {side} has no {absent}, so builds nothing");
 	// It lacks every selector too, so one the other side also lacks still fails.
 	let mut lacks = select(args, &Members::default())?.lacks;
 	lacks.insert(absent);
@@ -431,7 +431,7 @@ fn none(args: &[Arg], side: &str, absent: String) -> Result<Selection, String> {
 /// Counts the side checked out under `dir`, which the log calls `side`, building what `selection` picked.
 fn count(dir: &Path, options: &Options, selection: &Selection, side: &str) -> Result<Counts, String> {
 	let Some(args) = &selection.args else {
-		eprintln!("rust2-bench: {side} has nothing the cargo args select, so counts none");
+		eprintln!("swole: {side} has nothing the cargo args select, so counts none");
 		return Ok(Counts {
 			// Labeled as `measure` labels the other side's, so the two compare.
 			fingerprint: crate::counter(options)?.1,
@@ -491,12 +491,12 @@ fn snapshot(top: &Path, index: &Path) -> Result<String, String> {
 	}
 	// A fixed identity, since the host's Git may have none.
 	let out = Command::new("git")
-		.args(["commit-tree", &tree, "-p", &head, "-m", "rust2-bench: the working tree"])
+		.args(["commit-tree", &tree, "-p", &head, "-m", "swole: the working tree"])
 		.current_dir(top)
-		.env("GIT_AUTHOR_NAME", "rust2-bench")
-		.env("GIT_AUTHOR_EMAIL", "rust2-bench@localhost")
-		.env("GIT_COMMITTER_NAME", "rust2-bench")
-		.env("GIT_COMMITTER_EMAIL", "rust2-bench@localhost")
+		.env("GIT_AUTHOR_NAME", "swole")
+		.env("GIT_AUTHOR_EMAIL", "swole@localhost")
+		.env("GIT_COMMITTER_NAME", "swole")
+		.env("GIT_COMMITTER_EMAIL", "swole@localhost")
 		.output()
 		.map_err(|e| format!("cannot run git: {e}"))?;
 	output(&["commit-tree"], out)

@@ -1,13 +1,13 @@
-# rust2-bench-harness
+# swole
 
-Benchmarks as plain functions marked `#[bench]`, which [rust2-bench](../README.md) counts in
+Benchmarks as plain functions marked `#[bench]`, which [swole](../../README.md) counts in
 instructions under Valgrind, each alone in its own process, in parallel, and times by wall clock,
 alone or paired with a base commit's, for Kixel Quest's `metrics.json` or a local compare. A
 benchmark written for it needs neither Criterion nor CodSpeed's crates.
 
 ```toml
 [dev-dependencies]
-rust2-bench-harness = { git = "https://github.com/kixel-ai/rust2" }
+swole = { git = "https://github.com/kixel-ai/swole" }
 
 [[bench]]
 name = "varint"
@@ -17,7 +17,7 @@ harness = false
 ```rust
 use std::time::Duration;
 
-use rust2_bench_harness::{Iterations, bench};
+use swole::{Iterations, bench};
 
 #[bench]
 fn empty() -> Vec<u8> {
@@ -60,16 +60,16 @@ fn busy(iterations: Iterations) -> Duration {
 }
 
 fn main() {
-	rust2_bench_harness::main();
+	swole::main();
 }
 ```
 
 ```bash
-cargo bench                                          # each benchmark once, natively
-nix run github:kixel-ai/rust2#bench -- run          # each one counted under Valgrind
-nix run github:kixel-ai/rust2#bench -- compare main  # each one's change from main
-nix run github:kixel-ai/rust2#bench -- time          # each one timed
-nix run github:kixel-ai/rust2#bench -- time main     # each one timed beside main's
+cargo bench                                    # each benchmark once, natively
+nix run github:kixel-ai/swole -- run           # each one counted under Valgrind
+nix run github:kixel-ai/swole -- compare main  # each one's change from main
+nix run github:kixel-ai/swole -- time          # each one timed
+nix run github:kixel-ai/swole -- time main     # each one timed beside main's
 ```
 
 ## What a benchmark is
@@ -119,37 +119,37 @@ A benchmark is named by its file, relative to the workspace root, then its modul
 the crate, its function, and its argument, such as `rs/net/benches/varint.rs::encode[300]`
 or `ffi/moq/bench/export.rs::rust::call`, as CodSpeed's crates name theirs by file, group, and
 function. Two of one name fail the run, as does a name holding a control character, such as
-an argument that shows a line break: rust2-bench reads names a line each. Cargo names a member's file relative to the
+an argument that shows a line break: swole reads names a line each. Cargo names a member's file relative to the
 workspace root; a file it names by an absolute path, as for a target whose path lies outside
 its package, fails to compile, since a name holding a host's path would never match another
-host's: remap it with `--remap-path-prefix`, as [`just ffi bench-build`](../../../ffi/justfile)
+host's: remap it with `--remap-path-prefix`, as [`just ffi bench-build`](https://github.com/kixel-ai/rust2/blob/main/ffi/justfile)
 does.
 
 ## How it runs
 
-`rust2_bench_harness::main()` runs every benchmark once, sorted by name, setting up each case
-and bracketing its call with Callgrind's client requests, then prints `rust2-bench ran <name>`
+`swole::main()` runs every benchmark once, sorted by name, setting up each case
+and bracketing its call with Callgrind's client requests, then prints `swole ran <name>`
 after it. Natively the requests are instructions that do nothing, so `cargo bench` and
-`cargo test --benches` run each case once as a check. With `RUST2_BENCH` set to a name, it
-runs that benchmark alone, which rust2-bench sets on each job. It takes no arguments but
-Cargo's own `--bench` and `--quiet`; rust2-bench's `--benchmarks` chooses benchmarks.
+`cargo test --benches` run each case once as a check. With `SWOLE_BENCH` set to a name, it
+runs that benchmark alone, which swole sets on each job. It takes no arguments but
+Cargo's own `--bench` and `--quiet`; swole's `--benchmarks` chooses benchmarks.
 
-With `RUST2_BENCH_TIME=1` as well, it sets that benchmark up and then times it, a sample for
-each iteration count a line of stdin holds, printing `rust2-bench sample <nanoseconds>` on a
-line of its own after each, until stdin ends. rust2-bench drives it so, and reads a benchmark's
+With `SWOLE_TIME=1` as well, it sets that benchmark up and then times it, a sample for
+each iteration count a line of stdin holds, printing `swole sample <nanoseconds>` on a
+line of its own after each, until stdin ends. swole drives it so, and reads a benchmark's
 own output on stdout around its samples.
 
-Under Valgrind with `--instr-atstart=no`, as rust2-bench runs it, each case's count is
+Under Valgrind with `--instr-atstart=no`, as swole runs it, each case's count is
 everything its call executes on every thread, between `ZERO_STATS` and
 `START_INSTRUMENTATION` before it and `STOP_INSTRUMENTATION` and `DUMP_STATS_AT <name>` after:
-the body, its call, and the requests' own few dozen instructions at most. A program whose benchmarks rust2-bench runs as a
+the body, its call, and the requests' own few dozen instructions at most. A program whose benchmarks swole runs as a
 `--program` runs every case in one process, each dumped under its own name.
 
 The requests are x86_64's and aarch64's; elsewhere the harness requests nothing, and
-rust2-bench fails a job that measured no benchmark.
+swole fails a job that measured no benchmark.
 
-With `RUST2_BENCH_PERF` set to a core PMU's perf type, or 0 on a host with one, it also counts
+With `SWOLE_PERF` set to a core PMU's perf type, or 0 on a host with one, it also counts
 each case's user-space instructions with Linux perf counters, on every thread, and prints
-`rust2-bench counted <instructions> <alone|threads> <name>` before `rust2-bench ran <name>`:
-`threads` when another thread ran during the count. `rust2-bench run --perf` sets it, on that
-PMU's cores, as its [README](../README.md#perf-counters) says.
+`swole counted <instructions> <alone|threads> <name>` before `swole ran <name>`:
+`threads` when another thread ran during the count. `swole run --perf` sets it, on that
+PMU's cores, as its [README](../../README.md#perf-counters) says.

@@ -6,7 +6,7 @@ When the setup probe detects L0 or L-1 `perf` access (`perf_event_paranoid <= 0/
 
 ## Plan
 
-Decided 2026-11-25 (maintainer, `/quest-plan` in rust2):
+Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
 - ✅ Include L0 uncore/RAPL and L-1 tracepoint/IBS-PEBS metrics in the `swole` epic. Our Linux hosts run with `perf_event_paranoid = -1` (or `CAP_PERFMON`), and `moq`'s async/contention and memory-bound benchmarks directly benefit from off-CPU wait time, lock contention, memory bandwidth, energy, and native per-function attribution.
 
@@ -18,12 +18,12 @@ Recommendations for the implementer:
 - **L-1 off-CPU & contention**:
   - Open `sched:sched_switch` and `syscalls:sys_enter_futex` / `sys_exit_futex` (or `sched:sched_stat_sleep` / `sched:sched_stat_blocked` when available) scoped to the benchmark's threads to separate on-CPU execution from blocked/contended time.
 - **L-1 native per-function attribution**:
-  - Use AMD IBS (`ibs_op`) or Intel PEBS / `cycles:pp` sampling into a perf ring buffer during a dedicated attribution pass, resolve instruction pointers against the benchmark ELF + loaded DSOs (symbol table + DWARF/symtab), and print per-function native diffs in `swole bench <base>` just as [Callgrind attribution](/quest/m2/swole/callgrind-attribution.md) does for `sim`.
+  - Use AMD IBS (`ibs_op`) or Intel PEBS / `cycles:pp` sampling into a perf ring buffer during a dedicated attribution pass, resolve instruction pointers against the benchmark ELF + loaded DSOs (symbol table + DWARF/symtab), and print per-function native diffs in `swole bench <base>` just as [Callgrind attribution](/quest/m0/callgrind-attribution.md) does for `sim`.
 - Verify each tier on a real Linux host (`fedora` / `nixos`, AMD Zen 5 with `amd_l3`, `amd_df`, `amd_umc_*`, `ibs_op`, `power`, `tracepoint`): a memory-streaming benchmark moves DRAM bandwidth and energy; a mutex-contended benchmark moves futex/off-CPU wait time; a regression in one helper function shows up in IBS/PEBS attribution.
 
 ## Required
 
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m2/swole/modes-and-counters.md) - builds on the setup capability probe and multi-pass perf collector
+- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - builds on the setup capability probe and multi-pass perf collector
 
 ## Hosts
 

@@ -6,7 +6,7 @@
 
 ## Plan
 
-Decided 2026-11-25 (maintainer, `/quest-plan` in rust2):
+Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
 - ✅ Include deterministic Callgrind per-function attribution in the `swole` epic. The Callgrind dumps already hold per-function inclusive and self costs for every benchmark; parsing them costs milliseconds and turns a bare percentage change into an actionable diagnosis.
 
@@ -19,4 +19,4 @@ Recommendations for the implementer:
 
 ## Required
 
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m2/swole/modes-and-counters.md) - hooks into `swole sim <base>` reporting
+- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - hooks into `swole sim <base>` reporting

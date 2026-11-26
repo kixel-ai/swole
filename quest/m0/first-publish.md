@@ -6,7 +6,7 @@
 
 ## Plan
 
-Decided 2026-11-25 (maintainer, `/quest-plan` in rust2):
+Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
 - ✅ Publish `swole-macros`, `swole`, and `cargo-swole` to crates.io under `MIT OR Apache-2.0` once the repo move and unified CLI/harness API settle (rejected: git/Nix pin only with no crates.io publish; single combined crate).
 
@@ -23,4 +23,4 @@ Recommendations for the implementer:
 
 ## Required
 
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m2/swole/modes-and-counters.md) - settles the initial public CLI and harness surface before 0.1.0
+- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - settles the initial public CLI and harness surface before 0.1.0

@@ -36,7 +36,7 @@ impl Fingerprint {
 			Command::new(crate::valgrind_path()?).arg("--version"),
 			"valgrind --version",
 		)?;
-		let exe = std::env::current_exe().map_err(|e| format!("cannot locate rust2-bench itself: {e}"))?;
+		let exe = std::env::current_exe().map_err(|e| format!("cannot locate swole itself: {e}"))?;
 		let mut probe = crate::valgrind()?;
 		probe.arg("--callgrind-out-file=/dev/null").arg(exe).arg(crate::PROBE);
 		let cpu = output(&mut probe, "the CPU probe under Valgrind")?;

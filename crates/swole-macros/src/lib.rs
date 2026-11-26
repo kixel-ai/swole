@@ -1,11 +1,11 @@
-//! The `#[bench]` attribute of rust2-bench-harness: it keeps the function as written and
+//! The `#[bench]` attribute of swole: it keeps the function as written and
 //! registers it as a benchmark at link time. Its docs are the harness's.
 
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Error, Expr, FnArg, ItemFn, Path, Safety, Type};
 
-/// Marks a function as a benchmark; see rust2-bench-harness.
+/// Marks a function as a benchmark; see swole.
 #[proc_macro_attribute]
 pub fn bench(attr: proc_macro::TokenStream, item: proc_macro::TokenStream) -> proc_macro::TokenStream {
 	expand(attr.into(), item.into())
@@ -155,7 +155,7 @@ fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
 	}
 
 	let ident = &sig.ident;
-	let h = quote!(::rust2_bench_harness::__private);
+	let h = quote!(::swole::__private);
 	// Locals hygienic to the expansion, so no item of the same name, such as a benchmark
 	// named `input`, is shadowed by them.
 	let local = |name: &str| proc_macro2::Ident::new(name, proc_macro2::Span::mixed_site());
@@ -322,7 +322,7 @@ mod tests {
 
 	#[test]
 	fn passes_setup_output_as_the_parameter_takes_it() {
-		let h = ":: rust2_bench_harness :: __private ::";
+		let h = ":: swole :: __private ::";
 		let by = |item: &str| expands("setup = s", item);
 		let kept = by("fn f(x: &mut X) {}");
 		assert!(
@@ -380,7 +380,7 @@ mod tests {
 
 	#[test]
 	fn a_benchmark_that_takes_iterations_times_itself() {
-		let h = ":: rust2_bench_harness :: __private ::";
+		let h = ":: swole :: __private ::";
 		let none = expands("", "fn f(n: Iterations) -> Duration {}");
 		assert!(
 			none.contains(&format!(
@@ -390,11 +390,11 @@ mod tests {
 		);
 		let kept = expands(
 			"setup = s",
-			"fn f(x: &mut X, n: rust2_bench_harness::Iterations) -> std::time::Duration {}",
+			"fn f(x: &mut X, n: swole::Iterations) -> std::time::Duration {}",
 		);
 		assert!(
 			kept.contains(&format!(
-				"{h} kept_timed (s () , move | input : & mut _ , iterations | {h} black_box (f as fn (& mut X , rust2_bench_harness :: Iterations) -> _) ({h} black_box (& mut * input) , iterations))"
+				"{h} kept_timed (s () , move | input : & mut _ , iterations | {h} black_box (f as fn (& mut X , swole :: Iterations) -> _) ({h} black_box (& mut * input) , iterations))"
 			)),
 			"{kept}"
 		);

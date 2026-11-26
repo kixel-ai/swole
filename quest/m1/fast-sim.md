@@ -6,9 +6,9 @@ A measured spike determines whether a QEMU TCG plugin (`qemu-user` + `libcache` 
 
 ## Plan
 
-Decided 2026-11-25 (maintainer, `/quest-plan` in rust2):
+Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
-- ✅ Plan as a deferred m3 research spike rather than blocking `swole sim`'s v1 on custom binary-instrumentation plugins (rejected: building a custom QEMU/DynamoRIO backend before shipping Valgrind `sim`; omitting the spike entirely). Valgrind Callgrind with `--cache-sim=yes --branch-sim=yes` is already pinned and working, at 50–100× native cost; this spike tests whether QEMU TCG or DynamoRIO beats it enough to justify maintaining a custom plugin and trigger mechanism. Carried into `kixel-ai/swole`'s quest tree when [Move rust2-bench to kixel-ai/swole](/quest/m1/swole-repo.md) executes.
+- ✅ Plan as a deferred m3 research spike rather than blocking `swole sim`'s v1 on custom binary-instrumentation plugins (rejected: building a custom QEMU/DynamoRIO backend before shipping Valgrind `sim`; omitting the spike entirely). Valgrind Callgrind with `--cache-sim=yes --branch-sim=yes` is already pinned and working, at 50–100× native cost; this spike tests whether QEMU TCG or DynamoRIO beats it enough to justify maintaining a custom plugin and trigger mechanism.
 
 Recommendations for the implementer:
 
@@ -18,7 +18,7 @@ Recommendations for the implementer:
 
 ## Required
 
-- [Deterministic simulated cycles in sim (--cache-sim=yes --branch-sim=yes)](/quest/m2/swole/sim-cycles.md) - establishes the Valgrind cache/branch cycle baseline to beat
+- [Deterministic simulated cycles in sim (--cache-sim=yes --branch-sim=yes)](/quest/m0/sim-cycles.md) - establishes the Valgrind cache/branch cycle baseline to beat
 
 ## Hosts
 

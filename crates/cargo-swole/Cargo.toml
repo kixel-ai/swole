@@ -1,27 +1,27 @@
 [package]
-name = "rust2-bench"
-description = "Count each benchmark's instructions under stock Valgrind, in parallel"
-version = "0.0.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/kixel-ai/rust2"
-# Installed through the flake, or with `cargo install --git`.
+name = "cargo-swole"
+description = "Count each benchmark's instructions under stock Valgrind, in parallel, and time them paired with a base commit's"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Installed through the flake, or with `cargo install --git`, until first publish.
 publish = false
 
-[workspace]
-# Its own workspace, apart from the repo's other projects, on the repository's stable toolchain,
-# with the harness benchmarks are written with.
-members = ["harness", "harness/macros"]
-resolver = "3"
+# One program under two names: `swole` on its own, and `cargo swole` as Cargo runs a subcommand.
+[[bin]]
+name = "swole"
+path = "src/bin/swole.rs"
 
-[workspace.lints.clippy]
-# Every suppression says why, so the next lint audit can judge it.
-allow_attributes_without_reason = "warn"
+[[bin]]
+name = "cargo-swole"
+path = "src/bin/cargo-swole.rs"
 
 [dependencies]
-# For its perf counters, which a perf count checks this host exposes before building anything.
-rust2-bench-harness = { path = "harness" }
 serde_json = "1.0.154"
+# For its perf counters, which a perf count checks this host exposes before building anything.
+swole = { path = "../swole" }
 toml = "1.1.8"
 
 [lints]

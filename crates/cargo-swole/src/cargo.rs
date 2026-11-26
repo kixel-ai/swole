@@ -1,8 +1,8 @@
-//! A Cargo workspace's benchmarks, written with rust2-bench-harness or CodSpeed's
+//! A Cargo workspace's benchmarks, written with swole's harness or CodSpeed's
 //! compatibility crates.
 //!
-//! A harness target runs each benchmark once, printing `rust2-bench ran <name>` after it, or
-//! with `RUST2_BENCH` set to a name, that benchmark alone.
+//! A harness target runs each benchmark once, printing `swole ran <name>` after it, or
+//! with `SWOLE_BENCH` set to a name, that benchmark alone.
 //!
 //! Built with `--cfg codspeed`, as `cargo codspeed build` builds them, a target of CodSpeed's
 //! crates runs each benchmark once around CodSpeed's instrument hooks, printing
@@ -27,17 +27,17 @@ const CFG: &str = "--cfg=codspeed";
 pub const CAPTURE: &str = "__capture";
 
 /// Where the capturing runner writes each launch, set on the `cargo bench` it runs under.
-const CAPTURE_DIR: &str = "RUST2_BENCH_CAPTURE";
+const CAPTURE_DIR: &str = "SWOLE_CAPTURE";
 
 /// What a harness target prints after each benchmark it ran, before the benchmark's name.
-const HARNESS_RAN: &str = "rust2-bench ran ";
+const HARNESS_RAN: &str = "swole ran ";
 
 /// The variable naming the one benchmark a harness target runs.
-const HARNESS_ONLY: &str = "RUST2_BENCH";
+const HARNESS_ONLY: &str = "SWOLE_BENCH";
 
-/// The variable that has a harness target time the benchmark `RUST2_BENCH` names, which a launch
+/// The variable that has a harness target time the benchmark `SWOLE_BENCH` names, which a launch
 /// sets only to time.
-pub const HARNESS_TIME: &str = "RUST2_BENCH_TIME";
+pub const HARNESS_TIME: &str = "SWOLE_TIME";
 
 /// What a target of CodSpeed's crates prints for each benchmark it ran unmeasured.
 const CODSPEED_CHECKED: &str = "Checked: ";
@@ -55,8 +55,8 @@ const CODSPEED_ONLY: &str = "CODSPEED_ISOLATED_BENCHMARK";
 /// What a benchmark target is written with, which says how to run one of its benchmarks.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Harness {
-	/// rust2-bench-harness's `#[bench]` functions.
-	Rust2,
+	/// swole's `#[bench]` functions.
+	Swole,
 	/// CodSpeed's compatibility crates.
 	CodSpeed,
 }
@@ -65,7 +65,7 @@ impl Harness {
 	/// The variable that names the one benchmark a target runs.
 	fn only(self) -> &'static str {
 		match self {
-			Harness::Rust2 => HARNESS_ONLY,
+			Harness::Swole => HARNESS_ONLY,
 			Harness::CodSpeed => CODSPEED_ONLY,
 		}
 	}
@@ -144,7 +144,7 @@ struct Captures(PathBuf);
 impl Captures {
 	fn create() -> Result<Self, String> {
 		use std::os::unix::fs::DirBuilderExt;
-		let dir = std::env::temp_dir().join(format!("rust2-bench-launches-{}", std::process::id()));
+		let dir = std::env::temp_dir().join(format!("swole-launches-{}", std::process::id()));
 		// A directory already there may be another user's, so it is never reused.
 		std::fs::DirBuilder::new()
 			.mode(0o700)
@@ -251,7 +251,7 @@ pub fn jobs(dir: &Path, args: &[String], lacking: Lacking) -> Result<Vec<Job>, S
 	for ((target, launch), listed) in targets.iter().zip(listed) {
 		let Some((harness, names)) = listed? else {
 			return Err(format!(
-				"benchmark target {} ran no benchmark through rust2-bench-harness, nor through CodSpeed's \
+				"benchmark target {} ran no benchmark through swole, nor through CodSpeed's \
 				 compatibility crates, built with --cfg=codspeed (which a config's target rustflags would drop): \
 				 leave it out with cargo's --bench",
 				target.name
@@ -262,12 +262,12 @@ pub fn jobs(dir: &Path, args: &[String], lacking: Lacking) -> Result<Vec<Job>, S
 			if lacking != Lacking::Counted {
 				return Err(format!(
 					"benchmark target {} has only benchmarks CodSpeed's crates skip, such as iter_custom's, \
-					 which nothing counts: write them with rust2-bench-harness, or leave the target out with cargo's --bench",
+					 which nothing counts: write them with swole, or leave the target out with cargo's --bench",
 					target.name
 				));
 			}
 			eprintln!(
-				"rust2-bench: benchmark target {} has only benchmarks CodSpeed's crates skip, so it times as none",
+				"swole: benchmark target {} has only benchmarks CodSpeed's crates skip, so it times as none",
 				target.name
 			);
 		}
@@ -649,18 +649,18 @@ pub fn manifest_path(args: &[String]) -> Option<&str> {
 /// returns each with how Cargo launches it: `cargo bench` runs each through this executable as
 /// its runner, which records the launch rather than running it.
 fn build(dir: &Path, args: &[String]) -> Result<Vec<(Target, Launch)>, String> {
-	let exe = std::env::current_exe().map_err(|e| format!("cannot find rust2-bench's own executable: {e}"))?;
-	let exe = exe.to_str().ok_or("rust2-bench's own path is not UTF-8")?;
+	let exe = std::env::current_exe().map_err(|e| format!("cannot find swole's own executable: {e}"))?;
+	let exe = exe.to_str().ok_or("swole's own path is not UTF-8")?;
 	// A launch's environment holds whatever secrets the caller exported, so it goes to a
 	// directory only this user can read, removed once read.
 	let env: BTreeMap<String, String> = std::env::vars_os()
 		.map(|(key, value)| (key.to_string_lossy().into_owned(), value.to_string_lossy().into_owned()))
 		.collect();
-	// Cargo would run a runner a config sets for the target instead of rust2-bench's, so any
+	// Cargo would run a runner a config sets for the target instead of swole's, so any
 	// is refused before anything builds or runs.
 	if let Some(source) = configured(dir, args, &env, Key::Runner)? {
 		return Err(format!(
-			"{source} sets a runner, which could run the benchmarks in place of rust2-bench's own"
+			"{source} sets a runner, which could run the benchmarks in place of swole's own"
 		));
 	}
 	let captures = Captures::create()?;
@@ -699,12 +699,12 @@ fn build(dir: &Path, args: &[String]) -> Result<Vec<(Target, Launch)>, String> {
 		if let Some(source) = configured(dir, args, &env, Key::Rustflags)? {
 			return Err(format!(
 				"{source} sets rustflags, which the cfg CodSpeed's crates take would replace or be replaced by: \
-				 set RUSTFLAGS to the flags the build needs, and rust2-bench adds the cfg to them"
+				 set RUSTFLAGS to the flags the build needs, and swole adds the cfg to them"
 			));
 		}
 		cargo.env("CARGO_ENCODED_RUSTFLAGS", CFG);
 	}
-	eprintln!("rust2-bench: building benchmarks in {}", dir.display());
+	eprintln!("swole: building benchmarks in {}", dir.display());
 	let mut child = cargo.spawn().map_err(|e| format!("cannot run cargo: {e}"))?;
 	let stdout = child.stdout.take().expect("stdout is piped");
 	let built = (|| {
@@ -733,7 +733,7 @@ fn build(dir: &Path, args: &[String]) -> Result<Vec<(Target, Launch)>, String> {
 		return Err(format!("cargo bench failed ({status})"));
 	}
 	let mut launches = launches(captures)?;
-	// The fingerprint reads GLIBC_TUNABLES from rust2-bench's environment, so a Cargo `[env]`
+	// The fingerprint reads GLIBC_TUNABLES from swole's environment, so a Cargo `[env]`
 	// that sets another would count under a label that does not describe it.
 	let tunables = std::env::var("GLIBC_TUNABLES").ok();
 	for launch in launches.values() {
@@ -748,7 +748,7 @@ fn build(dir: &Path, args: &[String]) -> Result<Vec<(Target, Launch)>, String> {
 		.into_iter()
 		.map(|target| {
 			let launch = launches.remove(&target.executable).ok_or(format!(
-				"cargo launched benchmark target {} through a runner other than rust2-bench's: \
+				"cargo launched benchmark target {} through a runner other than swole's: \
 				 a config or the environment sets one",
 				target.name
 			))?;
@@ -761,7 +761,7 @@ fn build(dir: &Path, args: &[String]) -> Result<Vec<(Target, Launch)>, String> {
 				.find(|arg| !["--bench", "--quiet"].contains(&arg.as_str()))
 			{
 				return Err(format!(
-					"cargo passed benchmark target {} {arg}: rust2-bench takes no arguments for the targets \
+					"cargo passed benchmark target {} {arg}: swole takes no arguments for the targets \
 					 after cargo's --; name benchmarks with --benchmarks",
 					target.name
 				));
@@ -833,9 +833,9 @@ fn ran(stdout: &str) -> Result<Option<(Harness, Vec<String>)>, String> {
 	let is_codspeed = !codspeed.is_empty() || (starts(CODSPEED_HARNESS) && starts(CODSPEED_SKIPPED));
 	match (harness.is_empty(), is_codspeed) {
 		(true, false) => Ok(None),
-		(false, false) => Ok(Some((Harness::Rust2, harness))),
+		(false, false) => Ok(Some((Harness::Swole, harness))),
 		(true, true) => Ok(Some((Harness::CodSpeed, codspeed))),
-		(false, true) => Err("it ran benchmarks through both rust2-bench-harness and CodSpeed's crates".to_owned()),
+		(false, true) => Err("it ran benchmarks through both swole and CodSpeed's crates".to_owned()),
 	}
 }
 
@@ -849,25 +849,25 @@ mod tests {
 		let (harness, names) = ran(out).unwrap().unwrap();
 		assert_eq!(harness, Harness::CodSpeed);
 		assert_eq!(names, ["benches/a.rs::g::f[1]", "benches/a.rs::g::h"]);
-		let out = "a benchmark's own line\nrust2-bench ran benches/a.rs::f[1]\nrust2-bench ran benches/a.rs::m::g\n";
+		let out = "a benchmark's own line\nswole ran benches/a.rs::f[1]\nswole ran benches/a.rs::m::g\n";
 		let (harness, names) = ran(out).unwrap().unwrap();
-		assert_eq!(harness, Harness::Rust2);
+		assert_eq!(harness, Harness::Swole);
 		assert_eq!(names, ["benches/a.rs::f[1]", "benches/a.rs::m::g"]);
 		assert_eq!(ran("Harness: codspeed-criterion-compat v6.0.0\n").unwrap(), None);
 		let skipped = "Harness: codspeed-criterion-compat v6.0.0\nSkipping: benches/a.rs::c (CodSpeed doesn't support custom iterations)\n";
 		assert_eq!(ran(skipped).unwrap(), Some((Harness::CodSpeed, Vec::new())));
-		let own = "Skipping: a warm-up\nrust2-bench ran benches/a.rs::f\n";
+		let own = "Skipping: a warm-up\nswole ran benches/a.rs::f\n";
 		assert_eq!(
 			ran(own).unwrap(),
-			Some((Harness::Rust2, vec!["benches/a.rs::f".to_owned()]))
+			Some((Harness::Swole, vec!["benches/a.rs::f".to_owned()]))
 		);
-		let both = "rust2-bench ran benches/a.rs::f\nChecked: benches/a.rs::g\n";
+		let both = "swole ran benches/a.rs::f\nChecked: benches/a.rs::g\n";
 		assert!(ran(both).unwrap_err().contains("both"));
 	}
 
 	#[test]
 	fn names_the_workspace_from_its_repository() {
-		let repo = std::env::temp_dir().join(format!("rust2-bench-root-{}", std::process::id()));
+		let repo = std::env::temp_dir().join(format!("swole-root-{}", std::process::id()));
 		std::fs::create_dir_all(repo.join(".git")).unwrap();
 		std::fs::create_dir_all(repo.join("sub/ws")).unwrap();
 		let found = (codspeed_root(&repo), codspeed_root(&repo.join("sub/ws")));
@@ -1034,7 +1034,7 @@ mod tests {
 
 	#[test]
 	fn tells_a_workspace_under_resolver_1() {
-		let dir = std::env::temp_dir().join(format!("rust2-bench-resolver-{}", std::process::id()));
+		let dir = std::env::temp_dir().join(format!("swole-resolver-{}", std::process::id()));
 		let member = dir.join("a");
 		std::fs::create_dir_all(member.join("src")).unwrap();
 		std::fs::write(member.join("src/lib.rs"), "").unwrap();

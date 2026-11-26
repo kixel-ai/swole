@@ -1,5 +1,5 @@
-//! Builds preload.rs, the library rust2-bench preloads into every counted process, which
-//! rust2-bench embeds: it is a cdylib, which Cargo cannot build as a dependency of a binary.
+//! Builds preload.rs, the library swole preloads into every counted process, which
+//! swole embeds: it is a cdylib, which Cargo cannot build as a dependency of a binary.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,7 +18,7 @@ fn main() {
 	let status = Command::new(rustc)
 		.args([
 			"--crate-type=cdylib",
-			"--crate-name=rust2_bench_preload",
+			"--crate-name=swole_preload",
 			"--edition=2024",
 			"-Cpanic=abort",
 			"-Copt-level=3",

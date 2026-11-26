@@ -1,0 +1,49 @@
+name: Check
+
+# The check every pull request needs before it lands; main's ruleset requires its `check` job.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # x86_64, where the tests count under Valgrind; hosted, which costs a public repository
+    # nothing. Its VM exposes no perf counters, which the perf test accepts, saying so.
+    runs-on: ubuntu-24.04
+    # Backstop a hang instead of holding the runner for the 6-hour default.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/nix
+      # Dependencies are a small part of the build, but the tests' fixtures build in target
+      # directories of their own under it. Only main saves, so a pull request reads the cache
+      # and can't write what later runs build on.
+      - id: cargo
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: &cargo-paths |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'flake.lock') }}
+      - run: nix develop --command just ci
+        env:
+          # A fresh checkout rebuilds swole itself whole, so incremental state is only cache weight.
+          CARGO_INCREMENTAL: 0
+      - if: github.ref == 'refs/heads/main' && steps.cargo.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # The same paths, or the save writes a cache no restore matches.
+          path: *cargo-paths
+          key: ${{ steps.cargo.outputs.cache-primary-key }}

@@ -1,5 +1,5 @@
 //! Linux perf counters of a case's user-space instructions (`instructions:u`), on every thread,
-//! which rust2-bench reads natively instead of counting under Valgrind.
+//! which swole reads natively instead of counting under Valgrind.
 
 use std::cell::RefCell;
 use std::io::Read;
@@ -7,7 +7,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 
 /// Counts one case's instructions, on every thread its process runs during the count.
 pub struct Counter {
-	/// The PMU's perf type, or 0 on a host with one, whose CPUs rust2-bench runs the process on.
+	/// The PMU's perf type, or 0 on a host with one, whose CPUs swole runs the process on.
 	kind: u32,
 	state: RefCell<State>,
 }
@@ -126,7 +126,7 @@ fn threads() -> Result<std::collections::BTreeSet<i32>, String> {
 		.collect()
 }
 
-/// Fails unless the process loaded the first library `LD_PRELOAD` names, where rust2-bench puts
+/// Fails unless the process loaded the first library `LD_PRELOAD` names, where swole puts
 /// its own, which a static executable never does, so a count never follows the host's
 /// randomness and clock unannounced.
 pub fn preloaded() -> Result<(), String> {
@@ -280,7 +280,7 @@ fn instructions(kind: u32, tid: i32, inherit: bool) -> std::io::Result<OwnedFd> 
 		let _ = (attr, tid);
 		Err(std::io::Error::new(
 			std::io::ErrorKind::Unsupported,
-			"rust2-bench-harness opens perf counters on x86_64 and aarch64",
+			"swole opens perf counters on x86_64 and aarch64",
 		))
 	}
 }

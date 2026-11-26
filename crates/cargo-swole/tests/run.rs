@@ -1,4 +1,4 @@
-//! rust2-bench end to end, under the Valgrind on PATH: this test binary is also the program it
+//! swole end to end, under the Valgrind on PATH: this test binary is also the program it
 //! counts, which brackets each benchmark with Callgrind's client requests as CodSpeed's
 //! instrument hooks do.
 
@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 /// The benchmarks the fixture runs, `name=iterations` comma-separated, when it is the program.
-const FIXTURE: &str = "RUST2_BENCH_FIXTURE";
+const FIXTURE: &str = "SWOLE_FIXTURE";
 
 /// Callgrind's client request codes, from valgrind/callgrind.h.
 const BASE: u64 = (b'C' as u64) << 24 | (b'T' as u64) << 16;
@@ -110,7 +110,7 @@ fn program(benches: &str, wrap: &str) -> String {
 	format!("{FIXTURE}={benches} {wrap} '{me}' --exact fixture --ignored --test-threads=1 -q")
 }
 
-/// rust2-bench, run in `dir` with `args`, counting the fixture as its one program, launched
+/// swole, run in `dir` with `args`, counting the fixture as its one program, launched
 /// through the command `wrap`, if any.
 fn bench(dir: &Path, benches: &str, wrap: &str, args: &[&str]) -> Output {
 	command(dir, benches, wrap, args).output().unwrap()
@@ -118,7 +118,7 @@ fn bench(dir: &Path, benches: &str, wrap: &str, args: &[&str]) -> Output {
 
 /// The command [`bench`] runs.
 fn command(dir: &Path, benches: &str, wrap: &str, args: &[&str]) -> Command {
-	let mut command = Command::new(env!("CARGO_BIN_EXE_rust2-bench"));
+	let mut command = Command::new(env!("CARGO_BIN_EXE_swole"));
 	command
 		.arg("run")
 		.args(["--program", &program(benches, wrap)])
@@ -242,13 +242,13 @@ fn fails_on_a_program_that_measures_nothing() {
 	assert!(err.contains("measured no benchmark"), "{err}");
 }
 
-/// rust2-bench, run in this workspace with `args` on the harness's fixture benchmark target,
+/// swole, run in this workspace with `args` on the harness's fixture benchmark target,
 /// built in a target directory of its own, since this test's build holds the workspace's.
 fn harness(args: &[&str]) -> Output {
-	Command::new(env!("CARGO_BIN_EXE_rust2-bench"))
+	Command::new(env!("CARGO_BIN_EXE_swole"))
 		.arg("run")
 		.args(args)
-		.args(["--", "-p", "rust2-bench-harness", "--bench", "fixture"])
+		.args(["--", "-p", "swole", "--bench", "fixture"])
 		.current_dir(env!("CARGO_MANIFEST_DIR"))
 		.env(
 			"CARGO_TARGET_DIR",
@@ -267,7 +267,7 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 	let metrics: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(metrics).unwrap()).unwrap();
 	let metrics = metrics["samples"][0]["metrics"].as_object().unwrap();
-	let file = "harness/benches/fixture.rs::";
+	let file = "crates/swole/benches/fixture.rs::";
 	let names: Vec<&str> = metrics.keys().map(|name| name.strip_prefix(file).unwrap()).collect();
 	assert_eq!(
 		names,
@@ -387,7 +387,7 @@ fn counts_with_perf_counters_what_valgrind_does() {
 	let valgrind = table(&valgrind.stdout);
 	assert_eq!(perf.keys().collect::<Vec<_>>(), valgrind.keys().collect::<Vec<_>>());
 	assert_eq!(perf.len(), 16);
-	let file = "harness/benches/fixture.rs::";
+	let file = "crates/swole/benches/fixture.rs::";
 	let threaded = [
 		format!("{file}handed"),
 		format!("{file}spawned[100000]"),
@@ -444,7 +444,7 @@ fn fails_on_a_process_that_never_loaded_the_preload() {
 	let out = bench(&dir, "a=10", "env -u LD_PRELOAD", &[]);
 	assert!(!out.status.success());
 	let err = String::from_utf8_lossy(&out.stderr);
-	assert!(err.contains("never loaded rust2-bench's preload"), "{err}");
+	assert!(err.contains("never loaded swole's preload"), "{err}");
 }
 
 #[test]
@@ -497,7 +497,7 @@ fn compares_a_base_with_every_change_in_the_working_tree_from_one_directory() {
 	std::fs::write(repo.join("b.list"), "b=500,").unwrap();
 	std::fs::remove_file(repo.join("d.list")).unwrap();
 	let status = git(&repo, &["status", "--porcelain"]);
-	let out = Command::new(env!("CARGO_BIN_EXE_rust2-bench"))
+	let out = Command::new(env!("CARGO_BIN_EXE_swole"))
 		.args(["compare", "HEAD", "--program", &program("$(cat *.list)", "")])
 		// Each side's build resolves its own ignored lockfile, never the side's before.
 		.args(["--build", "! test -e Cargo.lock && touch Cargo.lock"])
@@ -531,13 +531,13 @@ fn compares_a_base_with_every_change_in_the_working_tree_from_one_directory() {
 fn package(repo: &Path, name: &str, bench: &str, needs: &[&str]) {
 	let dir = repo.join(name);
 	std::fs::create_dir_all(dir.join("benches")).unwrap();
-	let harness = Path::new(env!("CARGO_MANIFEST_DIR")).join("harness");
+	let harness = Path::new(env!("CARGO_MANIFEST_DIR")).join("../swole");
 	let features: String = needs.iter().map(|f| format!("{f} = []\n")).collect();
 	std::fs::write(
 		dir.join("Cargo.toml"),
 		format!(
 			"[package]\nname = \"{name}\"\nedition = \"2024\"\n\n[features]\n{features}\n\
-			 [dev-dependencies]\nrust2-bench-harness = {{ path = {harness:?} }}\n\n\
+			 [dev-dependencies]\nswole = {{ path = {harness:?} }}\n\n\
 			 [[bench]]\nname = \"{bench}\"\nharness = false\nrequired-features = {needs:?}\n"
 		),
 	)
@@ -546,8 +546,8 @@ fn package(repo: &Path, name: &str, bench: &str, needs: &[&str]) {
 	std::fs::write(dir.join("src/lib.rs"), "").unwrap();
 	std::fs::write(
 		dir.join("benches").join(format!("{bench}.rs")),
-		"#[rust2_bench_harness::bench]\nfn spin() -> u64 {\n\t(0..1000u64).map(std::hint::black_box).sum()\n}\n\n\
-		 fn main() {\n\trust2_bench_harness::main();\n}\n",
+		"#[swole::bench]\nfn spin() -> u64 {\n\t(0..1000u64).map(std::hint::black_box).sum()\n}\n\n\
+		 fn main() {\n\tswole::main();\n}\n",
 	)
 	.unwrap();
 }
@@ -560,7 +560,7 @@ fn compares_a_selection_only_one_side_has() {
 	// The runner's own lockfile, so the workspace resolves the harness's dependencies as the
 	// runner's build already has, offline.
 	std::fs::copy(
-		Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"),
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
 		repo.join("Cargo.lock"),
 	)
 	.unwrap();
@@ -579,9 +579,9 @@ fn compares_a_selection_only_one_side_has() {
 	)
 	.unwrap();
 	package(&repo, "b", "y", &["f"]);
-	// Compare from `dir`, with rust2-bench's `flags` and the `cargo` args.
+	// Compare from `dir`, with swole's `flags` and the `cargo` args.
 	let run = |dir: &Path, flags: &[&str], cargo: &[&str]| {
-		Command::new(env!("CARGO_BIN_EXE_rust2-bench"))
+		Command::new(env!("CARGO_BIN_EXE_swole"))
 			.args(["compare", "HEAD"])
 			.args(flags)
 			.arg("--")

@@ -1,4 +1,4 @@
-//! rust2-bench's wall-clock times end to end: the harness's fixture timed alone, and a scratch
+//! swole's wall-clock times end to end: the harness's fixture timed alone, and a scratch
 //! repository's benchmarks paired with its base commit's. Times move with the host's load, so
 //! these check what a time is, and only a difference far past any load's.
 
@@ -58,10 +58,10 @@ fn times(sample: &Value, measure: &str) -> Vec<(String, f64)> {
 #[test]
 fn times_each_harness_benchmark() {
 	let dir = scratch("time-alone");
-	let out = Command::new(env!("CARGO_BIN_EXE_rust2-bench"))
+	let out = Command::new(env!("CARGO_BIN_EXE_swole"))
 		.args(["time", "--out"])
 		.arg(dir.join("metrics.json"))
-		.args(["--", "-p", "rust2-bench-harness", "--bench", "fixture"])
+		.args(["--", "-p", "swole", "--bench", "fixture"])
 		.current_dir(env!("CARGO_MANIFEST_DIR"))
 		// The target directory the count tests build the fixture in, apart from this test's own.
 		.env(
@@ -76,7 +76,7 @@ fn times_each_harness_benchmark() {
 	assert_eq!(samples.len(), 1);
 	assert!(samples[0].get("commit").is_none());
 	let times = times(&samples[0], &measure);
-	let file = "harness/benches/fixture.rs::";
+	let file = "crates/swole/benches/fixture.rs::";
 	let names: Vec<&str> = times.iter().map(|(name, _)| name.strip_prefix(file).unwrap()).collect();
 	assert_eq!(
 		names,
@@ -112,12 +112,12 @@ fn times_each_harness_benchmark() {
 fn spins(work: u64, extra: &str) -> String {
 	format!(
 		"use std::hint::black_box;\n\
-		 use rust2_bench_harness::bench;\n\
+		 use swole::bench;\n\
 		 fn spin(n: u64) -> u64 {{ let mut sum = 0u64; for i in 0..n {{ sum = black_box(sum.wrapping_add(i)); }} sum }}\n\
 		 #[bench] fn work() -> u64 {{ spin({work}) }}\n\
 		 #[bench] fn same() -> u64 {{ spin(1000) }}\n\
 		 #[bench] fn {extra}() -> u64 {{ spin(1000) }}\n\
-		 fn main() {{ rust2_bench_harness::main(); }}\n"
+		 fn main() {{ swole::main(); }}\n"
 	)
 }
 
@@ -132,19 +132,19 @@ fn pairs_a_base_commit_with_the_working_tree() {
 	let dir = scratch("time-paired");
 	let repo = dir.join("repo");
 	std::fs::create_dir_all(repo.join("benches")).unwrap();
-	let harness = Path::new(env!("CARGO_MANIFEST_DIR")).join("harness");
+	let harness = Path::new(env!("CARGO_MANIFEST_DIR")).join("../swole");
 	std::fs::write(
 		repo.join("Cargo.toml"),
 		format!(
 			"[package]\nname = \"paired\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n\
-			 [dev-dependencies]\nrust2-bench-harness = {{ path = {:?} }}\n\n[[bench]]\nname = \"spin\"\nharness = false\n",
+			 [dev-dependencies]\nswole = {{ path = {:?} }}\n\n[[bench]]\nname = \"spin\"\nharness = false\n",
 			harness.to_str().unwrap()
 		),
 	)
 	.unwrap();
 	// The runner's own lock, so the scratch workspace resolves the harness's dependencies offline.
 	std::fs::copy(
-		Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"),
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
 		repo.join("Cargo.lock"),
 	)
 	.unwrap();
@@ -171,7 +171,7 @@ fn pairs_a_base_commit_with_the_working_tree() {
 	// The working tree spins twice as long in `work`, and trades `gone` for `new`.
 	std::fs::write(repo.join("benches/spin.rs"), spins(2000, "new")).unwrap();
 
-	let out = Command::new(env!("CARGO_BIN_EXE_rust2-bench"))
+	let out = Command::new(env!("CARGO_BIN_EXE_swole"))
 		.args(["time", "HEAD", "--out", "metrics.json"])
 		.current_dir(&repo)
 		// The base's worktree, outside the scratch repository, and one target directory both
@@ -230,12 +230,12 @@ fn package(repo: &Path, name: &str, bench: &str) {
 	let dir = repo.join(name);
 	std::fs::create_dir_all(dir.join("benches")).unwrap();
 	std::fs::create_dir_all(dir.join("src")).unwrap();
-	let harness = Path::new(env!("CARGO_MANIFEST_DIR")).join("harness");
+	let harness = Path::new(env!("CARGO_MANIFEST_DIR")).join("../swole");
 	std::fs::write(
 		dir.join("Cargo.toml"),
 		format!(
 			"[package]\nname = \"{name}\"\nedition = \"2024\"\npublish = false\n\n\
-			 [dev-dependencies]\nrust2-bench-harness = {{ path = {harness:?} }}\n\n\
+			 [dev-dependencies]\nswole = {{ path = {harness:?} }}\n\n\
 			 [[bench]]\nname = \"{bench}\"\nharness = false\n"
 		),
 	)
@@ -250,7 +250,7 @@ fn times_a_selection_only_one_side_has() {
 	let repo = dir.join("repo");
 	std::fs::create_dir_all(&repo).unwrap();
 	std::fs::copy(
-		Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"),
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
 		repo.join("Cargo.lock"),
 	)
 	.unwrap();
@@ -286,7 +286,7 @@ fn times_a_selection_only_one_side_has() {
 	.unwrap();
 	package(&repo, "b", "y");
 	let time = |cargo: &[&str]| {
-		Command::new(env!("CARGO_BIN_EXE_rust2-bench"))
+		Command::new(env!("CARGO_BIN_EXE_swole"))
 			.args(["time", "HEAD", "--"])
 			.args(cargo)
 			.current_dir(&repo)

@@ -1,4 +1,4 @@
-//! The benchmarks rust2-bench's tests count and time: a loop of known length alone, by
+//! The benchmarks swole's tests count and time: a loop of known length alone, by
 //! argument, in a module, in an order that changes, behind a setup and between steps whose own
 //! work must go uncounted, on another thread, which must count, and timing itself.
 
@@ -6,7 +6,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use rust2_bench_harness::{Iterations, bench};
+use swole::{Iterations, bench};
 
 /// `n` iterations of a loop the optimizer keeps.
 fn spin(n: u64) -> u64 {
@@ -136,7 +136,7 @@ mod inner {
 		heavy
 	}
 
-	#[rust2_bench_harness::bench(args = ["a", "bc"], setup = from)]
+	#[swole::bench(args = ["a", "bc"], setup = from)]
 	fn nested(heavy: &mut super::Heavy) -> u64 {
 		heavy.0[0] += 1;
 		super::spin(1000)
@@ -144,5 +144,5 @@ mod inner {
 }
 
 fn main() {
-	rust2_bench_harness::main();
+	swole::main();
 }

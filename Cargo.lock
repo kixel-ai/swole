@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "cargo-swole"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "swole",
+ "toml",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -64,32 +73,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust2-bench"
-version = "0.0.0"
-dependencies = [
- "rust2-bench-harness",
- "serde_json",
- "toml",
-]
-
-[[package]]
-name = "rust2-bench-harness"
-version = "0.0.0"
-dependencies = [
- "inventory",
- "rust2-bench-macros",
-]
-
-[[package]]
-name = "rust2-bench-macros"
-version = "0.0.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -144,6 +127,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c187e0a369471c550af028cba56d4f4fa2a489ad28151ae95a4d340a2a8b782"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "swole"
+version = "0.0.0"
+dependencies = [
+ "inventory",
+ "swole-macros",
+]
+
+[[package]]
+name = "swole-macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

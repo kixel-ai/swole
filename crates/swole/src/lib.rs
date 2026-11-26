@@ -1,7 +1,7 @@
-//! Benchmarks as plain functions marked `#[bench]`, which [rust2-bench] counts in
+//! Benchmarks as plain functions marked `#[bench]`, which [swole] counts in
 //! instructions under Valgrind and times by wall clock. See the README.
 //!
-//! [rust2-bench]: https://github.com/kixel-ai/rust2/tree/main/bench/runner
+//! [swole]: https://github.com/kixel-ai/swole
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -9,20 +9,20 @@ use std::io::{BufRead, Write};
 /// Marks a function as a benchmark: `#[bench]`, `#[bench(args = [..])]`, `#[bench(setup = f)]`,
 /// with `before = g` or `after = h` steps on setup's output. See the README for what each
 /// passes the function.
-pub use rust2_bench_macros::bench;
+pub use swole_macros::bench;
 
-/// The variable naming the one benchmark a run counts or times, which rust2-bench sets on each job.
-const ONLY: &str = "RUST2_BENCH";
+/// The variable naming the one benchmark a run counts or times, which swole sets on each job.
+const ONLY: &str = "SWOLE_BENCH";
 
-/// The variable that, set to `1`, times the benchmark `RUST2_BENCH` names, a sample for each
+/// The variable that, set to `1`, times the benchmark `SWOLE_BENCH` names, a sample for each
 /// iteration count a line of stdin holds.
-const TIME: &str = "RUST2_BENCH_TIME";
+const TIME: &str = "SWOLE_TIME";
 
-/// What a run prints after each benchmark, before its name, which rust2-bench lists them by.
-const RAN: &str = "rust2-bench ran ";
+/// What a run prints after each benchmark, before its name, which swole lists them by.
+const RAN: &str = "swole ran ";
 
 /// What a timed run prints, alone on a line, before each sample's nanoseconds.
-const SAMPLE: &str = "rust2-bench sample ";
+const SAMPLE: &str = "swole sample ";
 
 /// How many times a benchmark that times itself runs its work, as a loop takes it:
 /// `for _ in iterations`.
@@ -47,17 +47,17 @@ impl IntoIterator for Iterations {
 
 /// The variable that, set to a PMU's perf type (0 on a host with one), counts each benchmark's
 /// user-space instructions with Linux perf counters, natively.
-const PERF: &str = "RUST2_BENCH_PERF";
+const PERF: &str = "SWOLE_PERF";
 
 /// What a perf count prints before each benchmark's count, `alone` or `threads`, and name.
 #[cfg(target_os = "linux")]
-const COUNTED: &str = "rust2-bench counted ";
+const COUNTED: &str = "swole counted ";
 
 #[cfg(target_os = "linux")]
 mod perf;
 
 /// Fails unless this host lets a process count its own user-space instructions on the PMU of
-/// perf type `kind`, saying why not: rust2-bench's check before it builds anything.
+/// perf type `kind`, saying why not: swole's check before it builds anything.
 #[doc(hidden)]
 pub fn __probe_perf(kind: u32) -> Result<(), String> {
 	#[cfg(target_os = "linux")]
@@ -70,18 +70,18 @@ pub fn __probe_perf(kind: u32) -> Result<(), String> {
 }
 
 /// Runs every benchmark the program's `#[bench]` functions declare, or only the one
-/// `RUST2_BENCH` names, each counted alone under Valgrind and once natively, or timed when
-/// `RUST2_BENCH_TIME` is set. Call it from a benchmark target's `main`.
+/// `SWOLE_BENCH` names, each counted alone under Valgrind and once natively, or timed when
+/// `SWOLE_TIME` is set. Call it from a benchmark target's `main`.
 pub fn main() {
 	if let Err(err) = run() {
-		eprintln!("rust2-bench-harness: {err}");
+		eprintln!("swole: {err}");
 		std::process::exit(1);
 	}
 }
 
 fn run() -> Result<(), String> {
 	// Cargo passes `--bench` to a benchmark target, and `--quiet` under `cargo -q`; nothing
-	// else, but what follows its `--`, which a filter would take: rust2-bench chooses instead.
+	// else, but what follows its `--`, which a filter would take: swole chooses instead.
 	let mut quiet = false;
 	for arg in std::env::args().skip(1) {
 		match arg.as_str() {
@@ -89,7 +89,7 @@ fn run() -> Result<(), String> {
 			"--quiet" => quiet = true,
 			_ => {
 				return Err(format!(
-					"unknown argument {arg}: a benchmark target takes none, and rust2-bench's --benchmarks chooses benchmarks"
+					"unknown argument {arg}: a benchmark target takes none, and swole's --benchmarks chooses benchmarks"
 				));
 			}
 		}
@@ -183,7 +183,7 @@ fn cases<'a>(
 				Some(arg) => format!("{base}[{arg}]"),
 				None => base.clone(),
 			};
-			// rust2-bench reads names a line each, and Kixel Quest takes none holding one.
+			// swole reads names a line each, and Kixel Quest takes none holding one.
 			if name.chars().any(char::is_control) {
 				return Err(format!(
 					"{name:?} holds a control character, which no benchmark's name may"
@@ -791,7 +791,7 @@ mod tests {
 		serve(sampler, "1\n4\n".as_bytes(), &mut out).unwrap();
 		assert_eq!(
 			String::from_utf8(out).unwrap(),
-			"\nrust2-bench sample 10\n\nrust2-bench sample 40\n"
+			"\nswole sample 10\n\nswole sample 40\n"
 		);
 		for bad in ["0\n", "x\n", " 1\n"] {
 			let err = serve(nothing(), bad.as_bytes(), Vec::new()).unwrap_err();
