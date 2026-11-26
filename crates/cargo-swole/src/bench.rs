@@ -57,9 +57,10 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	}
 	eprintln!("swole: fingerprint {host}");
 	let perf = native.host.perf.as_ref().ok();
-	// Each counting pass runs under the preload, whose thread count tells whether another thread
-	// ran beside a call, which the counters, reading the calling thread alone, would not see.
-	let preload = perf.map(|_| crate::preload::install()).transpose()?;
+	// Each counting pass runs under the preload built to count threads alone, which tells whether
+	// another thread ran beside a call, whose work the counters, reading the calling thread alone,
+	// would not see, and leaves the clock and randomness the host's, as the timing passes have them.
+	let preload = perf.map(|_| crate::preload::threads()).transpose()?;
 	// Held until the base is timed, so no other compare checks out another commit under it.
 	let checkout = base.map(|base| Checkout::new(base, options)).transpose()?;
 	// Each side builds only the packages and targets of the Cargo args its revision has.
@@ -234,7 +235,15 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 		eprintln!("swole: wrote {}", out.display());
 	}
 	if let Some(path) = &options.report {
-		report(&times, &details, &threaded, &host, &native.describe(), sha).write(path)?;
+		report(
+			&times,
+			&details,
+			perf.map(|_| &threaded),
+			&host,
+			&native.describe(),
+			sha,
+		)
+		.write(path)?;
 		eprintln!("swole: wrote {}", path.display());
 	}
 	Ok(())
@@ -293,7 +302,7 @@ fn count(job: &Job, perf: &perf::Perf, preload: &Path, iterations: u64, dir: &Pa
 			));
 		}
 		let path = dir.join("stdout");
-		let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+		let text = crate::printed(&path)?;
 		let readings = perf::readings(&text, pass.len()).map_err(|err| format!("{}: {err}", job.label))?;
 		match readings.as_slice() {
 			[] => {
@@ -654,7 +663,8 @@ fn file(times: &BTreeMap<String, Times>, host: &str, base: Option<&str>) -> metr
 fn report(
 	times: &BTreeMap<String, Times>,
 	details: &[BTreeMap<String, Vec<Measure>>; 2],
-	threaded: &std::collections::BTreeSet<String>,
+	// The benchmarks beside which other threads ran, when perf counters watched for them.
+	threaded: Option<&std::collections::BTreeSet<String>>,
 	host: &str,
 	describe: &str,
 	base: Option<&str>,
@@ -668,7 +678,9 @@ fn report(
 			measures.extend(details[i].get(name).cloned().unwrap_or_default());
 			entry.insert(side.to_owned(), metrics::side(&measures));
 		}
-		entry.insert("threaded".to_owned(), threaded.contains(name).into());
+		if let Some(threaded) = threaded {
+			entry.insert("threaded".to_owned(), threaded.contains(name).into());
+		}
 		if let Times::Both { ratio, .. } = timed {
 			entry.insert(
 				"change".to_owned(),

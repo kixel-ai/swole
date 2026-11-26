@@ -13,6 +13,9 @@
 //! six fixed ones.
 
 #![no_std]
+// Built with `--cfg threads`, it counts the threads the process starts and nothing else, for a
+// process whose clock and randomness must stay the host's.
+#![cfg_attr(threads, allow(dead_code))]
 
 use core::ffi::{c_char, c_int, c_long, c_uint, c_void};
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering::Relaxed};
@@ -247,6 +250,7 @@ unsafe fn fill(buf: *mut u8, len: usize) {
 }
 
 /// glibc's `getrandom`, which std's `HashMap` seeds and the `getrandom` crate read.
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getrandom(buf: *mut c_void, len: usize, flags: c_uint) -> isize {
 	if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0
@@ -264,6 +268,7 @@ pub unsafe extern "C" fn getrandom(buf: *mut c_void, len: usize, flags: c_uint) 
 	len as isize
 }
 
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getentropy(buf: *mut c_void, len: usize) -> c_int {
 	if len > 256 {
@@ -334,6 +339,7 @@ fn host_deadline(clock: c_int, ahead: u64) -> Timespec {
 	Timespec::from_ns(now.ns().unwrap_or(0).saturating_add(ahead))
 }
 
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clock_gettime(clock: c_int, out: *mut Timespec) -> c_int {
 	match base(clock) {
@@ -354,6 +360,7 @@ pub unsafe extern "C" fn clock_gettime(clock: c_int, out: *mut Timespec) -> c_in
 	}
 }
 
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gettimeofday(out: *mut Timeval, _zone: *mut c_void) -> c_int {
 	if !out.is_null() {
@@ -369,6 +376,7 @@ pub unsafe extern "C" fn gettimeofday(out: *mut Timeval, _zone: *mut c_void) -> 
 	0
 }
 
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn time(out: *mut i64) -> i64 {
 	let sec = (read(REALTIME) / NS) as i64;
@@ -389,6 +397,7 @@ fn waited_ms(timeout: c_int, start: u64, ready: c_int) {
 	}
 }
 
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn epoll_wait(epfd: c_int, events: *mut c_void, max: c_int, timeout: c_int) -> c_int {
 	let real = real!("epoll_wait": unsafe extern "C" fn(c_int, *mut c_void, c_int, c_int) -> c_int);
@@ -399,6 +408,7 @@ pub unsafe extern "C" fn epoll_wait(epfd: c_int, events: *mut c_void, max: c_int
 	ready
 }
 
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn epoll_pwait(
 	epfd: c_int,
@@ -415,6 +425,7 @@ pub unsafe extern "C" fn epoll_pwait(
 	ready
 }
 
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn poll(fds: *mut c_void, n: u64, timeout: c_int) -> c_int {
 	let real = real!("poll": unsafe extern "C" fn(*mut c_void, u64, c_int) -> c_int);
@@ -425,6 +436,7 @@ pub unsafe extern "C" fn poll(fds: *mut c_void, n: u64, timeout: c_int) -> c_int
 	ready
 }
 
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nanosleep(span: *const Timespec, rest: *mut Timespec) -> c_int {
 	let real = real!("nanosleep": unsafe extern "C" fn(*const Timespec, *mut Timespec) -> c_int);
@@ -439,6 +451,7 @@ pub unsafe extern "C" fn nanosleep(span: *const Timespec, rest: *mut Timespec) -
 	slept
 }
 
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clock_nanosleep(
 	clock: c_int,
@@ -490,6 +503,7 @@ fn deadline(clock: c_int, at: *const Timespec) -> Option<(u64, Timespec)> {
 	Some((base, host_deadline(clock, ahead)))
 }
 
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_cond_timedwait(cond: *mut c_void, mutex: *mut c_void, at: *const Timespec) -> c_int {
 	let real = real!("pthread_cond_timedwait" @ "GLIBC_2.3.2": unsafe extern "C" fn(*mut c_void, *mut c_void, *const Timespec) -> c_int);
@@ -513,6 +527,7 @@ pub unsafe extern "C" fn pthread_cond_timedwait(cond: *mut c_void, mutex: *mut c
 	woke
 }
 
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_cond_clockwait(
 	cond: *mut c_void,
@@ -571,6 +586,7 @@ macro_rules! until {
 	)*};
 }
 
+#[cfg(not(threads))]
 until! {
 	fn sem_timedwait(sem: *mut c_void) -> c_int, CLOCK_REALTIME, set_timeout;
 	fn sem_clockwait(sem: *mut c_void, clock: c_int) -> c_int, clock, set_timeout;
@@ -600,6 +616,7 @@ fn absolute(flags: c_int, new: *const Itimerspec) -> bool {
 			.is_some_and(|new| valid(&new.interval) && valid(&new.value) && (new.value.sec != 0 || new.value.nsec != 0))
 }
 
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timerfd_settime(
 	fd: c_int,
@@ -616,6 +633,7 @@ pub unsafe extern "C" fn timerfd_settime(
 	unsafe { real(fd, flags, new, old) }
 }
 
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timer_settime(
 	timer: *mut c_void,
@@ -638,6 +656,7 @@ type Syscall = unsafe extern "C" fn(c_long, ...) -> c_long;
 /// glibc's `syscall`, through which the `getrandom` crate's 0.2 releases read randomness and
 /// std waits on a futex. On x86_64 a variadic call passes its first six arguments as a call with
 /// six fixed ones does, so this reads them all, as glibc's own does.
+#[cfg(not(threads))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall(
 	n: c_long,

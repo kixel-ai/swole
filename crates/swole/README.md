@@ -152,12 +152,14 @@ The requests are x86_64's and aarch64's; elsewhere the harness requests nothing,
 swole fails a job that measured no benchmark.
 
 Run by swole, it prints `swole threaded <name>` for a case beside which the process had another
-thread: one there when its call started or ended, or, under swole's preload, one its call started.
+thread: one there when its call started or ended, or, under swole's preload, one its call started;
+and `swole alone <name>` for any other, so swole counts a case again under Valgrind when a harness
+too old to watch says neither.
 
 With `SWOLE_COUNTERS` set to how many Linux perf counters swole opened on the process before it
 ran the target, as `<hardware>+<software>`, it starts them all after the case's setup and reads
 each hardware one in user space with `rdpmc`, then reads them again after its call and stops
-them, so a count holds no system call. It counts only under swole's preload, whose thread count
+them, so a count holds no system call. It counts only under swole's preload, or its build that counts threads alone, whose thread count
 tells swole whether another thread, whose work the counters cannot see, ran beside a call. It
 then prints a `swole rusage` line of what the process used over the call and
 `swole counted <value>... <name>`, each counter's value in the order swole opened them, before

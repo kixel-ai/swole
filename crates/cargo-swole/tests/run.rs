@@ -281,6 +281,7 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 			"sized[1000]",
 			"sized[2000]",
 			"sized[4000]",
+			"slept",
 			"spawned[100000]",
 			"spawned[1000]",
 			"stepped",
@@ -388,6 +389,7 @@ fn single_threaded(dir: &Path) -> PathBuf {
 		"sized[1000]",
 		"sized[2000]",
 		"sized[4000]",
+		"slept",
 		"stepped",
 		"timed",
 		"unstable[1000]",
@@ -431,7 +433,7 @@ fn counts_with_perf_counters_what_valgrind_does() {
 	assert!(sim.status.success(), "{}", String::from_utf8_lossy(&sim.stderr));
 	let valgrind = table(&sim.stdout);
 	assert_eq!(perf.keys().collect::<Vec<_>>(), valgrind.keys().collect::<Vec<_>>());
-	assert_eq!(perf.len(), 14);
+	assert_eq!(perf.len(), 15);
 	for (name, &count) in &perf {
 		// The same instructions, but for each bracket's own few dozen.
 		let under = valgrind[name];
@@ -444,6 +446,18 @@ fn counts_with_perf_counters_what_valgrind_does() {
 	// whatever follows it, and exactly so on every run.
 	let (alone, dropped) = (perf[&format!("{file}alone")], perf[&format!("{file}dropped")]);
 	assert!(alone.abs_diff(dropped) < 16, "{alone} {dropped}");
+	// A call that sleeps leaves the CPU and its counters move, which moves its count not at all:
+	// it is as far from Valgrind's as `alone`'s.
+	let gap = |name: &str| {
+		let name = format!("{file}{name}");
+		perf[&name] as i64 - valgrind[&name] as i64
+	};
+	assert!(
+		gap("slept").abs_diff(gap("alone")) < 16,
+		"{} {}",
+		gap("slept"),
+		gap("alone")
+	);
 	let again = table(&harness(&["quick", "--benchmarks", list]).stdout);
 	assert_eq!(perf, again);
 }

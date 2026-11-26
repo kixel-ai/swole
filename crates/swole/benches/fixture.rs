@@ -1,6 +1,7 @@
 //! The benchmarks swole's tests count and time: a loop of known length alone, by argument, with
 //! an output to drop, in a module, in an order that changes, behind a setup and between steps
-//! whose own work must go uncounted, on another thread, which must count, and timing itself.
+//! whose own work must go uncounted, across a sleep, on another thread, which must count, and
+//! timing itself.
 
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +35,14 @@ impl Drop for Dropped {
 #[bench]
 fn dropped() -> (u64, Dropped) {
 	(spin(1000), Dropped)
+}
+
+/// Counts as `alone` does, but for the sleep's own work: the thread leaves the CPU mid-call,
+/// and its counters with it.
+#[bench]
+fn slept() -> u64 {
+	std::thread::sleep(Duration::from_millis(1));
+	spin(1000)
 }
 
 /// Its literals are `u64`s, as `sized` takes them, which the first would overflow as an `i32`.

@@ -421,14 +421,22 @@ impl Counter {
 
 /// The reason a failed harness target gave on its stderr, at `errors`, after a colon, or nothing.
 pub(crate) fn reason(errors: &Path) -> String {
-	std::fs::read_to_string(errors)
+	std::fs::read(errors)
 		.ok()
-		.and_then(|text| {
-			text.lines()
+		.and_then(|bytes| {
+			String::from_utf8_lossy(&bytes)
+				.lines()
 				.rev()
 				.find_map(|line| line.strip_prefix("swole: ").map(str::to_owned))
 		})
 		.map_or(String::new(), |why| format!(": {why}"))
+}
+
+/// A harness target's stdout at `path`, where a benchmark may write any bytes around the
+/// harness's own lines, which are UTF-8.
+pub(crate) fn printed(path: &Path) -> Result<String, String> {
+	let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+	Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Each line of `text` under swole's prefix.
@@ -595,12 +603,15 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 	if matches!(counter.kind, CounterKind::Valgrind) {
 		// Under Valgrind, a job beside whose benchmarks other threads ran counts again, its
 		// samples' spread standing for what the scheduler moves. So does one whose threads
-		// swole cannot see: CodSpeed's, and a program's, whose harness no `SWOLE_BENCH` watches.
+		// swole cannot see: CodSpeed's, a program's, whose harness no `SWOLE_BENCH` watches, and
+		// one whose harness is too old to say.
 		// Each job repeated, with the names its first round measured.
 		let again: Vec<(&Job, Vec<&String>)> = jobs
 			.iter()
 			.zip(&first)
-			.filter(|(job, found)| job.codspeed || job.expect.is_none() || found.iter().any(|found| found.threaded))
+			.filter(|(job, found)| {
+				job.codspeed || job.expect.is_none() || found.iter().any(|found| found.threaded || !found.watched)
+			})
 			.map(|(job, found)| {
 				let mut names: Vec<&String> = found.iter().map(|found| &found.name).collect();
 				names.sort_unstable();
@@ -877,6 +888,8 @@ struct Found {
 	count: u64,
 	/// Whether the process had another thread beside it.
 	threaded: bool,
+	/// Whether its harness said whether it had, as one too old to watch does not.
+	watched: bool,
 	/// Every measure of it, when its count took more than instructions.
 	details: Vec<Measure>,
 }
@@ -943,7 +956,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 				dir.display()
 			));
 		}
-		let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+		let text = printed(&path)?;
 		let mut readings = perf::readings(&text, pass.len()).map_err(|err| format!("{label}: {err}"))?;
 		let reading = match (&job.expect, readings.len()) {
 			(Some(name), 1) if readings[0].name == *name => readings.remove(0),
@@ -989,6 +1002,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 		name: first.name,
 		count,
 		threaded: first.threaded,
+		watched: true,
 		details,
 	}])
 }
@@ -1028,11 +1042,7 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 			dir.display()
 		));
 	}
-	let stdout = dir.join("stdout");
-	// A program may write any bytes; only the harness's marker lines are read.
-	let threaded = perf::threaded(&String::from_utf8_lossy(
-		&std::fs::read(&stdout).map_err(|e| format!("cannot read {}: {e}", stdout.display()))?,
-	));
+	let threads = perf::threads(&printed(&dir.join("stdout"))?);
 	let mut measured = Vec::new();
 	let mut entries: Vec<_> = std::fs::read_dir(dir)
 		.map_err(|e| format!("cannot read {}: {e}", dir.display()))?
@@ -1056,7 +1066,8 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 			preload::check(dir, pid, label)?;
 		}
 		measured.extend(found.into_iter().map(|(name, count)| Found {
-			threaded: threaded.contains(&name),
+			threaded: threads.get(&name) == Some(&true),
+			watched: threads.contains_key(&name),
 			name,
 			count,
 			details: Vec::new(),

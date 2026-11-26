@@ -66,6 +66,10 @@ const RUSAGE: &str = "swole rusage ";
 /// another thread.
 const THREADED: &str = "swole threaded ";
 
+/// What a run swole measures prints before the name of a benchmark beside which the process had
+/// no other thread, so swole tells a harness that watched from one too old to.
+const ALONE: &str = "swole alone ";
+
 #[cfg(target_os = "linux")]
 mod perf;
 
@@ -153,8 +157,10 @@ fn run() -> Result<(), String> {
 		sampler.count(&meter, iterations);
 		drop(sampler);
 		let watch = meter.finish().map_err(|err| format!("{name}: {err}"))?;
-		if watch.threaded {
-			println!("{THREADED}{name}");
+		match watch.threaded {
+			Some(true) => println!("{THREADED}{name}"),
+			Some(false) => println!("{ALONE}{name}"),
+			None => {}
 		}
 		if let Some(usage) = watch.usage {
 			println!("{RUSAGE}{usage}");
@@ -378,8 +384,8 @@ pub mod __private {
 
 	/// What a meter saw over a case's calls.
 	pub(crate) struct Watched {
-		/// Whether the process had another thread during them.
-		pub threaded: bool,
+		/// Whether the process had another thread during them, when swole runs it.
+		pub threaded: Option<bool>,
 		/// What the process used over them, as the harness prints it, when perf counters count.
 		pub usage: Option<String>,
 		/// Each perf counter's value, when they count.
@@ -446,7 +452,7 @@ pub mod __private {
 		pub(crate) fn finish(self) -> Result<Watched, String> {
 			let Some(watch) = self.watch else {
 				return Ok(Watched {
-					threaded: false,
+					threaded: None,
 					usage: None,
 					counted: None,
 				});
@@ -464,7 +470,7 @@ pub mod __private {
 			#[cfg(not(target_os = "linux"))]
 			let counted = self.counters.map(|counters| match counters {});
 			Ok(Watched {
-				threaded: watch.threaded,
+				threaded: Some(watch.threaded),
 				usage,
 				counted,
 			})

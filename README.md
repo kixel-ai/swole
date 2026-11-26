@@ -96,8 +96,8 @@ even when it is gone by the call's end, counts what that thread ran meanwhile, w
 scheduler decides. So `sim` counts each such benchmark's job five times in all, and records the
 median of the five, with their least and most beside it in the table and as `lower_value` and
 `upper_value` in `metrics.json`. So does every benchmark whose threads swole cannot see: those of
-CodSpeed's crates and of a `--program`, whose harness runs every benchmark in one process. A
-harness benchmark that ran alone counts once: under the preload's
+CodSpeed's crates and of a `--program`, whose harness runs every benchmark in one process, and of
+a harness too old to say. A harness benchmark that ran alone counts once: under the preload's
 randomness and clock it repeats exactly, but for an input the host decides, such as the order a
 directory lists its entries in, which no repeat on one host would show.
 
@@ -267,11 +267,12 @@ what each job gets; the native [fingerprint](#fingerprints) holds all of it.
   TLB misses, the top-down breakdown's first level where the PMU exports it (retiring, bad
   speculation, frontend and backend bound) where it counts them as events, rather than as Intel's
   top-down metrics, which a read in user space gets as fractions, frontend and backend stall
-  cycles where the PMU counts them, and the kernel's `page-faults`, `context-switches`, and
-  `cpu-migrations`. The thread's time on a CPU, `task-clock`, is left out: the reads would count
-  in it.
+  cycles where the PMU counts them, and the kernel's `page-faults` taken in user space. The
+  thread's time on a CPU, `task-clock`, is left out: the reads would count in it.
 - Tier L1, `perf_event_paranoid` at most 1 or `CAP_PERFMON`: each hardware counter in the kernel
-  as well (`:k` beside `:u`), so a syscall's or `io_uring`'s cost shows apart from user space's.
+  as well (`:k` beside `:u`), so a syscall's or `io_uring`'s cost shows apart from user space's,
+  `page-faults` in both, and `context-switches` and `cpu-migrations`, which the scheduler counts
+  in the kernel.
   A count holds none of the kernel's work to start and stop counting, only what the call made
   it do, and the interrupts that landed meanwhile.
   Counting starts around each call, or each sample of a benchmark that times itself, whose
@@ -368,8 +369,9 @@ Each covers a sample's whole, steps and inputs built between calls included, whi
 leaves out. Where the host has perf counters, it then counts each side's benchmark with every
 counter the [probe](#capabilities) found, one process for each pass, each calling the
 benchmark as many times as a sample did, a counter's share of a call. Those processes run
-pinned to the PMU's CPUs, and under the preload, whose thread count tells whether another
-thread ran beside a call: such a benchmark keeps its time but has no counters, which read the
+pinned to the PMU's CPUs, and under the preload built to count the threads a process starts
+and nothing else, so their clock and randomness stay the host's, as the timing's do; its count
+tells whether another thread ran beside a call: such a benchmark keeps its time but has no counters, which read the
 calling thread alone, and a note under the table names it. A table after the times
 prints every measure of each benchmark, beside the base's and its change when paired, and
 `--report` writes them all. A side whose harness predates counters, as a base from before an

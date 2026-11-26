@@ -105,6 +105,7 @@ fn times_each_harness_benchmark() {
 			"sized[1000]",
 			"sized[2000]",
 			"sized[4000]",
+			"slept",
 			"spawned[100000]",
 			"spawned[1000]",
 			"stepped",

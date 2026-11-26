@@ -27,6 +27,10 @@ pub const RUSAGE: &str = "swole rusage ";
 /// What a harness target prints before the name of a benchmark beside which it had another thread.
 const THREADED: &str = "swole threaded ";
 
+/// What a harness target prints before the name of a benchmark beside which it had no other
+/// thread; one too old to watch prints neither.
+const ALONE: &str = "swole alone ";
+
 /// Where the kernel lists its PMUs.
 const PMUS: &str = "/sys/bus/event_source/devices";
 
@@ -43,7 +47,8 @@ pub struct Event {
 	kind: u32,
 	config: u64,
 	config1: u64,
-	/// Whether it counts only the kernel, rather than only user space.
+	/// Whether a hardware event counts only the kernel, rather than only user space, or a
+	/// software one counts the kernel as well.
 	kernel: bool,
 	/// Whether it takes one of the PMU's counters, as every event but the kernel's software ones does.
 	hardware: bool,
@@ -58,7 +63,12 @@ impl Event {
 			size: size_of::<Attr>() as u32,
 			config: self.config,
 			read_format: PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING,
-			flags: DISABLED | EXCLUDE_HV | if self.kernel { EXCLUDE_USER } else { EXCLUDE_KERNEL },
+			flags: DISABLED
+				| EXCLUDE_HV | match (self.hardware, self.kernel) {
+				(_, false) => EXCLUDE_KERNEL,
+				(true, true) => EXCLUDE_USER,
+				(false, true) => 0,
+			},
 			config1: self.config1,
 			..Attr::default()
 		}
@@ -130,7 +140,7 @@ pub struct Perf {
 	/// Every event it counts, in the passes that count them all: hardware ones packed into groups
 	/// that each fit the PMU at once, and software ones beside the first.
 	pub passes: Vec<Pass>,
-	/// The generic events this PMU does not count.
+	/// The events this PMU, or at tier L2 the kernel, does not count.
 	pub absent: Vec<String>,
 }
 
@@ -309,15 +319,19 @@ impl Perf {
 			groups.push(unit);
 		}
 		let mut passes: Vec<Pass> = groups.into_iter().map(|group| Pass { groups: vec![group] }).collect();
-		for (name, config) in SOFTWARE.into_iter().filter(|_| !quick) {
+		for (name, config, scheduler) in SOFTWARE.into_iter().filter(|_| !quick) {
+			// The scheduler counts its events in the kernel, so they need its ring, as only tier L1
+			// opens; a page fault counts in the ring that took it.
+			if scheduler && !kernel {
+				absent.push(name.to_owned());
+				continue;
+			}
 			let event = Event {
 				name: name.to_owned(),
 				kind: PERF_TYPE_SOFTWARE,
 				config,
 				config1: 0,
-				// At L2 the kernel takes no counter of its own work; a software event counts
-				// what the kernel does for the process either way.
-				kernel: false,
+				kernel,
 				hardware: false,
 			};
 			trial(std::slice::from_ref(&event))
@@ -361,10 +375,14 @@ const GENERIC: [(&str, u32, u64); 11] = [
 	("iTLB-load-misses", PERF_TYPE_HW_CACHE, 4 | 1 << 16),
 ];
 
-/// The software events: each name and config.
+/// The software events: each name, config, and whether the scheduler counts it.
 /// The calling thread's time on a CPU, task-clock, is not among them: read in user space, the
 /// counters cannot keep their own reads out of it.
-const SOFTWARE: [(&str, u64); 3] = [("page-faults", 2), ("context-switches", 3), ("cpu-migrations", 4)];
+const SOFTWARE: [(&str, u64, bool); 3] = [
+	("page-faults", 2, false),
+	("context-switches", 3, true),
+	("cpu-migrations", 4, true),
+];
 
 /// The first level of the top-down breakdown, as a PMU exports it among its own events.
 const TOPDOWN: [&str; 4] = [
@@ -577,7 +595,7 @@ pub struct Reading {
 
 /// What a harness target's output says each benchmark it counted with `counters` counters read.
 pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
-	let threaded = threaded(stdout);
+	let threads = threads(stdout);
 	let mut usage = None;
 	let mut readings = Vec::new();
 	for line in stdout.lines() {
@@ -600,19 +618,23 @@ pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 				name: name.to_owned(),
 				values,
 				usage: usage.take(),
-				threaded: threaded.contains(name),
+				threaded: threads.get(name) == Some(&true),
 			});
 		}
 	}
 	Ok(readings)
 }
 
-/// The benchmarks a harness target's output says it had another thread beside.
-pub fn threaded(stdout: &str) -> std::collections::BTreeSet<String> {
+/// Each benchmark a harness target's output says whether it had another thread beside, and
+/// what it says.
+pub fn threads(stdout: &str) -> std::collections::BTreeMap<String, bool> {
 	stdout
 		.lines()
-		.filter_map(|line| line.strip_prefix(THREADED))
-		.map(str::to_owned)
+		.filter_map(|line| {
+			(line.strip_prefix(THREADED).map(|name| (name, true)))
+				.or_else(|| line.strip_prefix(ALONE).map(|name| (name, false)))
+		})
+		.map(|(name, threaded)| (name.to_owned(), threaded))
 		.collect()
 }
 

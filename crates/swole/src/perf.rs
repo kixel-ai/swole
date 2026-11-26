@@ -26,8 +26,9 @@ pub struct Counters {
 /// A hardware counter, read in user space, and what its reads found.
 struct Slot {
 	page: Page,
-	/// Its page as the current call's start read it.
+	/// Its page as the current call's start read it, and as it read after the end.
 	snap: Cell<Snap>,
+	last: Cell<Snap>,
 	/// What its hardware counter read at the current call's start, and at its end, as `rdpmc`
 	/// returns it: its low and high halves.
 	start: Cell<(u32, u32)>,
@@ -79,6 +80,7 @@ impl Counters {
 				Ok(Slot {
 					page: Page::map(fd)?,
 					snap: Cell::default(),
+					last: Cell::default(),
 					start: Cell::default(),
 					end: Cell::default(),
 					counted: Cell::default(),
@@ -129,35 +131,52 @@ impl Counters {
 	/// each counted since, and stops every counter.
 	#[inline(never)]
 	pub fn stop(&self) {
-		if self.failed.get().is_none() {
+		if self.failed.get().is_none()
+			&& let Some(first) = self.slots.first()
+		{
+			let lock = first.page.lock();
+			compiler_fence(Ordering::SeqCst);
 			for slot in &self.slots {
 				slot.end.set(rdpmc(slot.snap.get().index - 1));
 			}
 			compiler_fence(Ordering::SeqCst);
-			self.add();
+			self.add(lock);
 		}
 		prctl(PR_TASK_PERF_EVENTS_DISABLE);
 	}
 
-	/// Adds what each hardware counter counted over the call just read.
-	fn add(&self) {
-		// Unless the kernel moved the counters since the start, such as for a context switch,
-		// which may land even as this checks, the start's offsets and indices still hold; else
-		// each page, read again, does, a few instructions late.
-		let moved = self.slots.iter().any(|slot| slot.page.lock() != slot.snap.get().lock);
+	/// Adds what each hardware counter counted over the call just read, given the first page's
+	/// lock as the end read it, just before the hardware counters.
+	fn add(&self, lock: u32) {
+		let Some(first) = self.slots.first() else {
+			return;
+		};
+		// The kernel rewrites every page at once, as in `start`, so the first page unchanged
+		// since means each page says where its counter was as the end read it. Else a context
+		// switch landed on those reads, and the start's page stands in, where it still says the
+		// same.
+		let held = loop {
+			for slot in &self.slots {
+				slot.last.set(slot.page.snap());
+			}
+			compiler_fence(Ordering::SeqCst);
+			if first.page.lock() == first.last.get().lock {
+				break first.last.get().lock == lock;
+			}
+		};
 		for slot in &self.slots {
-			let snap = slot.snap.get();
-			let started = snap.value(slot.start.get());
-			let ended = if moved {
-				match slot.page.value() {
-					Some(value) => value,
-					None => return self.fail(OFF),
-				}
-			} else {
-				snap.value(slot.end.get())
-			};
-			slot.counted
-				.set(slot.counted.get().wrapping_add(ended.wrapping_sub(started)));
+			let (start, now) = (slot.snap.get(), slot.last.get());
+			// The end read the hardware counter the start's page named, which must still hold the
+			// counter, as it does unless another user of the PMU moved it during the call.
+			if now.index != start.index || !held && now.offset != start.offset {
+				return self.fail(MOVED);
+			}
+			let ended = now.value(slot.end.get());
+			slot.counted.set(
+				slot.counted
+					.get()
+					.wrapping_add(ended.wrapping_sub(start.value(slot.start.get()))),
+			);
 		}
 	}
 
@@ -222,6 +241,10 @@ impl Snap {
 const OFF: &str = "a perf counter was not on the PMU while it counted: another user of this host's counters crowded it \
                    out, or the thread left the CPUs of the PMU it counts";
 
+/// Why a call's reads fail when the kernel moved a counter to another hardware counter during it.
+const MOVED: &str = "the kernel moved a perf counter to another hardware counter during a call, as another user of \
+                     this host's counters can make it, so what the call counted cannot be told";
+
 /// The page the kernel keeps for a counter: its offset and which hardware counter holds it.
 struct Page(*const u8);
 
@@ -279,7 +302,7 @@ impl Page {
 		unsafe { std::ptr::read_volatile(self.0.add(LOCK).cast::<u32>()) }
 	}
 
-	/// What the page holds now, which may be mid-rewrite: [`Counters::start`] checks its lock.
+	/// What the page holds now, which may be mid-rewrite: its reader checks its lock.
 	#[inline(always)]
 	fn snap(&self) -> Snap {
 		let lock = self.lock();
@@ -291,23 +314,6 @@ impl Page {
 				index: std::ptr::read_volatile(self.0.add(INDEX).cast::<u32>()),
 				offset: std::ptr::read_volatile(self.0.add(OFFSET).cast::<i64>()),
 				width: u32::from(std::ptr::read_volatile(self.0.add(PMC_WIDTH).cast::<u16>())),
-			}
-		}
-	}
-
-	/// The counter's value now, read without entering the kernel, retried if the kernel rewrote
-	/// the page meanwhile, or `None` while it is not on the PMU.
-	fn value(&self) -> Option<u64> {
-		loop {
-			let snap = self.snap();
-			if snap.index == 0 {
-				return None;
-			}
-			compiler_fence(Ordering::SeqCst);
-			let value = snap.value(rdpmc(snap.index - 1));
-			compiler_fence(Ordering::SeqCst);
-			if self.lock() == snap.lock {
-				return Some(value);
 			}
 		}
 	}
