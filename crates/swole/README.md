@@ -130,7 +130,7 @@ does.
 
 `swole::main()` runs every benchmark once, sorted by name, setting up each case
 and bracketing its call with Callgrind's client requests, then prints `swole ran <name>`
-after it. Natively the requests are instructions that do nothing, so `cargo bench` and
+after it, starting its records on a fresh line, as the benchmark's own output may not have ended one. Natively the requests are instructions that do nothing, so `cargo bench` and
 `cargo test --benches` run each case once as a check. With `SWOLE_BENCH` set to a name, it
 runs that benchmark alone, which swole sets on each job. It takes no arguments but
 Cargo's own `--bench` and `--quiet`; swole's `--benchmarks` chooses benchmarks.

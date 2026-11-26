@@ -828,14 +828,7 @@ fn ran(stdout: &str) -> Result<Option<(Harness, Vec<String>)>, String> {
 			.map(str::to_owned)
 			.collect()
 	};
-	// The harness's record may follow a line a benchmark left unfinished, unwatched as a listing
-	// runs it.
-	let harness: Vec<String> = stdout
-		.lines()
-		.filter_map(|line| line.split_once(HARNESS_RAN))
-		.map(|(_, name)| name.to_owned())
-		.collect();
-	let codspeed = names(CODSPEED_CHECKED);
+	let (harness, codspeed) = (names(HARNESS_RAN), names(CODSPEED_CHECKED));
 	// A benchmark's own `Skipping:` line is not CodSpeed's, which follows CodSpeed's header.
 	let starts = |prefix: &str| stdout.lines().any(|line| line.starts_with(prefix));
 	let is_codspeed = !codspeed.is_empty() || (starts(CODSPEED_HARNESS) && starts(CODSPEED_SKIPPED));
@@ -857,7 +850,7 @@ mod tests {
 		let (harness, names) = ran(out).unwrap().unwrap();
 		assert_eq!(harness, Harness::CodSpeed);
 		assert_eq!(names, ["benches/a.rs::g::f[1]", "benches/a.rs::g::h"]);
-		let out = "a benchmark's own line\nswole ran benches/a.rs::f[1]\nunfinishedswole ran benches/a.rs::m::g\n";
+		let out = "a benchmark's own line\nswole ran benches/a.rs::f[1]\nswole ran benches/a.rs::m::g\nlast time swole ran this benchmark\n";
 		let (harness, names) = ran(out).unwrap().unwrap();
 		assert_eq!(harness, Harness::Swole);
 		assert_eq!(names, ["benches/a.rs::f[1]", "benches/a.rs::m::g"]);

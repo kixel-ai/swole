@@ -4,14 +4,15 @@ Measures each benchmark in one of three modes over the same compiled benchmark t
 writes the measures as Kixel Quest's `metrics.json`, or compares a base commit with the working
 tree:
 
-- `swole sim` counts its instructions under stock Valgrind, one Valgrind process a job, in
+- `swole sim`, what gates a merge, counts its instructions under stock Valgrind, one Valgrind process a job, in
   parallel across the host's cores, the same on any x86_64 Linux host that shares its
   [fingerprint](#fingerprints): hosted CI, a self-hosted runner, or an agent's own, with no
   third-party service in the loop. It replaces CodSpeed's runner over the benchmarks as they are
   written for it.
-- `swole quick` counts them [natively](#quick), once each, with the host's Linux perf counters,
-  20 to 50 times faster, comparable only on hosts like this one.
-- `swole bench` [times](#bench) them by wall clock on any Linux or macOS host, alone or paired
+- `swole quick`, an agent's local spot-check, counts them [natively](#quick), once each, with
+  the host's Linux perf counters, 20 to 50 times faster, comparable only on hosts like this one,
+  and exact only for a call shorter than the timer's tick.
+- `swole bench`, what gates a release, [times](#bench) them by wall clock on any Linux or macOS host, alone or paired
   with a base commit's, beside what each process used and every perf counter the host's
   [capabilities](#capabilities) allow.
 
@@ -222,7 +223,8 @@ has counted both sides.
 
 ## Quick
 
-`swole quick` counts each benchmark of [swole's harness](crates/swole/README.md) natively,
+`swole quick`, an agent's local spot-check, counts each benchmark of
+[swole's harness](crates/swole/README.md) natively,
 without Valgrind's 20 to 50 times slowdown, with Linux perf counters: its user-space
 instructions (`instructions:u`), the headline, and its cycles, branches, branch mispredicts, and
 L1 data and last-level cache misses, each where the PMU counts it, beside what the process used
@@ -252,10 +254,11 @@ rather than be scaled up: another user of the host's counters multiplexed it, or
 the PMU's cores. The kernel maps no page for a counter a process's threads inherit, so a benchmark
 beside which the process had another thread fails `quick`, naming it, since `sim` counts every
 thread, and keeps only its time in `bench`. Run under Valgrind, the same benchmark counts within those few dozen instructions.
-Each hardware interrupt that lands during a call, such as the timer's tick, adds an instruction
-and a branch to its count, as x86's counters count the return to user space, so a call longer
-than the tick repeats only within a few instructions: a 10 ms loop counted 2 to 7 over its
-40,000,092 on an Intel Core Ultra 7 270K Plus at `CONFIG_HZ=1000`.
+So `quick` is exact only for a call shorter than the timer's tick: each hardware interrupt that
+lands during a call, the tick's or a device's, adds an instruction and a branch to its count, as
+x86's counters count the return to user space, so a longer call's count moves with how many
+interrupts it took. On one host, an Intel Core Ultra 7 270K Plus at `CONFIG_HZ=1000`, a 10 ms
+loop counted 2 to 7 over its 40,000,092 across 15 runs.
 
 ## Capabilities
 

@@ -157,22 +157,30 @@ fn run() -> Result<(), String> {
 		sampler.count(&meter, iterations);
 		drop(sampler);
 		let watch = meter.finish().map_err(|err| format!("{name}: {err}"))?;
-		// On a fresh line, as a benchmark's own output may not have ended one, and the rest
-		// follow it.
+		// The records start on a fresh line, as a benchmark's own output may not have ended one,
+		// so a record never runs into it; the rest follow the first.
+		let mut fresh = false;
+		let mut record = |line: std::fmt::Arguments| {
+			if !fresh {
+				println!();
+				fresh = true;
+			}
+			println!("{line}");
+		};
 		match watch.threaded {
-			Some(true) => println!("\n{THREADED}{name}"),
-			Some(false) => println!("\n{ALONE}{name}"),
+			Some(true) => record(format_args!("{THREADED}{name}")),
+			Some(false) => record(format_args!("{ALONE}{name}")),
 			None => {}
 		}
 		if let Some(usage) = watch.usage {
-			println!("{RUSAGE}{usage}");
+			record(format_args!("{RUSAGE}{usage}"));
 		}
 		if let Some(values) = watch.counted {
 			let values: Vec<String> = values.iter().map(u64::to_string).collect();
-			println!("{COUNTED}{} {name}", values.join(" "));
+			record(format_args!("{COUNTED}{} {name}", values.join(" ")));
 		}
 		if !quiet {
-			println!("{RAN}{name}");
+			record(format_args!("{RAN}{name}"));
 		}
 	}
 	Ok(())

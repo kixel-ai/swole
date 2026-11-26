@@ -458,8 +458,21 @@ fn counts_with_perf_counters_what_valgrind_does() {
 		gap("slept"),
 		gap("alone")
 	);
+	// Exactly so on every run for a call far shorter than the timer's tick, as these 4,000- to
+	// 5,000-instruction calls are; a longer one may take an interrupt, which adds an
+	// instruction, so it only stays close.
 	let again = table(&harness(&["quick", "--benchmarks", list]).stdout);
-	assert_eq!(perf, again);
+	assert_eq!(perf.keys().collect::<Vec<_>>(), again.keys().collect::<Vec<_>>());
+	let short = perf.values().filter(|&&count| count < 5000).count();
+	assert_eq!(short, 11, "{perf:?}");
+	for (name, &count) in &perf {
+		let other = again[name];
+		if count < 5000 {
+			assert_eq!(count, other, "{name}");
+		} else {
+			assert!(count.abs_diff(other) < 16, "{name}: {count} then {other}");
+		}
+	}
 }
 
 #[test]
