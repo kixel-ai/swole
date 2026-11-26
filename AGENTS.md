@@ -1,10 +1,10 @@
-swole counts Rust benchmarks' instructions under stock Valgrind and times them by wall clock, alone or paired with a base commit's: `swole` is the harness a benchmark is written with, a plain `#[bench]` function, `swole-macros` its attribute, and `cargo-swole` the runner, installed as `swole` and `cargo swole`. See [README.md](README.md), [crates/swole/README.md](crates/swole/README.md), and the [quest tree](quest/README.md).
+swole measures Rust benchmarks from one compiled binary across three roles: `quick` (fast local native spot-checks), `sim` (deterministic Valgrind Callgrind merge gating), and `bench` (paired wall-clock and full hardware-counter validation). `swole` is the harness a benchmark is written with, a plain `#[bench]` function, `swole-macros` its attribute, and `cargo-swole` the runner, installed as `swole` and `cargo swole`. See [README.md](README.md), [crates/swole/README.md](crates/swole/README.md), and the [quest tree](quest/README.md).
 
 # Required
 
 - Everything is configless, with opinionated names and defaults: a benchmark is a plain function, and a consumer needs no config. Each config key a consumer needs is a gap to close.
-- A count that cannot be trusted fails the run: an input swole cannot pin, or a benchmark that measured nothing. One that can still move, such as a count other threads ran beside, is labeled so, never reported as exact.
-- A count swole reports as exact repeats across runs, checkouts, and environments that share a fingerprint, and whatever can move it either enters the fingerprint or is pinned, as Valgrind's version, the preload, and the launch's padding are. Prove a change keeps that with the tests, which count under the dev shell's Valgrind.
+- A measurement that cannot be trusted fails the run: an input swole cannot pin, a multiplexed counter, or a benchmark that measured nothing. One that can still move, such as a count other threads ran beside or native timing, is labeled so, never reported as exact.
+- `sim` alone owns cross-host bit-exact repeatability: a `sim` count swole reports as exact repeats across runs, checkouts, and environments that share a fingerprint, and whatever can move it either enters the fingerprint or is pinned (Valgrind's version, the preload, and the launch's padding). `quick` optimizes for fast whole-workspace local feedback, and `bench` for real hardware behavior. Prove a change keeps `sim`'s repeatability with the tests, which count under the dev shell's Valgrind.
 - The harness stays small, since it is in every consumer's `[dev-dependencies]`: what only the runner needs lives in `cargo-swole`.
 - moq and rind are the first consumers of every change.
 
