@@ -377,8 +377,8 @@ involuntary context switches, each a call's share, and the process's peak reside
 Each covers a sample's whole, steps and inputs built between calls included, which the clock
 leaves out. Where the host has perf counters, it then counts each side's benchmark with every
 counter the [probe](#capabilities) found, one process for each pass, each calling the
-benchmark as many times as a sample did, or fewer once its counted calls, each bracketed apart,
-have taken as long as the sample, a counter's share of a call. Those processes run
+benchmark as many times as a sample did and counting about 64 of those calls, spread evenly
+over them, the same calls in every pass and on both sides, a counter's share of a call. Those processes run
 pinned to the PMU's CPUs, and under the preload built to count the threads a process starts
 and nothing else, so their clock and randomness stay the host's, as the timing's do; its count
 tells whether another thread ran beside a call: such a benchmark keeps its time but has no counters, which read the

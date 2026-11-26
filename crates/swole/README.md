@@ -166,7 +166,7 @@ then prints a `swole rusage` line of what the process used over the call and
 `swole ran <name>`. The benchmark itself needs no privilege: swole opens the counters with its
 own. With `SWOLE_ITERATIONS` as well, it first replays the uncounted calls `swole bench` warms
 it up with before timing, one call and then batches doubled from one up to that many, then calls
-it up to that many times, each call counted, stopping once the counted calls have taken as long
-as that many took uncounted, and prints `swole calls <n> <name>`, how many its counts cover, or a
-benchmark that times itself once, for that many iterations. `swole quick` and `swole bench`
+it that many times, counting about 64 of the calls spread evenly over them, every
+`ceil(that many / 64)`th from the first, and prints `swole calls <n> <name>`, how many its counts
+cover, or a benchmark that times itself once, for that many iterations. `swole quick` and `swole bench`
 set them, as the [README](../../README.md#quick) says.

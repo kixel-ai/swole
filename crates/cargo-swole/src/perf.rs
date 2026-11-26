@@ -609,13 +609,11 @@ pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 		if let Some(fields) = line.strip_prefix(RUSAGE) {
 			usage = Some(Usage::parse(fields)?);
 		} else if let Some(rest) = line.strip_prefix(CALLS) {
-			calls = Some(
-				rest.split(' ')
-					.next()
-					.and_then(|n| n.parse::<u64>().ok())
-					.filter(|&n| n > 0)
-					.ok_or_else(|| format!("a harness target printed {CALLS}{rest}, which no harness prints"))?,
-			);
+			let (n, name) = rest
+				.split_once(' ')
+				.and_then(|(n, name)| Some((n.parse::<u64>().ok().filter(|&n| n > 0)?, name)))
+				.ok_or_else(|| format!("a harness target printed {CALLS}{rest}, which no harness prints"))?;
+			calls = Some((name, n));
 		} else if let Some(rest) = line.strip_prefix(COUNTED) {
 			let malformed =
 				|| format!("a harness target printed {COUNTED}{rest}, which no harness prints for {counters} counters");
@@ -640,7 +638,8 @@ pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 			readings.push(Reading {
 				name: name.to_owned(),
 				values,
-				calls: calls.take(),
+				// Only its own benchmark's record, which a benchmark's own line cannot pass for.
+				calls: calls.take().filter(|&(of, _)| of == name).map(|(_, n)| n),
 				usage: usage.take(),
 				threaded,
 			});
@@ -1200,6 +1199,9 @@ mod tests {
 			)
 			.is_err()
 		);
+		// A count record of another name, such as a benchmark's own line, covers nothing.
+		let other = readings("swole alone a.rs::f\nswole calls 5 b\nswole counted 1 2 a.rs::f\n", 2).unwrap();
+		assert_eq!(other[0].calls, None);
 		assert!(readings("swole counted x 1 a.rs::f\n", 2).is_err());
 		assert!(readings("swole counted 1 2\n", 2).is_err());
 		assert!(readings("swole rusage 1 2\n", 2).is_err());
