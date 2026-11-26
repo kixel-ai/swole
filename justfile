@@ -12,8 +12,8 @@ check:
     cargo sort --workspace --check --no-format
     actionlint
     # Every action pins a release's commit and names its tag, which Dependabot moves; it cannot move a branch's.
-    # Any other form of a `uses:` line fails, including a value on the next line, so none slips past unpinned.
-    ! (grep -rnE '^\s*(- +)?uses:' .github | grep -vE '^[^:]+:[0-9]+:\s*(- +)?uses: (\./\S+|[^ #]+@[0-9a-f]{40} # v[0-9]\S*)$')
+    # Any other line naming `uses:`, such as a value on the next line or an inline mapping, fails, so none slips past unpinned.
+    ! (grep -rn 'uses:' .github | grep -vE '^[^:]+:[0-9]+:\s*(- +)?uses: (\./\S+|[^ #]+@[0-9a-f]{40} # v[0-9]\S*)$')
     taplo format --check
     nixfmt --check flake.nix
     quest check
