@@ -256,8 +256,9 @@ fn count(job: &Job, perf: &perf::Perf, iterations: u64, dir: &Path) -> Result<Ve
 			.map_err(|e| format!("cannot run {}: {e}", job.label))?;
 		if !status.success() {
 			return Err(format!(
-				"{} failed counting ({status}); its output is in {}",
+				"{} failed counting ({status}){}; its output is in {}",
 				job.label,
+				crate::reason(&dir.join("stderr")),
 				dir.display()
 			));
 		}

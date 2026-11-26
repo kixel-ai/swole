@@ -71,7 +71,7 @@ pub fn compare(base: &str, options: &Options, mode: Mode) -> Result<(), String> 
 	let mut threaded = Counts::none(&counter);
 	threaded.threaded = before.threaded.union(&after.threaded).cloned().collect();
 	threaded.spread = before.spread.clone().into_iter().chain(after.spread.clone()).collect();
-	print!("{}", crate::threaded(&threaded, mode));
+	print!("{}", crate::threaded(&threaded));
 	print!("{}", metrics::details(Some(&before.details), &after.details));
 	if let Some(report) = &options.report {
 		metrics::report(&after, Some(&before), &counter, Some(&sha)).write(report)?;

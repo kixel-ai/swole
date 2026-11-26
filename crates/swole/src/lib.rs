@@ -46,8 +46,8 @@ impl IntoIterator for Iterations {
 }
 
 /// The variable that, set to how many perf counters swole opened on the process before it ran
-/// the target, has the one benchmark `SWOLE_BENCH` names start and stop them around its call,
-/// and print what they counted.
+/// the target, as `<hardware>+<software>`, has the one benchmark `SWOLE_BENCH` names count
+/// its calls with them, and print what they counted.
 const COUNTERS: &str = "SWOLE_COUNTERS";
 
 /// The variable that, beside `SWOLE_COUNTERS`, has the benchmark called this many times, each
@@ -122,7 +122,7 @@ fn run() -> Result<(), String> {
 		let (_, case) = cases.pop_first().expect("one case is left");
 		return serve((case.build)(), std::io::stdin().lock(), std::io::stdout());
 	}
-	let counters = number(COUNTERS)?;
+	let counters = split(COUNTERS)?;
 	let warm = number(ITERATIONS)?;
 	let iterations = warm.unwrap_or(1);
 	if counters.is_some() && cases.len() != 1 {
@@ -170,16 +170,16 @@ fn run() -> Result<(), String> {
 	Ok(())
 }
 
-/// The `count` perf counters swole opened on this process.
+/// The `hardware` and `software` perf counters swole opened on this process.
 #[cfg(target_os = "linux")]
-fn open(count: u64) -> Result<Counters, String> {
+fn open((hardware, software): (usize, usize)) -> Result<Counters, String> {
 	perf::preloaded()?;
-	Counters::inherited(count as usize)
+	Counters::inherited(hardware, software)
 }
 
 /// Elsewhere swole opens none.
 #[cfg(not(target_os = "linux"))]
-fn open(_: u64) -> Result<Counters, String> {
+fn open(_: (usize, usize)) -> Result<Counters, String> {
 	Err(format!("{COUNTERS}: perf counters are Linux's"))
 }
 
@@ -247,6 +247,22 @@ fn serve(mut sampler: Box<dyn __private::Sampler>, commands: impl BufRead, mut o
 			.map_err(|e| format!("cannot write a sample: {e}"))?;
 	}
 	Ok(())
+}
+
+/// The counts of hardware and software counters the variable `key` holds as
+/// `<hardware>+<software>`, when set, at least one counter in all.
+fn split(key: &str) -> Result<Option<(usize, usize)>, String> {
+	let value = match std::env::var(key) {
+		Ok(value) => value,
+		Err(std::env::VarError::NotPresent) => return Ok(None),
+		Err(std::env::VarError::NotUnicode(_)) => return Err(format!("{key} is not UTF-8")),
+	};
+	value
+		.split_once('+')
+		.and_then(|(hardware, software)| Some((hardware.parse().ok()?, software.parse().ok()?)))
+		.filter(|&(hardware, software): &(usize, usize)| hardware + software > 0)
+		.map(Some)
+		.ok_or(format!("{key} is {value}, not <hardware>+<software> counters"))
 }
 
 /// Each case of `benches` by its name. Every benchmark's args are evaluated here, once, and
@@ -430,6 +446,13 @@ pub mod __private {
 			let watch = watch.into_inner();
 			if let Some(err) = watch.error {
 				return Err(err);
+			}
+			if watch.threaded && self.counters.is_some() {
+				return Err(
+					"another thread ran beside a counted call, whose work perf counters read in user space cannot see: \
+					 quick and bench count the calling thread alone, and sim counts every thread"
+						.to_owned(),
+				);
 			}
 			#[cfg(all(unix, target_pointer_width = "64"))]
 			let usage = watch.usage.map(|(_, used)| used.fields());

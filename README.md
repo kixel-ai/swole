@@ -243,14 +243,15 @@ sizes its copies; so every job runs on the kind with the most cores, and `--jobs
 how many there are. A job takes one process for each pass of counters the probe packed.
 
 swole opens each job's counters itself, in the job's process just before it `exec`s the target,
-each counting every thread the process starts. The harness starts them all at once after the
-case's setup and stops them right after the call, so a count holds the call on every thread and
-a few dozen instructions of the counters' own. A counter that did not run the whole time it was
-enabled fails the run rather than be scaled up: another user of the host's counters multiplexed
-it, or a thread left the PMU's cores. A count beside which the process had another thread is
-noisy, since what that thread runs while the call does depends on the scheduler: the run names
-each one. Run under Valgrind, the same benchmark counts within those few dozen instructions when
-it runs alone.
+each counting the thread that runs the benchmark. The harness starts them after the case's setup
+and then reads each with `rdpmc`, in user space, through the page the kernel maps for it, and
+reads them again right after the call, before stopping them, so the system calls that start and
+stop counting stay out of a count, which holds the call and the reads' own few dozen instructions,
+the same for every call. A counter that did not run the whole time it was enabled fails the run
+rather than be scaled up: another user of the host's counters multiplexed it, or the thread left
+the PMU's cores. The kernel maps no page for a counter a process's threads inherit, so a benchmark
+beside which the process had another thread fails `quick` and `bench`, naming it: `sim` counts
+every thread. Run under Valgrind, the same benchmark counts within those few dozen instructions.
 
 ## Capabilities
 
@@ -264,18 +265,22 @@ what each job gets; the native [fingerprint](#fingerprints) holds all of it.
 - Tier L2, `perf_event_paranoid` at most 2: user-space instructions, cycles and instructions a
   cycle, branches and mispredicts, L1 data and instruction, last-level, and data and instruction
   TLB misses, the top-down breakdown's first level where the PMU exports it (retiring, bad
-  speculation, frontend and backend bound), frontend and backend stall cycles where the PMU
-  counts them, and the kernel's `task-clock`, `page-faults`, `context-switches`, and
-  `cpu-migrations`.
+  speculation, frontend and backend bound) where it counts them as events, rather than as Intel's
+  top-down metrics, which a read in user space gets as fractions, frontend and backend stall
+  cycles where the PMU counts them, and the kernel's `page-faults`, `context-switches`, and
+  `cpu-migrations`. The thread's time on a CPU, `task-clock`, is left out: the reads would count
+  in it.
 - Tier L1, `perf_event_paranoid` at most 1 or `CAP_PERFMON`: each hardware counter in the kernel
   as well (`:k` beside `:u`), so a syscall's or `io_uring`'s cost shows apart from user space's.
-  A count, `:u` or `:k`, includes the tail of the system calls that start and stop counting.
-  Counting starts around each call, or each sample of a benchmark that times itself, so the
-  cost is fixed per call whatever the benchmark's shape, and cancels between a base and a head
-  on one fingerprint.
+  A count holds none of the kernel's work to start and stop counting, only what the call made
+  it do, and the interrupts that landed meanwhile.
+  Counting starts around each call, or each sample of a benchmark that times itself, whose
+  count holds the reads' few dozen user-space instructions once a sample rather than once a
+  call.
   `quick` counts user space alone at any tier.
-- No tier, above 2 without `CAP_PERFMON`, or a host without a PMU, or macOS: `bench` times by
-  wall clock with rusage alone, saying why, and `quick` fails.
+- No tier, above 2 without `CAP_PERFMON`, or a host without a PMU, or one that does not let a
+  process read its counters in user space (`cap_user_rdpmc` off), or a CPU other than x86_64, or
+  macOS: `bench` times by wall clock with rusage alone, saying why, and `quick` fails.
 
 A PMU holds only so many counters at once, and the kernel shares more among them by turns,
 scaling each up by a guess. swole never lets it: the probe packs the counters into groups that

@@ -55,14 +55,11 @@ fn times(sample: &Value, measure: &str) -> Vec<(String, f64)> {
 		.collect()
 }
 
-#[test]
-fn times_each_harness_benchmark() {
-	let dir = scratch("time-alone");
-	let out = Command::new(env!("CARGO_BIN_EXE_swole"))
-		.args(["bench", "--out"])
-		.arg(dir.join("metrics.json"))
-		.arg("--report")
-		.arg(dir.join("report.json"))
+/// swole run in this workspace with `args` on the harness's fixture benchmark target.
+fn fixture(args: &[&std::ffi::OsStr]) -> Output {
+	Command::new(env!("CARGO_BIN_EXE_swole"))
+		.arg("bench")
+		.args(args)
 		.args(["--", "-p", "swole", "--bench", "fixture"])
 		.current_dir(env!("CARGO_MANIFEST_DIR"))
 		// The target directory the count tests build the fixture in, apart from this test's own.
@@ -71,37 +68,80 @@ fn times_each_harness_benchmark() {
 			Path::new(env!("CARGO_TARGET_TMPDIR")).join("harness"),
 		)
 		.output()
+		.unwrap()
+}
+
+/// The fixture's benchmarks that run another thread, which perf counters read in user space
+/// cannot count.
+const THREADED: [&str; 3] = ["handed", "spawned[100000]", "spawned[1000]"];
+
+#[test]
+fn times_each_harness_benchmark() {
+	let dir = scratch("time-alone");
+	let file = "crates/swole/benches/fixture.rs::";
+	// A host with perf counters fails a threaded benchmark's counts, so the run takes the rest.
+	let fingerprint = Command::new(env!("CARGO_BIN_EXE_swole"))
+		.args(["fingerprint", "bench"])
+		.output()
 		.unwrap();
+	succeeded(&fingerprint);
+	let perf = String::from_utf8_lossy(&fingerprint.stderr).contains("perf: tier");
+	if perf {
+		let list = dir.join("handed");
+		std::fs::write(&list, format!("{file}handed\n")).unwrap();
+		let out = fixture(&["--benchmarks".as_ref(), list.as_os_str()]);
+		let err = String::from_utf8_lossy(&out.stderr);
+		assert!(!out.status.success(), "{err}");
+		assert!(
+			err.contains(&format!("{file}handed: another thread ran beside a counted call")),
+			"{err}"
+		);
+	}
+	let all = [
+		"alone",
+		"borrowed",
+		"dropped",
+		"generic[4000]",
+		"handed",
+		"inner::nested[a]",
+		"inner::nested[bc]",
+		"sized[1000]",
+		"sized[2000]",
+		"sized[4000]",
+		"spawned[100000]",
+		"spawned[1000]",
+		"stepped",
+		"timed",
+		"unstable[1000]",
+		"unstable[8000]",
+		"word[word]",
+	];
+	let wanted: Vec<&str> = all
+		.into_iter()
+		.filter(|name| !perf || !THREADED.contains(name))
+		.collect();
+	let list = dir.join("benchmarks");
+	std::fs::write(
+		&list,
+		wanted.iter().map(|name| format!("{file}{name}\n")).collect::<String>(),
+	)
+	.unwrap();
+	let out = fixture(&[
+		"--benchmarks".as_ref(),
+		list.as_os_str(),
+		"--out".as_ref(),
+		dir.join("metrics.json").as_os_str(),
+		"--report".as_ref(),
+		dir.join("report.json").as_os_str(),
+	]);
 	succeeded(&out);
 	let (measure, metrics) = read(&dir.join("metrics.json"));
 	let samples = metrics["samples"].as_array().unwrap();
 	assert_eq!(samples.len(), 1);
 	assert!(samples[0].get("commit").is_none());
 	let times = times(&samples[0], &measure);
-	let file = "crates/swole/benches/fixture.rs::";
 	let names: Vec<&str> = times.iter().map(|(name, _)| name.strip_prefix(file).unwrap()).collect();
-	assert_eq!(
-		names,
-		[
-			"alone",
-			"borrowed",
-			"dropped",
-			"generic[4000]",
-			"handed",
-			"inner::nested[a]",
-			"inner::nested[bc]",
-			"sized[1000]",
-			"sized[2000]",
-			"sized[4000]",
-			"spawned[100000]",
-			"spawned[1000]",
-			"stepped",
-			"timed",
-			"unstable[1000]",
-			"unstable[8000]",
-			"word[word]"
-		]
-	);
+	assert_eq!(names, wanted);
 	let time = |name: &str| times.iter().find(|(n, _)| n == &format!("{file}{name}")).unwrap().1;
 	// Eight times the spins, which no load makes look like under twice.
 	assert!(time("unstable[8000]") > 2.0 * time("unstable[1000]"), "{times:?}");
@@ -143,12 +183,17 @@ fn times_each_harness_benchmark() {
 		assert!(head("alone")["IPC:u"]["value"].as_f64().unwrap() > 0.0);
 		// A drop to run after each call changes nothing counted: each count, of each side,
 		// starts and stops around every call alike.
-		for counter in ["instructions:u", "instructions:k"] {
-			let Some(alone) = head("alone")[counter]["value"].as_f64() else {
-				continue;
-			};
-			let dropped = head("dropped")[counter]["value"].as_f64().unwrap();
-			assert!((dropped - alone).abs() <= alone / 100.0, "{counter}: {dropped} {alone}");
+		let alone = head("alone")["instructions:u"]["value"].as_f64().unwrap();
+		let dropped = head("dropped")["instructions:u"]["value"].as_f64().unwrap();
+		assert!((dropped - alone).abs() < 16.0, "{dropped} {alone}");
+		// The counters are read in user space, so a count holds none of the kernel's work to
+		// start and stop them, some 18,000 instructions a call: only interrupts', a few a call.
+		// A benchmark that times itself counts as one called each time does, but for the
+		// reads' own fixed few dozen instructions a call.
+		if let Some(kernel) = head("alone")["instructions:k"]["value"].as_f64() {
+			assert!(kernel < 1000.0, "{kernel}");
+			let timed = head("timed")["instructions:u"]["value"].as_f64().unwrap();
+			assert!((alone - timed).abs() < 300.0, "{alone} {timed}");
 		}
 	} else {
 		assert!(head("alone").get("instructions:u").is_none());

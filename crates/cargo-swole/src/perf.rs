@@ -50,14 +50,15 @@ pub struct Event {
 }
 
 impl Event {
-	/// The `perf_event_attr` that opens it, stopped, counting each thread the process starts.
+	/// The `perf_event_attr` that opens it, stopped, counting only the thread that opens it,
+	/// since the kernel lets no process read a counter its threads inherit in user space.
 	fn attr(&self) -> Attr {
 		Attr {
 			kind: self.kind,
 			size: size_of::<Attr>() as u32,
 			config: self.config,
 			read_format: PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING,
-			flags: DISABLED | INHERIT | EXCLUDE_HV | if self.kernel { EXCLUDE_USER } else { EXCLUDE_KERNEL },
+			flags: DISABLED | EXCLUDE_HV | if self.kernel { EXCLUDE_USER } else { EXCLUDE_KERNEL },
 			config1: self.config1,
 			..Attr::default()
 		}
@@ -65,7 +66,7 @@ impl Event {
 
 	/// What it counts in, as Kixel Quest names a unit.
 	pub fn unit(&self) -> &'static str {
-		if self.name == "task-clock" { "ns" } else { "events" }
+		"events"
 	}
 }
 
@@ -85,6 +86,11 @@ impl Pass {
 	/// How many counters it opens.
 	pub fn len(&self) -> usize {
 		self.events().count()
+	}
+
+	/// How many of them are hardware counters, which it opens before its software ones.
+	pub fn hardware(&self) -> usize {
+		self.events().filter(|event| event.hardware).count()
 	}
 }
 
@@ -246,6 +252,7 @@ impl Perf {
 		let instructions = generic(&pmu, "instructions", PERF_TYPE_HARDWARE, 1, false);
 		// The one counter every tier needs: its failure is the host's, not one event's.
 		trial(std::slice::from_ref(&instructions)).map_err(|err| refused(&err))?;
+		readable(&instructions, &pmu)?;
 		let slots = (1..=MOST_SLOTS)
 			.take_while(|&n| {
 				let branches = vec![generic(&pmu, "branches", PERF_TYPE_HARDWARE, 4, false); n];
@@ -275,12 +282,18 @@ impl Perf {
 				}
 			}
 		}
+		// A breakdown led by `slots` is Intel's top-down metrics, which a read in user space gets
+		// as fractions of `slots` rather than counts.
 		if let Some(topdown) = topdown(&pmu)?.filter(|_| !quick) {
-			match trial(&topdown) {
-				Ok(true) => units.push(topdown),
-				Ok(_) => absent.push("topdown".to_owned()),
-				Err(err) if unsupported(&err) => absent.push("topdown".to_owned()),
-				Err(err) => return Err(format!("cannot open PMU {}'s top-down counters: {err}", pmu.name)),
+			if topdown[0].name == "slots:u" {
+				absent.push("topdown".to_owned());
+			} else {
+				match trial(&topdown) {
+					Ok(true) => units.push(topdown),
+					Ok(_) => absent.push("topdown".to_owned()),
+					Err(err) if unsupported(&err) => absent.push("topdown".to_owned()),
+					Err(err) => return Err(format!("cannot open PMU {}'s top-down counters: {err}", pmu.name)),
+				}
 			}
 		}
 		let mut groups: Vec<Vec<Event>> = Vec::new();
@@ -349,12 +362,9 @@ const GENERIC: [(&str, u32, u64); 11] = [
 ];
 
 /// The software events: each name and config.
-const SOFTWARE: [(&str, u64); 4] = [
-	("task-clock", 1),
-	("page-faults", 2),
-	("context-switches", 3),
-	("cpu-migrations", 4),
-];
+/// The calling thread's time on a CPU, task-clock, is not among them: read in user space, the
+/// counters cannot keep their own reads out of it.
+const SOFTWARE: [(&str, u64); 3] = [("page-faults", 2), ("context-switches", 3), ("cpu-migrations", 4)];
 
 /// The first level of the top-down breakdown, as a PMU exports it among its own events.
 const TOPDOWN: [&str; 4] = [
@@ -514,7 +524,8 @@ impl Pmu {
 /// Has `command` run on `pmu`'s CPUs, at the addresses of its last run when `fixed`, and open
 /// `pass`'s counters on itself just before it `exec`s, telling the harness how many.
 pub fn launch(command: &mut std::process::Command, pmu: &Pmu, pass: &Pass, fixed: bool) {
-	command.env(COUNTERS, pass.len().to_string());
+	let hardware = pass.hardware();
+	command.env(COUNTERS, format!("{hardware}+{}", pass.len() - hardware));
 	#[cfg(target_os = "linux")]
 	{
 		use std::os::unix::process::CommandExt;
@@ -833,7 +844,6 @@ const PERF_PMU_TYPE_SHIFT: u32 = 32;
 const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1;
 const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 2;
 const DISABLED: u64 = 1 << 0;
-const INHERIT: u64 = 1 << 1;
 const EXCLUDE_USER: u64 = 1 << 4;
 const EXCLUDE_KERNEL: u64 = 1 << 5;
 const EXCLUDE_HV: u64 = 1 << 6;
@@ -848,6 +858,20 @@ mod sys {
 	pub const AT_SECURE: u64 = 23;
 	pub const PR_CAP_AMBIENT: i32 = 47;
 	pub const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
+	#[cfg(target_arch = "x86_64")]
+	pub const PROT_READ: i32 = 1;
+	#[cfg(target_arch = "x86_64")]
+	pub const MAP_SHARED: i32 = 1;
+	#[cfg(target_arch = "x86_64")]
+	pub const MAP_FAILED: *mut std::ffi::c_void = !0 as *mut std::ffi::c_void;
+	/// One page, what the kernel maps for a counter without a ring buffer.
+	#[cfg(target_arch = "x86_64")]
+	pub const PAGE: usize = 4096;
+	/// Where `perf_event_mmap_page` holds its capabilities, and the bit saying `rdpmc` reads it.
+	#[cfg(target_arch = "x86_64")]
+	pub const CAPABILITIES: usize = 40;
+	#[cfg(target_arch = "x86_64")]
+	pub const CAP_USER_RDPMC: u64 = 1 << 2;
 	pub const ENOENT: i32 = 2;
 	pub const EINVAL: i32 = 22;
 	pub const EOPNOTSUPP: i32 = 95;
@@ -870,6 +894,15 @@ mod sys {
 		pub fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
 		pub fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
 		pub fn personality(persona: u64) -> i32;
+		pub fn mmap(
+			addr: *mut std::ffi::c_void,
+			len: usize,
+			prot: i32,
+			flags: i32,
+			fd: i32,
+			offset: i64,
+		) -> *mut std::ffi::c_void;
+		pub fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
 	}
 }
 
@@ -933,6 +966,54 @@ fn trial(events: &[Event]) -> std::io::Result<bool> {
 		}
 	}
 	Ok(true)
+}
+
+/// Fails unless the harness can read `event` of `pmu` in user space, as it reads every hardware
+/// counter: with `rdpmc`, through the page the kernel maps for it.
+#[cfg(target_os = "linux")]
+fn readable(event: &Event, pmu: &Pmu) -> Result<(), String> {
+	#[cfg(target_arch = "x86_64")]
+	{
+		use std::os::fd::{FromRawFd, OwnedFd};
+		let fd = open(&event.attr(), -1, PERF_FLAG_FD_CLOEXEC).map_err(|err| refused(&err))?;
+		// SAFETY: the kernel returned a new descriptor, which nothing else owns.
+		let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+		// SAFETY: maps the counter's one page, read-only and shared, and unmaps it below.
+		let page = unsafe {
+			mmap(
+				std::ptr::null_mut(),
+				PAGE,
+				PROT_READ,
+				MAP_SHARED,
+				std::os::fd::AsRawFd::as_raw_fd(&fd),
+				0,
+			)
+		};
+		if page == MAP_FAILED {
+			return Err(format!(
+				"cannot map a perf counter's page, which swole reads counts through: {}",
+				std::io::Error::last_os_error()
+			));
+		}
+		// SAFETY: the page holds `perf_event_mmap_page`'s capabilities at this offset.
+		let capabilities = unsafe { std::ptr::read_volatile(page.cast::<u8>().add(CAPABILITIES).cast::<u64>()) };
+		// SAFETY: the mapping made above, of this length.
+		unsafe { munmap(page, PAGE) };
+		if capabilities & CAP_USER_RDPMC == 0 {
+			return Err(format!(
+				"this host does not let a process read PMU {}'s counters in user space (cap_user_rdpmc is off), which \
+				 swole counts with, so the system calls that start and stop counting stay out of a count: root turns it \
+				 on by writing 1 to {PMUS}/{}/rdpmc",
+				pmu.name, pmu.name
+			));
+		}
+		Ok(())
+	}
+	#[cfg(not(target_arch = "x86_64"))]
+	{
+		let _ = (event, pmu);
+		Err("swole reads perf counters in user space with x86_64's rdpmc alone".to_owned())
+	}
 }
 
 /// Pins the calling thread to `cpus`.

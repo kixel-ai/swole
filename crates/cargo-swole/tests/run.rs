@@ -5,7 +5,7 @@
 // Valgrind, and the fingerprint, are x86_64 Linux's here.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// The benchmarks the fixture runs, `name=iterations` comma-separated, when it is the program.
@@ -372,68 +372,78 @@ fn table(stdout: &[u8]) -> std::collections::BTreeMap<String, u64> {
 		.collect()
 }
 
-/// On a host that exposes perf counters, they count what Valgrind does, on every thread; on
-/// one that exposes none, as a hosted CI runner, the run fails, saying so.
+/// The fixture's benchmarks that run another thread.
+const THREADED: [&str; 3] = ["handed", "spawned[100000]", "spawned[1000]"];
+
+/// A file naming each of the fixture's benchmarks that runs no other thread, one a line.
+fn single_threaded(dir: &Path) -> PathBuf {
+	let file = "crates/swole/benches/fixture.rs::";
+	let names = [
+		"alone",
+		"borrowed",
+		"dropped",
+		"generic[4000]",
+		"inner::nested[a]",
+		"inner::nested[bc]",
+		"sized[1000]",
+		"sized[2000]",
+		"sized[4000]",
+		"stepped",
+		"timed",
+		"unstable[1000]",
+		"unstable[8000]",
+		"word[word]",
+	];
+	let list = dir.join("single-threaded");
+	std::fs::write(&list, names.map(|name| format!("{file}{name}\n")).concat()).unwrap();
+	list
+}
+
+/// On a host that exposes perf counters, they count what Valgrind does on the calling thread,
+/// and fail a benchmark that runs another; on one that exposes none, as a hosted CI runner, the
+/// run fails, saying so.
 #[test]
 fn counts_with_perf_counters_what_valgrind_does() {
 	let out = harness(&["quick"]);
 	let err = String::from_utf8_lossy(&out.stderr);
-	if !out.status.success() {
-		assert!(err.contains("quick counts with perf counters, and"), "{err}");
+	if err.contains("quick counts with perf counters, and") {
+		assert!(!out.status.success());
 		return;
 	}
+	assert!(!out.status.success(), "{err}");
+	let file = "crates/swole/benches/fixture.rs::";
+	for name in THREADED {
+		assert!(
+			err.contains(&format!(
+				"{file}{name}: another thread ran beside a counted call, whose work perf counters read in user space cannot see"
+			)),
+			"{name}: {err}"
+		);
+	}
+	let list = single_threaded(&scratch("quick-single"));
+	let list = list.to_str().unwrap();
+	let out = harness(&["quick", "--benchmarks", list]);
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 	let perf = table(&out.stdout);
-	let sim = harness(&["sim"]);
+	let sim = harness(&["sim", "--benchmarks", list]);
 	assert!(sim.status.success(), "{}", String::from_utf8_lossy(&sim.stderr));
 	let valgrind = table(&sim.stdout);
 	assert_eq!(perf.keys().collect::<Vec<_>>(), valgrind.keys().collect::<Vec<_>>());
-	assert_eq!(perf.len(), 17);
-	let file = "crates/swole/benches/fixture.rs::";
-	let threaded = [
-		format!("{file}handed"),
-		format!("{file}spawned[100000]"),
-		format!("{file}spawned[1000]"),
-	];
+	assert_eq!(perf.len(), 14);
 	for (name, &count) in &perf {
+		// The same instructions, but for each bracket's own few dozen.
 		let under = valgrind[name];
-		if threaded.contains(name) {
-			// Starting a thread takes its own path under Valgrind's scheduler.
-			let ratio = count as f64 / under as f64;
-			assert!(
-				(0.9..1.1).contains(&ratio),
-				"{name}: {count} natively, {under} under Valgrind"
-			);
-		} else {
-			// The same instructions, but for each bracket's own few dozen.
-			assert!(
-				count.abs_diff(under) < 100,
-				"{name}: {count} natively, {under} under Valgrind"
-			);
-		}
+		assert!(
+			count.abs_diff(under) < 100,
+			"{name}: {count} natively, {under} under Valgrind"
+		);
 	}
-	// The other thread's spins count, the one setup started and the one the benchmark spawns.
-	assert!(perf[&format!("{file}handed")] > 100 * perf[&format!("{file}alone")] * 9 / 10);
-	assert!(
-		perf[&format!("{file}spawned[100000]")] - perf[&format!("{file}spawned[1000]")]
-			> 99 * perf[&format!("{file}alone")] * 9 / 10
-	);
-	let stdout = String::from_utf8_lossy(&out.stdout);
-	assert!(
-		stdout.contains(&format!(
-			"\nOther threads ran beside {}, whose counts the scheduler makes noisy.\n",
-			threaded.join(", ")
-		)),
-		"{stdout}"
-	);
-	// Under Valgrind, the same benchmarks count five times, each the median of its samples.
-	let stdout = String::from_utf8_lossy(&sim.stdout);
-	assert!(
-		stdout.contains(&format!(
-			"\nOther threads ran beside {}, so each count is the median of 5",
-			threaded.join(", ")
-		)),
-		"{stdout}"
-	);
+	// A count reads the counters in user space, the same few instructions around every call,
+	// whatever follows it, and exactly so on every run.
+	let (alone, dropped) = (perf[&format!("{file}alone")], perf[&format!("{file}dropped")]);
+	assert!(alone.abs_diff(dropped) < 16, "{alone} {dropped}");
+	let again = table(&harness(&["quick", "--benchmarks", list]).stdout);
+	assert_eq!(perf, again);
 }
 
 #[test]

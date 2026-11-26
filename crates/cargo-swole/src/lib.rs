@@ -131,7 +131,7 @@ fn cli(args: &[String]) -> Result<(), String> {
 				let counter = Counter::new(mode)?;
 				let counts = measure(Path::new("."), &options, &counter, true)?;
 				print!("{}", metrics::table(&counts));
-				print!("{}", threaded(&counts, mode));
+				print!("{}", threaded(&counts));
 				print!("{}", metrics::details(None, &counts.details));
 				if let Some(out) = &options.out {
 					metrics::File::counts(&counts, counter.measure()).write(out)?;
@@ -419,27 +419,34 @@ impl Counter {
 	}
 }
 
+/// The reason a failed harness target gave on its stderr, at `errors`, after a colon, or nothing.
+pub(crate) fn reason(errors: &Path) -> String {
+	std::fs::read_to_string(errors)
+		.ok()
+		.and_then(|text| {
+			text.lines()
+				.rev()
+				.find_map(|line| line.strip_prefix("swole: ").map(str::to_owned))
+		})
+		.map_or(String::new(), |why| format!(": {why}"))
+}
+
 /// Each line of `text` under swole's prefix.
 pub(crate) fn indent(text: &str) -> String {
 	text.lines().map(|line| format!("swole: {line}\n")).collect()
 }
 
 /// A note naming the benchmarks beside which other threads ran, if any, and what that did.
-pub(crate) fn threaded(counts: &Counts, mode: Mode) -> String {
+pub(crate) fn threaded(counts: &Counts) -> String {
 	let mut out = String::new();
 	if !counts.threaded.is_empty() {
 		let names: Vec<&str> = counts.threaded.iter().map(String::as_str).collect();
-		out += &match mode {
-			Mode::Sim => format!(
-				"\nOther threads ran beside {}, so each count is the median of {SAMPLES}, with their least and most, which \
-				 the scheduler moves.\n",
-				names.join(", ")
-			),
-			_ => format!(
-				"\nOther threads ran beside {}, whose counts the scheduler makes noisy.\n",
-				names.join(", ")
-			),
-		};
+		// Only sim counts them: quick's and bench's counters fail a benchmark that runs a thread.
+		out += &format!(
+			"\nOther threads ran beside {}, so each count is the median of {SAMPLES}, with their least and most, which \
+			 the scheduler moves.\n",
+			names.join(", ")
+		);
 	}
 	// Sampled without having been seen to run other threads: swole could not watch them.
 	let unwatched: Vec<&str> = counts
@@ -913,8 +920,8 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 		std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 		let path = dir.join("stdout");
 		let stdout = std::fs::File::create(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-		let stderr = dir.join("stderr");
-		let stderr = std::fs::File::create(&stderr).map_err(|e| format!("cannot create {}: {e}", stderr.display()))?;
+		let errors = dir.join("stderr");
+		let stderr = std::fs::File::create(&errors).map_err(|e| format!("cannot create {}: {e}", errors.display()))?;
 		let mut command = job.command();
 		perf::launch(&mut command, pmu, pass, true);
 		let env = environment(&command, preload, label)?;
@@ -926,7 +933,11 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 			.stderr(stderr);
 		let status = command.status().map_err(|e| format!("cannot run {label}: {e}"))?;
 		if !status.success() {
-			return Err(format!("{label} failed ({status}); its output is in {}", dir.display()));
+			return Err(format!(
+				"{label} failed ({status}){}; its output is in {}",
+				reason(&errors),
+				dir.display()
+			));
 		}
 		let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
 		let mut readings = perf::readings(&text, pass.len()).map_err(|err| format!("{label}: {err}"))?;
