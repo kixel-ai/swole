@@ -1,12 +1,12 @@
-//! Counts as Kixel Quest's `metrics.json`, and as a table to read.
+//! Measures as Kixel Quest's `metrics.json`, as a full report, and as tables to read.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::path::Path;
 
 use serde_json::{Map, Number, Value, json};
 
-use crate::Counts;
+use crate::{Counter, Counts, Measure};
 
 /// The most bytes of `metrics.json` Kixel Quest reads from one run attempt.
 const LIMIT: usize = 1 << 20;
@@ -14,13 +14,6 @@ const LIMIT: usize = 1 << 20;
 const NAME_LIMIT: usize = 1024;
 /// The longest measure name Kixel Quest takes, in characters.
 const MEASURE_LIMIT: usize = 64;
-/// The unit of every count.
-const UNIT: &str = "instructions";
-
-/// The measure counts under `fingerprint` record, so a series never mixes two environments.
-pub fn measure(fingerprint: &str) -> String {
-	format!("{UNIT} ({fingerprint})")
-}
 
 /// A `metrics.json`: one measure, in one unit, of each sample's benchmarks.
 pub struct File {
@@ -34,20 +27,44 @@ pub struct Sample {
 	/// The commit's full ID, when it is not the run's.
 	pub commit: Option<String>,
 	/// Each benchmark's value.
-	pub values: BTreeMap<String, Number>,
+	pub values: BTreeMap<String, Point>,
+}
+
+/// One benchmark's value, and the least and most of its samples, when it took several.
+pub struct Point {
+	pub value: Number,
+	pub spread: Option<(Number, Number)>,
+}
+
+impl From<Number> for Point {
+	fn from(value: Number) -> Self {
+		Self { value, spread: None }
+	}
 }
 
 impl File {
-	/// `counts` as one sample of the run's own commit, a measure per benchmark.
-	pub fn counts(counts: &Counts) -> Self {
+	/// `counts` as one sample of the run's own commit, `measure` per benchmark.
+	pub fn counts(counts: &Counts, measure: String) -> Self {
 		let values = counts
 			.counts
 			.iter()
-			.map(|(name, &ir)| (name.clone(), ir.into()))
+			.map(|(name, &count)| {
+				let spread = counts
+					.spread
+					.get(name)
+					.map(|&(least, most)| (least.into(), most.into()));
+				(
+					name.clone(),
+					Point {
+						value: count.into(),
+						spread,
+					},
+				)
+			})
 			.collect();
 		Self {
-			measure: measure(&counts.fingerprint),
-			unit: UNIT,
+			measure,
+			unit: "instructions",
 			samples: vec![Sample { commit: None, values }],
 		}
 	}
@@ -61,11 +78,16 @@ impl File {
 		let mut samples = Vec::new();
 		for sample in &self.samples {
 			let mut metrics = Map::new();
-			for (name, value) in &sample.values {
+			for (name, point) in &sample.values {
 				if name.is_empty() || name.chars().count() > NAME_LIMIT || name.chars().any(char::is_control) {
 					return Err(format!("Kixel Quest takes no benchmark named {name:?}"));
 				}
-				metrics.insert(name.clone(), json!({ measure: { "value": value } }));
+				let mut value = json!({ "value": point.value });
+				if let Some((lower, upper)) = &point.spread {
+					value["lower_value"] = lower.clone().into();
+					value["upper_value"] = upper.clone().into();
+				}
+				metrics.insert(name.clone(), json!({ measure: value }));
 			}
 			if metrics.is_empty() {
 				continue;
@@ -93,20 +115,186 @@ impl File {
 
 	/// Writes the file at `path`.
 	pub fn write(&self, path: &Path) -> Result<(), String> {
-		let text = self.json()?;
-		if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-			std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-		}
-		std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+		write(path, &self.json()?)
 	}
 }
 
+/// Writes `text` at `path`, creating its directory.
+fn write(path: &Path, text: &str) -> Result<(), String> {
+	if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+		std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+	}
+	std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Every measure of every benchmark a run took, as JSON: what `--report` writes.
+pub struct Report(Value);
+
+impl Report {
+	/// A report of a `mode` run under `fingerprint`, whose host `describe`s itself so, against the
+	/// commit `base` when it has one, of each benchmark's measures by side.
+	pub fn new(
+		mode: crate::Mode,
+		fingerprint: &str,
+		host: &str,
+		base: Option<&str>,
+		benchmarks: BTreeMap<String, Map<String, Value>>,
+	) -> Self {
+		let mut report = json!({
+			"mode": mode.name(),
+			"fingerprint": fingerprint,
+			"host": host.lines().collect::<Vec<_>>(),
+			"benchmarks": benchmarks,
+		});
+		if let Some(base) = base {
+			report["base"] = base.into();
+		}
+		Self(report)
+	}
+
+	/// Writes the report at `path`.
+	pub fn write(&self, path: &Path) -> Result<(), String> {
+		write(path, &format!("{:#}\n", self.0))
+	}
+}
+
+/// Each measure of `measures` as a report holds it: its value and unit by name.
+pub fn side(measures: &[Measure]) -> Value {
+	let mut side = Map::new();
+	for measure in measures {
+		side.insert(
+			measure.name.clone(),
+			json!({ "value": number(measure.value), "unit": measure.unit }),
+		);
+	}
+	Value::Object(side)
+}
+
+/// The report of a count, quick's or sim's, of the working tree, against `base`'s counts, from the
+/// commit `sha`, when given.
+pub fn report(counts: &Counts, base: Option<&Counts>, counter: &Counter, sha: Option<&str>) -> Report {
+	let headline = |counts: &Counts, name: &str| -> Option<Vec<Measure>> {
+		let count = *counts.counts.get(name)?;
+		Some(match counts.details.get(name) {
+			Some(details) => details.clone(),
+			None => vec![Measure::new("instructions", count as f64, "instructions")],
+		})
+	};
+	let point = |counts: &Counts, name: &str| -> Option<Value> {
+		let mut side = side(&headline(counts, name)?);
+		if let Some(&(least, most)) = counts.spread.get(name) {
+			side["instructions"]["lower"] = least.into();
+			side["instructions"]["upper"] = most.into();
+		}
+		Some(side)
+	};
+	let names: BTreeSet<&String> = counts
+		.counts
+		.keys()
+		.chain(base.into_iter().flat_map(|base| base.counts.keys()))
+		.collect();
+	let mut benchmarks = BTreeMap::new();
+	for name in names {
+		let mut entry = Map::new();
+		if let Some(base) = base.and_then(|base| point(base, name)) {
+			entry.insert("base".to_owned(), base);
+		}
+		if let Some(head) = point(counts, name) {
+			entry.insert("head".to_owned(), head);
+		}
+		let threaded = counts.threaded.contains(name) || base.is_some_and(|base| base.threaded.contains(name));
+		entry.insert("threaded".to_owned(), threaded.into());
+		benchmarks.insert(name.clone(), entry);
+	}
+	Report::new(counter.mode(), &counts.fingerprint, &counter.host, sha, benchmarks)
+}
+
+/// A measure's value as JSON: a whole number as one, else five significant digits, more than any
+/// run resolves.
+pub fn number(value: f64) -> Value {
+	if value.fract() == 0.0 && value.abs() < 9e15 {
+		return (value as i64).into();
+	}
+	let rounded: f64 = format!("{value:.4e}").parse().expect("a float reads back");
+	Number::from_f64(rounded).map_or(Value::Null, Value::Number)
+}
+
 /// Each benchmark's count, a line each.
-pub fn table(counts: &BTreeMap<String, u64>) -> String {
-	let width = counts.values().map(|ir| ir.to_string().len()).max().unwrap_or(0);
+pub fn table(counts: &Counts) -> String {
+	let width = counts.counts.values().map(|n| n.to_string().len()).max().unwrap_or(0);
 	let mut out = String::new();
-	for (name, ir) in counts {
-		writeln!(out, "{ir:>width$}  {name}").expect("a String takes every write");
+	for (name, count) in &counts.counts {
+		writeln!(out, "{count:>width$}  {name}").expect("a String takes every write");
+	}
+	out
+}
+
+/// A measure's value as a table shows it, in its unit.
+pub fn shown(value: f64, unit: &str) -> String {
+	let number = if value.fract() == 0.0 {
+		format!("{value}")
+	} else if value.abs() >= 100.0 {
+		format!("{value:.1}")
+	} else {
+		format!("{value:.3}")
+	};
+	match unit {
+		"events" | "instructions" | "instructions/cycle" => number,
+		unit => format!("{number} {unit}"),
+	}
+}
+
+/// Every measure of each benchmark beyond its headline, a row each, as a Markdown table: with
+/// `before`, the base's beside the head's, and the change; empty when no benchmark has any.
+pub fn details(before: Option<&BTreeMap<String, Vec<Measure>>>, after: &BTreeMap<String, Vec<Measure>>) -> String {
+	if after.is_empty() && before.is_none_or(BTreeMap::is_empty) {
+		return String::new();
+	}
+	let mut out = match before {
+		Some(_) => String::from("\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n"),
+		None => String::from("\n| benchmark | measure | value |\n|---|---|---:|\n"),
+	};
+	let names: BTreeSet<&String> = after
+		.keys()
+		.chain(before.into_iter().flat_map(BTreeMap::keys))
+		.collect();
+	for name in names {
+		// A `|` in a name would split its cell.
+		let shown_name = name.replace('|', "\\|");
+		let head = after.get(name).map(Vec::as_slice).unwrap_or_default();
+		let base = before.and_then(|before| before.get(name)).map(Vec::as_slice);
+		let mut measures: Vec<(&str, &'static str)> = Vec::new();
+		for measure in head.iter().chain(base.unwrap_or_default()) {
+			if !measures.iter().any(|(name, _)| *name == measure.name) {
+				measures.push((&measure.name, measure.unit));
+			}
+		}
+		for (measure, unit) in measures {
+			let find = |side: &[Measure]| side.iter().find(|m| m.name == measure).map(|m| m.value);
+			let cell = |value: Option<f64>| value.map_or("-".to_owned(), |value| shown(value, unit));
+			match base {
+				Some(base) => {
+					let change = match (find(base), find(head)) {
+						(Some(b), Some(a)) if b != 0.0 => format!("{:+.2}%", (a - b) / b * 100.0),
+						(Some(_), Some(_)) => String::new(),
+						(None, Some(_)) => "added".to_owned(),
+						(Some(_), None) => "removed".to_owned(),
+						(None, None) => unreachable!("every measure comes from one side"),
+					};
+					writeln!(
+						out,
+						"| {shown_name} | {measure} | {} | {} | {change} |",
+						cell(find(base)),
+						cell(find(head))
+					)
+				}
+				None if before.is_some() => {
+					writeln!(out, "| {shown_name} | {measure} | - | {} | added |", cell(find(head)))
+				}
+				None => writeln!(out, "| {shown_name} | {measure} | {} |", cell(find(head))),
+			}
+			.expect("a String takes every write");
+		}
 	}
 	out
 }
@@ -119,24 +307,51 @@ mod tests {
 		Counts {
 			fingerprint: "x86_64-0123456789ab".to_owned(),
 			counts: names.iter().map(|(name, ir)| ((*name).to_owned(), *ir)).collect(),
+			spread: Default::default(),
 			threaded: Default::default(),
+			details: Default::default(),
 		}
+	}
+
+	fn measure() -> String {
+		"instructions (x86_64-0123456789ab)".to_owned()
 	}
 
 	#[test]
 	fn writes_one_sample_with_the_fingerprint_in_the_measure() {
-		let text = File::counts(&counts(&[("b::two", 20), ("a::one", 10)])).json().unwrap();
+		let mut counts = counts(&[("b::two", 20), ("a::one", 10)]);
+		counts.spread.insert("b::two".to_owned(), (18, 25));
+		let text = File::counts(&counts, measure()).json().unwrap();
 		assert_eq!(
 			text,
 			"{\"samples\":[{\"metrics\":{\"a::one\":{\"instructions (x86_64-0123456789ab)\":{\"value\":10}},\
-			 \"b::two\":{\"instructions (x86_64-0123456789ab)\":{\"value\":20}}}}],\
+			 \"b::two\":{\"instructions (x86_64-0123456789ab)\":{\"lower_value\":18,\"upper_value\":25,\"value\":20}}}}],\
 			 \"units\":{\"instructions (x86_64-0123456789ab)\":\"instructions\"}}\n"
 		);
 	}
 
 	#[test]
+	fn tables_every_measure_beside_the_base() {
+		let side = |cycles: f64| {
+			vec![
+				Measure::new("cycles:u", cycles, "events"),
+				Measure::new("user time", 1.5, "ns"),
+			]
+		};
+		let base = BTreeMap::from([("a".to_owned(), side(100.0)), ("gone".to_owned(), side(1.0))]);
+		let head = BTreeMap::from([("a".to_owned(), side(150.0))]);
+		assert_eq!(
+			details(Some(&base), &head),
+			"\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n\
+			 | a | cycles:u | 100 | 150 | +50.00% |\n| a | user time | 1.500 ns | 1.500 ns | +0.00% |\n\
+			 | gone | cycles:u | 1 | - | removed |\n| gone | user time | 1.500 ns | - | removed |\n"
+		);
+		assert_eq!(details(None, &BTreeMap::new()), "");
+	}
+
+	#[test]
 	fn refuses_what_kixel_quest_would() {
-		let json = |counts: &Counts| File::counts(counts).json();
+		let json = |counts: &Counts| File::counts(counts, measure()).json();
 		assert!(json(&counts(&[])).is_err());
 		assert!(json(&counts(&[("a\nb", 1)])).is_err());
 		assert!(json(&counts(&[("", 1)])).is_err());
@@ -159,11 +374,11 @@ mod tests {
 			samples: vec![
 				Sample {
 					commit: Some(base.clone()),
-					values: BTreeMap::from([("a".to_owned(), value(2.5))]),
+					values: BTreeMap::from([("a".to_owned(), value(2.5).into())]),
 				},
 				Sample {
 					commit: None,
-					values: BTreeMap::from([("a".to_owned(), value(2.0))]),
+					values: BTreeMap::from([("a".to_owned(), value(2.0).into())]),
 				},
 				Sample {
 					commit: Some("b".repeat(40)),

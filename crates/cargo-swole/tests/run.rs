@@ -120,7 +120,7 @@ fn bench(dir: &Path, benches: &str, wrap: &str, args: &[&str]) -> Output {
 fn command(dir: &Path, benches: &str, wrap: &str, args: &[&str]) -> Command {
 	let mut command = Command::new(env!("CARGO_BIN_EXE_swole"));
 	command
-		.arg("run")
+		.arg("sim")
 		.args(["--program", &program(benches, wrap)])
 		.args(args)
 		.current_dir(dir)
@@ -246,7 +246,6 @@ fn fails_on_a_program_that_measures_nothing() {
 /// built in a target directory of its own, since this test's build holds the workspace's.
 fn harness(args: &[&str]) -> Output {
 	Command::new(env!("CARGO_BIN_EXE_swole"))
-		.arg("run")
 		.args(args)
 		.args(["--", "-p", "swole", "--bench", "fixture"])
 		.current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -263,7 +262,7 @@ fn harness(args: &[&str]) -> Output {
 fn counts_each_harness_benchmark_alone_without_its_setup() {
 	let dir = scratch("harness");
 	let metrics = dir.join("metrics.json");
-	let out = harness(&["--out", metrics.to_str().unwrap()]);
+	let out = harness(&["sim", "--out", metrics.to_str().unwrap()]);
 	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 	let metrics: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(metrics).unwrap()).unwrap();
 	let metrics = metrics["samples"][0]["metrics"].as_object().unwrap();
@@ -323,6 +322,7 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 	std::fs::write(dir.join("list"), format!("{file}sized[2000]\n")).unwrap();
 	let only = dir.join("only.json");
 	let out = harness(&[
+		"sim",
 		"--benchmarks",
 		dir.join("list").to_str().unwrap(),
 		"--out",
@@ -333,7 +333,7 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 	let only = only["samples"][0]["metrics"].as_object().unwrap();
 	assert_eq!(only.keys().collect::<Vec<_>>(), [&format!("{file}sized[2000]")]);
 	std::fs::write(dir.join("list"), format!("{file}sized[3000]\n")).unwrap();
-	let out = harness(&["--benchmarks", dir.join("list").to_str().unwrap()]);
+	let out = harness(&["sim", "--benchmarks", dir.join("list").to_str().unwrap()]);
 	assert!(!out.status.success());
 	let err = String::from_utf8_lossy(&out.stderr);
 	assert!(
@@ -344,6 +344,7 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 	std::fs::write(dir.join("list"), format!("{file}sized[2000]\n{file}sized[3000]\n")).unwrap();
 	let some = dir.join("some.json");
 	let out = harness(&[
+		"sim",
 		"--benchmarks",
 		dir.join("list").to_str().unwrap(),
 		"--allow-missing",
@@ -371,20 +372,16 @@ fn table(stdout: &[u8]) -> std::collections::BTreeMap<String, u64> {
 /// one that exposes none, as a hosted CI runner, the run fails, saying so.
 #[test]
 fn counts_with_perf_counters_what_valgrind_does() {
-	let out = harness(&["--perf"]);
+	let out = harness(&["quick"]);
 	let err = String::from_utf8_lossy(&out.stderr);
 	if !out.status.success() {
-		assert!(err.contains("this host exposes no counters"), "{err}");
+		assert!(err.contains("quick counts with perf counters, and"), "{err}");
 		return;
 	}
 	let perf = table(&out.stdout);
-	let valgrind = harness(&[]);
-	assert!(
-		valgrind.status.success(),
-		"{}",
-		String::from_utf8_lossy(&valgrind.stderr)
-	);
-	let valgrind = table(&valgrind.stdout);
+	let sim = harness(&["sim"]);
+	assert!(sim.status.success(), "{}", String::from_utf8_lossy(&sim.stderr));
+	let valgrind = table(&sim.stdout);
 	assert_eq!(perf.keys().collect::<Vec<_>>(), valgrind.keys().collect::<Vec<_>>());
 	assert_eq!(perf.len(), 16);
 	let file = "crates/swole/benches/fixture.rs::";
@@ -418,8 +415,17 @@ fn counts_with_perf_counters_what_valgrind_does() {
 	);
 	let stdout = String::from_utf8_lossy(&out.stdout);
 	assert!(
-		stdout.ends_with(&format!(
-			"\nOther threads ran during the perf counts of {}, which the scheduler makes noisy.\n",
+		stdout.contains(&format!(
+			"\nOther threads ran beside {}, whose counts the scheduler makes noisy.\n",
+			threaded.join(", ")
+		)),
+		"{stdout}"
+	);
+	// Under Valgrind, the same benchmarks count five times, each the median of its samples.
+	let stdout = String::from_utf8_lossy(&sim.stdout);
+	assert!(
+		stdout.contains(&format!(
+			"\nOther threads ran beside {}, so each count is the median of 5",
 			threaded.join(", ")
 		)),
 		"{stdout}"
@@ -498,7 +504,7 @@ fn compares_a_base_with_every_change_in_the_working_tree_from_one_directory() {
 	std::fs::remove_file(repo.join("d.list")).unwrap();
 	let status = git(&repo, &["status", "--porcelain"]);
 	let out = Command::new(env!("CARGO_BIN_EXE_swole"))
-		.args(["compare", "HEAD", "--program", &program("$(cat *.list)", "")])
+		.args(["sim", "HEAD", "--program", &program("$(cat *.list)", "")])
 		// Each side's build resolves its own ignored lockfile, never the side's before.
 		.args(["--build", "! test -e Cargo.lock && touch Cargo.lock"])
 		.current_dir(&repo)
@@ -579,11 +585,10 @@ fn compares_a_selection_only_one_side_has() {
 	)
 	.unwrap();
 	package(&repo, "b", "y", &["f"]);
-	// Compare from `dir`, with swole's `flags` and the `cargo` args.
-	let run = |dir: &Path, flags: &[&str], cargo: &[&str]| {
+	// Compare from `dir`, in `mode`, with the `cargo` args.
+	let run = |dir: &Path, mode: &str, cargo: &[&str]| {
 		Command::new(env!("CARGO_BIN_EXE_swole"))
-			.args(["compare", "HEAD"])
-			.args(flags)
+			.args([mode, "HEAD"])
 			.arg("--")
 			.args(cargo)
 			.current_dir(dir)
@@ -596,7 +601,7 @@ fn compares_a_selection_only_one_side_has() {
 			.output()
 			.unwrap()
 	};
-	let compare = |cargo: &[&str]| run(&repo, &[], cargo);
+	let compare = |cargo: &[&str]| run(&repo, "sim", cargo);
 	let out = compare(&["-p", "a", "--package=b", "--bench", "x", "--bench=y", "-F", "b/f"]);
 	let err = String::from_utf8_lossy(&out.stderr);
 	assert!(out.status.success(), "{err}");
@@ -635,7 +640,7 @@ fn compares_a_selection_only_one_side_has() {
 	// So does the directory of a package only the head has, even once a run left the head's
 	// build output in it.
 	for _ in 0..2 {
-		let out = run(&repo.join("b"), &[], &["--features", "f"]);
+		let out = run(&repo.join("b"), "sim", &["--features", "f"]);
 		let err = String::from_utf8_lossy(&out.stderr);
 		assert!(out.status.success(), "{err}");
 		let table = String::from_utf8(out.stdout).unwrap();
@@ -644,12 +649,12 @@ fn compares_a_selection_only_one_side_has() {
 	}
 
 	// Under perf counters, the empty side carries the counted side's fingerprint.
-	let out = run(&repo, &["--perf"], &["-p", "b", "--features", "b/f"]);
+	let out = run(&repo, "quick", &["-p", "b", "--features", "b/f"]);
 	let err = String::from_utf8_lossy(&out.stderr);
 	if out.status.success() {
 		assert!(row(&String::from_utf8(out.stdout).unwrap(), "b").ends_with("| added |"));
 	} else {
-		assert!(err.contains("this host exposes no counters"), "{err}");
+		assert!(err.contains("quick counts with perf counters, and"), "{err}");
 	}
 
 	// Without `-p`, the base leaves out the feature of a package it lacks.

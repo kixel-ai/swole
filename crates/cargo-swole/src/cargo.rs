@@ -97,8 +97,9 @@ impl Launch {
 			.envs(&self.env)
 			.env_remove(HARNESS_TIME)
 			.env("CODSPEED_CARGO_WORKSPACE_ROOT", root)
-			// Only a perf count sets it, on a job pinned to its PMU's cores.
-			.env_remove(crate::perf::PERF);
+			// Only a native count sets them, on a job whose counters swole opened.
+			.env_remove(crate::perf::COUNTERS)
+			.env_remove(crate::perf::ITERATIONS);
 		command
 	}
 }

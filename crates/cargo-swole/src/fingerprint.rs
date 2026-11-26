@@ -49,6 +49,18 @@ impl Fingerprint {
 		})
 	}
 
+	/// Every input, a line each, but the CPU's, a line a leaf.
+	pub fn describe(&self) -> String {
+		format!(
+			"arch: {}\nvalgrind: {}\nGLIBC_TUNABLES: {}\npreload: {}\ncpu:\n{}",
+			self.arch,
+			self.valgrind,
+			self.tunables.as_deref().unwrap_or("(unset)"),
+			self.preload,
+			self.cpu
+		)
+	}
+
 	/// The fingerprint as a measure names it: the architecture and a hash of every input.
 	pub fn label(&self) -> String {
 		let mut hash = Fnv::default();
@@ -62,6 +74,113 @@ impl Fingerprint {
 		hash.write(&self.preload);
 		format!("{}-{:012x}", self.arch, hash.0 >> 16)
 	}
+}
+
+/// The environment a native measure, quick's count or bench's time, is comparable within: the
+/// CPU's model, how many CPUs swole may run on, and what the host lets swole count, the perf
+/// tier, PMU, and counters its probe found, so a series never mixes two kinds of host or two
+/// sets of counters; and for quick, the preload, whose code runs inside each count.
+pub struct Native {
+	pub arch: &'static str,
+	/// The CPU's model, as the system describes it.
+	pub model: String,
+	/// How many CPUs swole may run on.
+	pub cpus: usize,
+	pub host: crate::perf::Host,
+	/// The preload's hash, for a count that runs with it.
+	pub preload: Option<String>,
+}
+
+impl Native {
+	/// Probes this host for `mode`, quick or bench.
+	pub fn probe(mode: crate::Mode) -> Result<Self, String> {
+		Ok(Self {
+			arch: std::env::consts::ARCH,
+			model: model()?,
+			cpus: std::thread::available_parallelism()
+				.map_err(|e| format!("cannot count the CPUs: {e}"))?
+				.get(),
+			host: crate::perf::Host::probe(mode)?,
+			preload: (mode == crate::Mode::Quick).then(crate::preload::hash),
+		})
+	}
+
+	/// Every input, a line each, as the label hashes them.
+	pub fn describe(&self) -> String {
+		let mut out = format!(
+			"arch: {}
+CPUs: {}
+{}",
+			self.arch,
+			self.cpus,
+			self.host.describe()
+		);
+		if let Some(preload) = &self.preload {
+			out.push_str(&format!(
+				"preload: {preload}
+"
+			));
+		}
+		out.push_str(&format!("model:\n{}", self.model));
+		out
+	}
+
+	/// The fingerprint as a measure names it: the architecture and a hash of every input.
+	pub fn label(&self) -> String {
+		let mut hash = Fnv::default();
+		hash.write(&self.describe());
+		format!("{}-{:012x}", self.arch, hash.0 >> 16)
+	}
+}
+
+/// The CPU's model as Linux describes each logical CPU, by the fields that name it.
+#[cfg(target_os = "linux")]
+fn model() -> Result<String, String> {
+	const MODEL: [&str; 9] = [
+		"vendor_id",
+		"cpu family",
+		"model",
+		"model name",
+		"stepping",
+		"CPU implementer",
+		"CPU variant",
+		"CPU part",
+		"CPU revision",
+	];
+	let info = std::fs::read_to_string("/proc/cpuinfo").map_err(|e| format!("cannot read /proc/cpuinfo: {e}"))?;
+	// Each line once: a host's CPUs mostly repeat each other's, and `cpus` counts them.
+	let mut model = String::new();
+	for line in info
+		.lines()
+		.filter(|line| line.split_once(':').is_some_and(|(key, _)| MODEL.contains(&key.trim())))
+	{
+		if !model.lines().any(|seen| seen == line) {
+			model.push_str(line);
+			model.push('\n');
+		}
+	}
+	if model.is_empty() {
+		return Err("/proc/cpuinfo names no CPU model".to_owned());
+	}
+	Ok(model)
+}
+
+/// The CPU's model as macOS names it.
+#[cfg(target_os = "macos")]
+fn model() -> Result<String, String> {
+	let out = Command::new("sysctl")
+		.args(["-n", "machdep.cpu.brand_string"])
+		.output()
+		.map_err(|e| format!("cannot run sysctl: {e}"))?;
+	if !out.status.success() {
+		return Err(format!("sysctl failed ({})", out.status));
+	}
+	String::from_utf8(out.stdout).map_err(|_| "sysctl named the CPU in something not UTF-8".to_owned())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn model() -> Result<String, String> {
+	Err("swole names CPUs on Linux and macOS alone".to_owned())
 }
 
 /// Runs `command`, returning its stdout, or failing with its stderr.

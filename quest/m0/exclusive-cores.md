@@ -17,10 +17,6 @@ Recommendations for the implementer:
 - When the host permits cpufreq control (or via a minimal helper/capability), switch the reserved core's scaling governor to `performance` and restore the original governor on drop/signal (including `SIGINT`/`SIGTERM`); when cpufreq is read-only, probe once at setup, report the active governor in the fingerprint/header, and never silently claim exclusivity it doesn't hold.
 - Verify on a loaded multi-core Linux host with an A/A `swole bench HEAD` run comparing unpinned shared execution against exclusive-core pinned execution and recording the interval tightening in the PR.
 
-## Required
-
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - integrates into `swole bench` job execution
-
 ## Hosts
 
 - linux - CPU affinity, SMT sibling topology, and cpufreq governor

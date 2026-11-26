@@ -1,129 +1,72 @@
-//! Linux perf counters of a case's user-space instructions (`instructions:u`), on every thread,
-//! which swole reads natively instead of counting under Valgrind.
+//! Linux perf counters swole opened on this process before it ran the benchmark target, which
+//! the harness starts and stops around each case and reads. swole opens them, with whatever
+//! privileges it holds, such as `CAP_PERFMON`, so a benchmark target needs none of its own.
 
-use std::cell::RefCell;
 use std::io::Read;
 use std::os::fd::{FromRawFd, OwnedFd};
 
-/// Counts one case's instructions, on every thread its process runs during the count.
-pub struct Counter {
-	/// The PMU's perf type, or 0 on a host with one, whose CPUs swole runs the process on.
-	kind: u32,
-	state: RefCell<State>,
+/// The counters swole opened, in the order it opened them, which is the order of their
+/// descriptors: each takes the lowest free one.
+pub struct Counters {
+	fds: Vec<OwnedFd>,
 }
 
-enum State {
-	Idle,
-	Counting(Counters),
-	Done(Result<Count, String>),
-}
-
-/// What a case counted.
-pub struct Count {
-	pub instructions: u64,
-	/// Whether another thread ran during the count, which makes it noisy.
-	pub threaded: bool,
-}
-
-/// One case's counters, which the calling thread opened, so one `prctl` starts or stops them all.
-struct Counters {
-	/// The calling thread's, and each thread it spawns.
-	own: OwnedFd,
-	/// The calling thread's alone, which differs from `own` exactly when a spawned thread ran.
-	alone: OwnedFd,
-	/// Each other thread's, and each thread it spawns.
-	others: Vec<OwnedFd>,
-}
-
-impl Counter {
-	/// A counter of the PMU of perf type `kind`, 0 on a host with one.
-	pub fn new(kind: u32) -> Self {
-		Self {
-			kind,
-			state: RefCell::new(State::Idle),
-		}
-	}
-
-	/// Opens counters on each of the process's threads, after the case's setup, and starts them,
-	/// last of all, so little of its own work counts.
-	pub fn start(&self) {
-		let mut state = self.state.borrow_mut();
-		assert!(matches!(*state, State::Idle), "a case is counted once");
-		let opened = self.open();
-		let start = opened.is_ok();
-		*state = match opened {
-			Ok(counters) => State::Counting(counters),
-			Err(err) => State::Done(Err(err)),
-		};
-		drop(state);
-		if start {
-			// The thread is in the kernel from the first counter's start to the last's, so every
-			// one counts its user-space instructions from the same one.
-			prctl(PR_TASK_PERF_EVENTS_ENABLE);
-		}
-	}
-
-	/// Stops the counters, first of all, and reads them.
-	pub fn stop(&self) {
-		// Stopping none, when the case could not count, changes nothing.
-		prctl(PR_TASK_PERF_EVENTS_DISABLE);
-		let mut state = self.state.borrow_mut();
-		*state = match std::mem::replace(&mut *state, State::Idle) {
-			State::Counting(counters) => State::Done(counters.read()),
-			done @ State::Done(_) => done,
-			State::Idle => panic!("a case stops after it starts"),
-		};
-	}
-
-	/// What the case counted, once it has stopped, or why it could not count.
-	pub fn count(&self) -> Result<Count, String> {
-		match std::mem::replace(&mut *self.state.borrow_mut(), State::Idle) {
-			State::Done(count) => count,
-			_ => Err("the case never ran".to_owned()),
-		}
-	}
-
-	fn open(&self) -> Result<Counters, String> {
-		// SAFETY: it takes nothing and always succeeds.
-		let own = unsafe { gettid() };
-		let mut others = Vec::new();
-		let before = threads()?;
-		for &tid in before.iter().filter(|&&tid| tid != own) {
-			match instructions(self.kind, tid, true) {
-				Ok(fd) => others.push(fd),
-				// It exited since the listing, so it runs nothing in the count.
-				Err(err) if err.raw_os_error() == Some(ESRCH) => {}
-				Err(err) => return Err(refused(&err)),
+impl Counters {
+	/// The `count` counters swole left open on this process, each counting every thread the
+	/// process starts. Fails unless there are exactly that many.
+	pub fn inherited(count: usize) -> Result<Self, String> {
+		let entries = std::fs::read_dir("/proc/self/fd").map_err(|e| format!("cannot list /proc/self/fd: {e}"))?;
+		let mut found = Vec::new();
+		for entry in entries {
+			let entry = entry.map_err(|e| format!("cannot list /proc/self/fd: {e}"))?;
+			// The listing's own descriptor is gone by the time it is read.
+			let Ok(link) = std::fs::read_link(entry.path()) else {
+				continue;
+			};
+			if link.as_os_str() != "anon_inode:[perf_event]" {
+				continue;
 			}
-		}
-		let counters = Counters {
-			own: instructions(self.kind, 0, true).map_err(|err| refused(&err))?,
-			alone: instructions(self.kind, 0, false).map_err(|err| refused(&err))?,
-			others,
-		};
-		// A thread started meanwhile has no counter, or its spawner's as well as its own.
-		if let Some(tid) = threads()?.difference(&before).next() {
-			return Err(format!(
-				"thread {tid} started while the case's perf counters opened, so it would count twice or not at all: \
-				 let setup's threads settle before it returns"
-			));
-		}
-		Ok(counters)
-	}
-}
-
-/// The process's threads.
-fn threads() -> Result<std::collections::BTreeSet<i32>, String> {
-	let tasks = std::fs::read_dir("/proc/self/task").map_err(|e| format!("cannot list /proc/self/task: {e}"))?;
-	tasks
-		.map(|task| {
-			task.map_err(|e| format!("cannot list /proc/self/task: {e}"))?
+			let fd: i32 = entry
 				.file_name()
 				.to_str()
 				.and_then(|name| name.parse().ok())
-				.ok_or_else(|| "/proc/self/task lists a thread by no number".to_owned())
+				.ok_or("/proc/self/fd lists a descriptor by no number")?;
+			found.push(fd);
+		}
+		found.sort_unstable();
+		if found.len() != count {
+			return Err(format!(
+				"swole opened {count} perf counters on this process, but it holds {}",
+				found.len()
+			));
+		}
+		Ok(Self {
+			// SAFETY: each is an open perf event descriptor nothing else in the process owns:
+			// swole opened it before the process started, for the harness alone.
+			fds: found
+				.into_iter()
+				.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+				.collect(),
 		})
-		.collect()
+	}
+
+	/// Starts every counter at once: the thread that opened them, which became this process's
+	/// main thread, owns them, so one `prctl` starts them all, on every thread.
+	#[inline(always)]
+	pub fn start(&self) {
+		prctl(PR_TASK_PERF_EVENTS_ENABLE);
+	}
+
+	/// Stops every counter at once.
+	#[inline(always)]
+	pub fn stop(&self) {
+		prctl(PR_TASK_PERF_EVENTS_DISABLE);
+	}
+
+	/// Each counter's value, refusing one that did not count the whole time it was enabled.
+	pub fn read(&self) -> Result<Vec<u64>, String> {
+		self.fds.iter().map(read).collect()
+	}
 }
 
 /// Fails unless the process loaded the first library `LD_PRELOAD` names, where swole puts
@@ -154,135 +97,45 @@ pub fn preloaded() -> Result<(), String> {
 	Ok(())
 }
 
+/// How many threads swole's preload saw the process start, or `None` without it: a thread a
+/// case starts and joins within its call is gone before the case's end can list it.
+pub fn started() -> Option<u64> {
+	// SAFETY: the name is a C string; RTLD_DEFAULT searches every loaded library.
+	let symbol = unsafe { dlsym(RTLD_DEFAULT, c"swole_threads_started".as_ptr()) };
+	if symbol.is_null() {
+		return None;
+	}
+	// SAFETY: the preload defines the symbol as a function of this signature.
+	let started: extern "C" fn() -> u64 = unsafe { std::mem::transmute(symbol) };
+	Some(started())
+}
+
+/// How many threads the process has now.
+pub fn threads() -> Result<usize, String> {
+	let tasks = std::fs::read_dir("/proc/self/task").map_err(|e| format!("cannot list /proc/self/task: {e}"))?;
+	Ok(tasks.count())
+}
+
 const RTLD_LAZY: i32 = 1;
 const RTLD_NOLOAD: i32 = 4;
-
-impl Counters {
-	fn read(self) -> Result<Count, String> {
-		let alone = read(&self.alone)?;
-		let mut instructions = 0;
-		let mut spawned = false;
-		for fd in std::iter::once(&self.own).chain(&self.others) {
-			let count = read(fd)?;
-			if std::ptr::eq(fd, &self.own) {
-				spawned = count != alone;
-			}
-			instructions += count;
-		}
-		Ok(Count {
-			instructions,
-			threaded: spawned || !self.others.is_empty(),
-		})
-	}
-}
-
-/// Fails unless this host lets a process count its own user-space instructions on the PMU of
-/// perf type `kind`, saying why not.
-pub fn probe(kind: u32) -> Result<(), String> {
-	instructions(kind, 0, false).map(drop).map_err(|err| refused(&err))
-}
-
-/// Why opening a counter failed, and what to change.
-fn refused(err: &std::io::Error) -> String {
-	let paranoid = std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
-		.map_or_else(|_| "unreadable".to_owned(), |text| text.trim().to_owned());
-	format!(
-		"cannot open a perf counter of user-space instructions ({err}): this host exposes no counters to a \
-		 process, as a VM without its PMU passed through, or a kernel.perf_event_paranoid above 2 (here {paranoid}), does"
-	)
-}
-
-const ESRCH: i32 = 3;
-
-/// `perf_event_attr`'s first 64 bytes, `PERF_ATTR_SIZE_VER0`, all a count needs.
-#[repr(C)]
-#[derive(Default)]
-struct Attr {
-	kind: u32,
-	size: u32,
-	config: u64,
-	sample_period: u64,
-	sample_type: u64,
-	read_format: u64,
-	flags: u64,
-	wakeup_events: u32,
-	bp_type: u32,
-	config1: u64,
-}
-
-const PERF_TYPE_HARDWARE: u32 = 0;
-const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
-/// Where a hardware event's config names the PMU on a host with several.
-const PERF_PMU_TYPE_SHIFT: u32 = 32;
-const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1;
-const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 2;
-const DISABLED: u64 = 1 << 0;
-const INHERIT: u64 = 1 << 1;
-const EXCLUDE_KERNEL: u64 = 1 << 5;
-const EXCLUDE_HV: u64 = 1 << 6;
-const PERF_FLAG_FD_CLOEXEC: u64 = 1 << 3;
+const RTLD_DEFAULT: *mut std::ffi::c_void = std::ptr::null_mut();
 const PR_TASK_PERF_EVENTS_DISABLE: i32 = 31;
 const PR_TASK_PERF_EVENTS_ENABLE: i32 = 32;
 
-#[cfg(target_arch = "x86_64")]
-const SYS_PERF_EVENT_OPEN: i64 = 298;
-#[cfg(target_arch = "aarch64")]
-const SYS_PERF_EVENT_OPEN: i64 = 241;
-
 unsafe extern "C" {
-	fn syscall(number: i64, ...) -> i64;
 	#[link_name = "prctl"]
 	fn sys_prctl(option: i32, ...) -> i32;
-	fn gettid() -> i32;
 	fn dlopen(name: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
 	fn dlclose(handle: *mut std::ffi::c_void) -> i32;
+	fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
 }
 
-/// Starts or stops every perf event the calling thread opened.
+/// Starts or stops every perf event the calling thread opened, or swole opened before `exec`.
+#[inline(always)]
 fn prctl(option: i32) {
 	// SAFETY: these options take no argument.
 	let done = unsafe { sys_prctl(option) };
-	assert_eq!(done, 0, "a thread starts and stops the perf events it opened");
-}
-
-/// A stopped counter of thread `tid`'s user-space instructions (0 for the calling thread's), and
-/// when `inherit`, of each thread it spawns.
-fn instructions(kind: u32, tid: i32, inherit: bool) -> std::io::Result<OwnedFd> {
-	let attr = Attr {
-		kind: PERF_TYPE_HARDWARE,
-		size: std::mem::size_of::<Attr>() as u32,
-		config: u64::from(kind) << PERF_PMU_TYPE_SHIFT | PERF_COUNT_HW_INSTRUCTIONS,
-		read_format: PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING,
-		flags: DISABLED | EXCLUDE_KERNEL | EXCLUDE_HV | if inherit { INHERIT } else { 0 },
-		..Attr::default()
-	};
-	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-	{
-		// SAFETY: `attr` is a `perf_event_attr` of the size it states, read during the call.
-		let fd = unsafe {
-			syscall(
-				SYS_PERF_EVENT_OPEN,
-				&raw const attr,
-				tid,
-				-1i32,
-				-1i32,
-				PERF_FLAG_FD_CLOEXEC,
-			)
-		};
-		if fd < 0 {
-			return Err(std::io::Error::last_os_error());
-		}
-		// SAFETY: the kernel returned a new descriptor, which nothing else owns.
-		Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
-	}
-	#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-	{
-		let _ = (attr, tid);
-		Err(std::io::Error::new(
-			std::io::ErrorKind::Unsupported,
-			"swole opens perf counters on x86_64 and aarch64",
-		))
-	}
+	assert_eq!(done, 0, "a thread starts and stops the perf events it owns");
 }
 
 /// A counter's value, refusing one that did not count the whole time it was enabled.
@@ -297,8 +150,8 @@ fn read(fd: &OwnedFd) -> Result<u64, String> {
 	// time, and one on a CPU of another PMU counted none of it: neither is scaled up.
 	if enabled != running {
 		return Err(format!(
-			"a perf counter ran {running} ns of the {enabled} ns it was enabled, so it missed instructions: another \
-			 user of this host's counters multiplexed it, or a thread left the CPUs of the PMU it counts"
+			"a perf counter ran {running} ns of the {enabled} ns it was enabled, so it missed events: another user of \
+			 this host's counters multiplexed it, or a thread left the CPUs of the PMU it counts"
 		));
 	}
 	Ok(count)

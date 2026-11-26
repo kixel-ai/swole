@@ -211,6 +211,7 @@ fn refuse(line: &[u8]) -> ! {
 /// apart but which runs no constructor of its own.
 extern "C" fn init() {
 	loaded();
+	create();
 	// SAFETY: glibc's own registration, which pthread_atfork wraps; this library is never
 	// unloaded, so it names no DSO.
 	unsafe { __register_atfork(None, None, Some(loaded), core::ptr::null_mut()) };
@@ -708,4 +709,40 @@ unsafe fn futex(
 		}
 		_ => pass_through(),
 	}
+}
+
+// Threads: how many the process has started, which the harness reads around each case's call,
+// so a thread the call starts and joins, gone by the call's end, still marks the case as one
+// other threads ran beside.
+
+static STARTED: AtomicU64 = AtomicU64::new(0);
+
+/// How many threads `pthread_create` has started in this process.
+#[unsafe(no_mangle)]
+pub extern "C" fn swole_threads_started() -> u64 {
+	STARTED.load(Relaxed)
+}
+
+/// glibc's `pthread_create`.
+type Create = unsafe extern "C" fn(*mut u64, *const c_void, extern "C" fn(*mut c_void) -> *mut c_void, *mut c_void) -> c_int;
+
+/// glibc's `pthread_create`, found once, as the library loads: a first lookup inside a count, by
+/// the first thread a benchmark starts, would count `dlsym`'s own work.
+fn create() -> Create {
+	real!("pthread_create": Create)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_create(
+	thread: *mut u64,
+	attr: *const c_void,
+	start: extern "C" fn(*mut c_void) -> *mut c_void,
+	arg: *mut c_void,
+) -> c_int {
+	// SAFETY: the caller's arguments, passed on.
+	let made = unsafe { create()(thread, attr, start, arg) };
+	if made == 0 {
+		STARTED.fetch_add(1, Relaxed);
+	}
+	made
 }

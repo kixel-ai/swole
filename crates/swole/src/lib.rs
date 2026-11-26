@@ -1,5 +1,5 @@
 //! Benchmarks as plain functions marked `#[bench]`, which [swole] counts in
-//! instructions under Valgrind and times by wall clock. See the README.
+//! instructions under Valgrind or with perf counters and times by wall clock. See the README.
 //!
 //! [swole]: https://github.com/kixel-ai/swole
 
@@ -45,29 +45,32 @@ impl IntoIterator for Iterations {
 	}
 }
 
-/// The variable that, set to a PMU's perf type (0 on a host with one), counts each benchmark's
-/// user-space instructions with Linux perf counters, natively.
-const PERF: &str = "SWOLE_PERF";
+/// The variable that, set to how many perf counters swole opened on the process before it ran
+/// the target, has the one benchmark `SWOLE_BENCH` names start and stop them around its call,
+/// and print what they counted.
+const COUNTERS: &str = "SWOLE_COUNTERS";
 
-/// What a perf count prints before each benchmark's count, `alone` or `threads`, and name.
-#[cfg(target_os = "linux")]
+/// The variable that, beside `SWOLE_COUNTERS`, has the benchmark called this many times, each
+/// call counted, rather than once.
+const ITERATIONS: &str = "SWOLE_ITERATIONS";
+
+/// What a count with perf counters prints before each counter's value, in the order swole opened
+/// them, and the benchmark's name.
 const COUNTED: &str = "swole counted ";
+
+/// What a run swole measures natively prints before what the process used over the benchmark's
+/// calls, or over each sample's, from `getrusage`.
+const RUSAGE: &str = "swole rusage ";
+
+/// What a run swole measures prints before the name of a benchmark beside which the process had
+/// another thread.
+const THREADED: &str = "swole threaded ";
 
 #[cfg(target_os = "linux")]
 mod perf;
 
-/// Fails unless this host lets a process count its own user-space instructions on the PMU of
-/// perf type `kind`, saying why not: swole's check before it builds anything.
-#[doc(hidden)]
-pub fn __probe_perf(kind: u32) -> Result<(), String> {
-	#[cfg(target_os = "linux")]
-	return perf::probe(kind);
-	#[cfg(not(target_os = "linux"))]
-	{
-		let _ = kind;
-		Err("perf counters are Linux's: count under Valgrind instead".to_owned())
-	}
-}
+#[cfg(all(unix, target_pointer_width = "64"))]
+mod rusage;
 
 /// Runs every benchmark the program's `#[bench]` functions declare, or only the one
 /// `SWOLE_BENCH` names, each counted alone under Valgrind and once natively, or timed when
@@ -105,6 +108,8 @@ fn run() -> Result<(), String> {
 		Some(value) if value == "1" => true,
 		Some(value) => return Err(format!("{TIME} is {}, not 1", value.to_string_lossy())),
 	};
+	// What swole runs, it watches: whether other threads ran, and natively, what it used.
+	let watched = only.is_some();
 	if let Some(only) = only {
 		let case = cases
 			.remove(&only)
@@ -117,28 +122,32 @@ fn run() -> Result<(), String> {
 		let (_, case) = cases.pop_first().expect("one case is left");
 		return serve((case.build)(), std::io::stdin().lock(), std::io::stdout());
 	}
-	let perf = match std::env::var(PERF) {
-		Ok(kind) => Some(
-			kind.parse::<u32>()
-				.map_err(|_| format!("{PERF} is {kind}, not a PMU's perf type"))?,
-		),
-		Err(std::env::VarError::NotPresent) => None,
-		Err(std::env::VarError::NotUnicode(_)) => return Err(format!("{PERF} is not UTF-8")),
-	};
-	#[cfg(target_os = "linux")]
-	if perf.is_some() {
-		perf::preloaded()?;
+	let counters = number(COUNTERS)?;
+	let iterations = number(ITERATIONS)?.unwrap_or(1);
+	if counters.is_some() && cases.len() != 1 {
+		return Err(format!("{COUNTERS} counts one benchmark, which {ONLY} names"));
 	}
+	if iterations != 1 && counters.is_none() {
+		return Err(format!(
+			"{ITERATIONS} counts with perf counters, which {COUNTERS} has swole open"
+		));
+	}
+	let mut counters = counters.map(open).transpose()?;
 	for (name, case) in cases {
-		let meter = __private::Meter::new(&name, perf)?;
+		let meter = __private::Meter::new(&name, counters.take(), watched)?;
 		let mut sampler = (case.build)();
-		sampler.count(&meter);
+		sampler.count(&meter, iterations);
 		drop(sampler);
-		#[cfg(target_os = "linux")]
-		if let Some(counter) = &meter.perf {
-			let count = counter.count().map_err(|err| format!("{name}: {err}"))?;
-			let threads = if count.threaded { "threads" } else { "alone" };
-			println!("{COUNTED}{} {threads} {name}", count.instructions);
+		let watch = meter.finish().map_err(|err| format!("{name}: {err}"))?;
+		if watch.threaded {
+			println!("{THREADED}{name}");
+		}
+		if let Some(usage) = watch.usage {
+			println!("{RUSAGE}{usage}");
+		}
+		if let Some(values) = watch.counted {
+			let values: Vec<String> = values.iter().map(u64::to_string).collect();
+			println!("{COUNTED}{} {name}", values.join(" "));
 		}
 		if !quiet {
 			println!("{RAN}{name}");
@@ -147,9 +156,59 @@ fn run() -> Result<(), String> {
 	Ok(())
 }
 
+/// The `count` perf counters swole opened on this process.
+#[cfg(target_os = "linux")]
+fn open(count: u64) -> Result<Counters, String> {
+	perf::preloaded()?;
+	Counters::inherited(count as usize)
+}
+
+/// Elsewhere swole opens none.
+#[cfg(not(target_os = "linux"))]
+fn open(_: u64) -> Result<Counters, String> {
+	Err(format!("{COUNTERS}: perf counters are Linux's"))
+}
+
+#[cfg(target_os = "linux")]
+use perf::Counters;
+
+/// How many threads swole's preload saw the process start, when it loaded.
+fn started() -> Option<u64> {
+	#[cfg(target_os = "linux")]
+	return perf::started();
+	#[cfg(not(target_os = "linux"))]
+	None
+}
+
+/// How many threads the process has, as far as the harness can tell.
+fn threads() -> Result<usize, String> {
+	#[cfg(target_os = "linux")]
+	return perf::threads();
+	#[cfg(not(target_os = "linux"))]
+	Ok(1)
+}
+
+/// Elsewhere swole opens no perf counters.
+#[cfg(not(target_os = "linux"))]
+enum Counters {}
+
+/// The positive number the variable `key` holds, when set.
+fn number(key: &str) -> Result<Option<u64>, String> {
+	match std::env::var(key) {
+		Ok(value) => value
+			.parse()
+			.ok()
+			.filter(|&n| n > 0)
+			.map(Some)
+			.ok_or(format!("{key} is {value}, not a count")),
+		Err(std::env::VarError::NotPresent) => Ok(None),
+		Err(std::env::VarError::NotUnicode(_)) => Err(format!("{key} is not UTF-8")),
+	}
+}
+
 /// Times `sampler` once for each line of `commands`, an iteration count, printing each sample's
-/// nanoseconds to `out` until `commands` ends. Each sample's line starts a line of its own, so a
-/// benchmark's own unfinished line never runs into it.
+/// nanoseconds to `out` until `commands` ends, after what the process used over it. Each sample's
+/// line starts a line of its own, so a benchmark's own unfinished line never runs into it.
 fn serve(mut sampler: Box<dyn __private::Sampler>, commands: impl BufRead, mut out: impl Write) -> Result<(), String> {
 	for line in commands.lines() {
 		let line = line.map_err(|e| format!("cannot read a sample's iterations: {e}"))?;
@@ -158,7 +217,17 @@ fn serve(mut sampler: Box<dyn __private::Sampler>, commands: impl BufRead, mut o
 			.ok()
 			.filter(|&n| n > 0)
 			.ok_or(format!("cannot sample {line:?} iterations"))?;
+		#[cfg(all(unix, target_pointer_width = "64"))]
+		let start = rusage::Usage::now();
 		let nanos = sampler.time(iterations);
+		#[cfg(all(unix, target_pointer_width = "64"))]
+		{
+			let mut used = rusage::Usage::default();
+			rusage::Usage::now().add_since(start, &mut used);
+			// Before the sample's line, which an older swole waits for, reading what precedes
+			// it as the benchmark's own output.
+			write!(out, "\n{RUSAGE}{}", used.fields()).map_err(|e| format!("cannot write a sample: {e}"))?;
+		}
 		write!(out, "\n{SAMPLE}{nanos}\n")
 			.and_then(|()| out.flush())
 			.map_err(|e| format!("cannot write a sample: {e}"))?;
@@ -208,6 +277,8 @@ pub mod __private {
 	use std::fmt::Display;
 	use std::time::{Duration, Instant};
 
+	use std::cell::RefCell;
+
 	pub use core::hint::black_box;
 	pub use inventory;
 
@@ -249,46 +320,73 @@ pub mod __private {
 
 	/// A case set up, which runs its benchmark once counted or many times timed.
 	pub trait Sampler {
-		/// Calls the benchmark once, counting only the call between the meter's requests.
-		fn count(&mut self, meter: &Meter);
+		/// Calls the benchmark `iterations` times, counting only the calls between the meter's
+		/// requests.
+		fn count(&mut self, meter: &Meter, iterations: u64);
 		/// Calls the benchmark `iterations` times, returning the nanoseconds its timed part took.
 		fn time(&mut self, iterations: u64) -> u64;
 	}
 
 	/// Brackets one case with Callgrind's client requests, so Valgrind run with
 	/// `--instr-atstart=no` counts it alone and dumps it under its name. Natively each
-	/// request is an instruction sequence that does nothing.
+	/// request is an instruction sequence that does nothing, and the perf counters swole opened,
+	/// when it did, count instead.
 	pub struct Meter {
 		name: CString,
-		/// The case's perf counters, when it counts natively.
-		#[cfg(target_os = "linux")]
-		pub(crate) perf: Option<crate::perf::Counter>,
+		counters: Option<crate::Counters>,
+		/// What the case's calls used and whether other threads ran, when swole runs it.
+		watch: Option<RefCell<Watching>>,
+	}
+
+	/// What a meter saw over a case's calls.
+	pub(crate) struct Watched {
+		/// Whether the process had another thread during them.
+		pub threaded: bool,
+		/// What the process used over them, as the harness prints it, when perf counters count.
+		pub usage: Option<String>,
+		/// Each perf counter's value, when they count.
+		pub counted: Option<Vec<u64>>,
+	}
+
+	/// What a meter has seen so far.
+	struct Watching {
+		threaded: bool,
+		/// How many threads the preload saw start before the current call.
+		started: Option<u64>,
+		#[cfg(all(unix, target_pointer_width = "64"))]
+		usage: Option<(crate::rusage::Usage, crate::rusage::Usage)>,
+		/// Why a call could not be watched.
+		error: Option<String>,
 	}
 
 	impl Meter {
-		/// A meter of the case `name`, which also counts with perf counters of the PMU of perf
-		/// type `perf`, when given.
-		pub(crate) fn new(name: &str, perf: Option<u32>) -> Result<Self, String> {
+		/// A meter of the case `name`, which also starts and stops `counters`, when given, and
+		/// when `watched`, sees whether other threads ran.
+		pub(crate) fn new(name: &str, counters: Option<crate::Counters>, watched: bool) -> Result<Self, String> {
 			let name = CString::new(name).map_err(|_| format!("{name:?} holds a NUL"))?;
-			#[cfg(not(target_os = "linux"))]
-			if perf.is_some() {
-				return Err(format!("{}: perf counters are Linux's", crate::PERF));
-			}
-			Ok(Self {
-				name,
-				#[cfg(target_os = "linux")]
-				perf: perf.map(crate::perf::Counter::new),
-			})
+			let watch = watched.then(|| {
+				RefCell::new(Watching {
+					threaded: false,
+					started: None,
+					#[cfg(all(unix, target_pointer_width = "64"))]
+					usage: counters.as_ref().map(|_| Default::default()),
+					error: None,
+				})
+			});
+			Ok(Self { name, counters, watch })
 		}
 
 		/// Zeroes the counts and starts counting.
 		#[inline(always)]
 		pub fn start(&self) {
+			if let Some(watch) = &self.watch {
+				watch.borrow_mut().before();
+			}
 			crate::valgrind::request(crate::valgrind::ZERO_STATS, 0);
 			crate::valgrind::request(crate::valgrind::START_INSTRUMENTATION, 0);
 			#[cfg(target_os = "linux")]
-			if let Some(perf) = &self.perf {
-				perf.start();
+			if let Some(counters) = &self.counters {
+				counters.start();
 			}
 		}
 
@@ -296,11 +394,76 @@ pub mod __private {
 		#[inline(always)]
 		pub fn stop(&self) {
 			#[cfg(target_os = "linux")]
-			if let Some(perf) = &self.perf {
-				perf.stop();
+			if let Some(counters) = &self.counters {
+				counters.stop();
 			}
 			crate::valgrind::request(crate::valgrind::STOP_INSTRUMENTATION, 0);
 			crate::valgrind::request(crate::valgrind::DUMP_STATS_AT, self.name.as_ptr() as usize);
+			if let Some(watch) = &self.watch {
+				watch.borrow_mut().after();
+			}
+		}
+
+		/// What the meter saw over every call, once they have run.
+		pub(crate) fn finish(self) -> Result<Watched, String> {
+			let Some(watch) = self.watch else {
+				return Ok(Watched {
+					threaded: false,
+					usage: None,
+					counted: None,
+				});
+			};
+			let watch = watch.into_inner();
+			if let Some(err) = watch.error {
+				return Err(err);
+			}
+			#[cfg(all(unix, target_pointer_width = "64"))]
+			let usage = watch.usage.map(|(_, used)| used.fields());
+			#[cfg(not(all(unix, target_pointer_width = "64")))]
+			let usage = None;
+			#[cfg(target_os = "linux")]
+			let counted = self.counters.map(|counters| counters.read()).transpose()?;
+			#[cfg(not(target_os = "linux"))]
+			let counted = self.counters.map(|counters| match counters {});
+			Ok(Watched {
+				threaded: watch.threaded,
+				usage,
+				counted,
+			})
+		}
+	}
+
+	impl Watching {
+		/// Before a call: whether another thread is there already, and what was used so far.
+		fn before(&mut self) {
+			self.look();
+			self.started = crate::started();
+			#[cfg(all(unix, target_pointer_width = "64"))]
+			if let Some((start, _)) = &mut self.usage {
+				*start = crate::rusage::Usage::now();
+			}
+		}
+
+		/// After a call: what it used, and whether another thread is there, or was started and is gone.
+		fn after(&mut self) {
+			#[cfg(all(unix, target_pointer_width = "64"))]
+			if let Some((start, used)) = &mut self.usage {
+				crate::rusage::Usage::now().add_since(*start, used);
+			}
+			self.look();
+			if crate::started() != self.started {
+				self.threaded = true;
+			}
+		}
+
+		/// Notes whether the process has a thread besides the one calling the benchmark.
+		fn look(&mut self) {
+			match crate::threads() {
+				Ok(threads) => self.threaded |= threads > 1,
+				Err(err) => {
+					self.error.get_or_insert(err);
+				}
+			}
 		}
 	}
 
@@ -320,12 +483,24 @@ pub mod __private {
 	}
 
 	impl<I, O, M: FnMut() -> I, F: FnMut(I) -> O> Sampler for Fresh<M, F> {
-		fn count(&mut self, meter: &Meter) {
-			let input = (self.make)();
-			meter.start();
-			let output = black_box((self.call)(input));
-			meter.stop();
-			drop(output);
+		fn count(&mut self, meter: &Meter, iterations: u64) {
+			if iterations > 1 && !self.setup && !std::mem::needs_drop::<I>() && !std::mem::needs_drop::<O>() {
+				// As a sample times them: one count around every call.
+				let mut inputs: Vec<I> = (0..iterations).map(|_| (self.make)()).collect();
+				meter.start();
+				for input in inputs.drain(..) {
+					black_box((self.call)(input));
+				}
+				meter.stop();
+				return;
+			}
+			for _ in 0..iterations {
+				let input = (self.make)();
+				meter.start();
+				let output = black_box((self.call)(input));
+				meter.stop();
+				drop(output);
+			}
 		}
 
 		fn time(&mut self, iterations: u64) -> u64 {
@@ -369,16 +544,26 @@ pub mod __private {
 	type Step<I> = Box<dyn FnMut(&mut I)>;
 
 	impl<I, O, F: FnMut(&mut I) -> O> Sampler for Kept<I, F> {
-		fn count(&mut self, meter: &Meter) {
-			if let Some(before) = &mut self.before {
-				before(&mut self.input);
+		fn count(&mut self, meter: &Meter, iterations: u64) {
+			if iterations > 1 && self.before.is_none() && self.after.is_none() && !std::mem::needs_drop::<O>() {
+				meter.start();
+				for _ in 0..iterations {
+					black_box((self.call)(&mut self.input));
+				}
+				meter.stop();
+				return;
 			}
-			meter.start();
-			let output = black_box((self.call)(&mut self.input));
-			meter.stop();
-			drop(output);
-			if let Some(after) = &mut self.after {
-				after(&mut self.input);
+			for _ in 0..iterations {
+				if let Some(before) = &mut self.before {
+					before(&mut self.input);
+				}
+				meter.start();
+				let output = black_box((self.call)(&mut self.input));
+				meter.stop();
+				drop(output);
+				if let Some(after) = &mut self.after {
+					after(&mut self.input);
+				}
 			}
 		}
 
@@ -418,10 +603,10 @@ pub mod __private {
 	}
 
 	impl<I, M: FnMut() -> I, F: FnMut(I, Iterations) -> Duration> Sampler for FreshTimed<M, F> {
-		fn count(&mut self, meter: &Meter) {
+		fn count(&mut self, meter: &Meter, iterations: u64) {
 			let input = (self.make)();
 			meter.start();
-			black_box((self.call)(input, Iterations(1)));
+			black_box((self.call)(input, Iterations(iterations)));
 			meter.stop();
 		}
 
@@ -439,9 +624,9 @@ pub mod __private {
 	}
 
 	impl<I, F: FnMut(&mut I, Iterations) -> Duration> Sampler for KeptTimed<I, F> {
-		fn count(&mut self, meter: &Meter) {
+		fn count(&mut self, meter: &Meter, iterations: u64) {
 			meter.start();
-			black_box((self.call)(&mut self.input, Iterations(1)));
+			black_box((self.call)(&mut self.input, Iterations(iterations)));
 			meter.stop();
 		}
 
@@ -665,7 +850,7 @@ mod tests {
 
 	#[test]
 	fn a_name_with_a_nul_is_refused() {
-		assert!(Meter::new("a\0b", None).is_err());
+		assert!(Meter::new("a\0b", None, false).is_err());
 	}
 
 	#[test]
@@ -704,7 +889,7 @@ mod tests {
 		sampler.time(2);
 		assert_eq!(*log.borrow(), ["make", "call", "drop", "make", "call", "drop"]);
 		log.borrow_mut().clear();
-		sampler.count(&Meter::new("a", None).unwrap());
+		sampler.count(&Meter::new("a", None, false).unwrap(), 1);
 		assert_eq!(*log.borrow(), ["make", "call", "drop"]);
 
 		// With nothing to drop, setup still runs just before each call, since it may reset what
@@ -748,8 +933,11 @@ mod tests {
 		let each = ["before", "call", "drop", "after"];
 		assert_eq!(*log.borrow(), [each, each].concat());
 		log.borrow_mut().clear();
-		sampler.count(&Meter::new("a", None).unwrap());
+		sampler.count(&Meter::new("a", None, false).unwrap(), 1);
 		assert_eq!(*log.borrow(), each);
+		log.borrow_mut().clear();
+		sampler.count(&Meter::new("a", None, false).unwrap(), 2);
+		assert_eq!(*log.borrow(), [each, each].concat());
 
 		// Without steps, every output still drops before the next call, so a guard it holds never
 		// blocks the next.
@@ -789,10 +977,17 @@ mod tests {
 			Duration::from_nanos(10 * iterations.get())
 		});
 		serve(sampler, "1\n4\n".as_bytes(), &mut out).unwrap();
-		assert_eq!(
-			String::from_utf8(out).unwrap(),
-			"\nswole sample 10\n\nswole sample 40\n"
-		);
+		let out = String::from_utf8(out).unwrap();
+		let lines: Vec<&str> = out.lines().filter(|line| !line.is_empty()).collect();
+		assert_eq!(lines.len(), 4, "{out}");
+		assert_eq!([lines[1], lines[3]], ["swole sample 10", "swole sample 40"]);
+		// What the process used over each sample comes first, so an older swole reads it as the
+		// benchmark's own output.
+		for usage in [lines[0], lines[2]] {
+			let fields = usage.strip_prefix(RUSAGE).unwrap().split(' ');
+			let fields: Vec<u64> = fields.map(|n| n.parse().unwrap()).collect();
+			assert_eq!(fields.len(), 7, "{usage}");
+		}
 		for bad in ["0\n", "x\n", " 1\n"] {
 			let err = serve(nothing(), bad.as_bytes(), Vec::new()).unwrap_err();
 			assert!(err.contains("cannot sample"), "{bad:?}: {err}");

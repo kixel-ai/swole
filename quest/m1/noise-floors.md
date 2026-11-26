@@ -14,7 +14,3 @@ Recommendations for the implementer:
 
 - Provide a self-calibration command (e.g. `swole calibrate` or periodic A/A runs stored by host fingerprint) that runs each benchmark against itself across repeat pairs/runs and stores robust spread estimates (MAD / 95th percentile A/A delta) per benchmark and metric.
 - In `compare` tables and `metrics.json`, annotate each change with whether it exceeds the benchmark's host noise floor (e.g. `4.2× noise`), treating a metric as zero-noise (flagged on any non-zero move) only for a benchmark whose A/A runs reproduced it exactly, such as a single-threaded `sim` `Ir` or allocation count with fixed inputs; a benchmark whose A/A runs vary, such as one with random input, uses its measured floor like every other metric.
-
-## Required
-
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - measures per-metric spread across the unified modes

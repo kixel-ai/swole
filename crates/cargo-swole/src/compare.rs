@@ -1,18 +1,20 @@
 //! A base commit's counts against the working tree's, on this host, from one directory.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::cargo::Members;
 use crate::fingerprint::Fnv;
-use crate::{Counts, Options, measure, missing};
+use crate::{Counter, Counts, Mode, Options, measure, metrics, missing};
 
-/// Counts `base`, then a snapshot of the working tree, both in one worktree of their own, and
-/// prints each change. One directory counts both, so a path a build compiles in, such as a
-/// panic's location, is the same on both sides and moves neither count.
-pub fn compare(base: &str, options: &Options) -> Result<(), String> {
+/// Counts `base`, then a snapshot of the working tree, both in one worktree of their own, as
+/// `mode`, quick or sim, counts, and prints each change. One directory counts both, so a path a
+/// build compiles in, such as a panic's location, is the same on both sides and moves neither count.
+pub fn compare(base: &str, options: &Options, mode: Mode) -> Result<(), String> {
+	// Probed before anything builds, so a host that cannot count fails first.
+	let counter = Counter::new(mode)?;
 	let top = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?);
 	// Where the run is within the repository, so both sides run from the same place in the worktree.
 	let prefix = git(Path::new("."), &["rev-parse", "--show-prefix"])?;
@@ -46,7 +48,7 @@ pub fn compare(base: &str, options: &Options) -> Result<(), String> {
 	);
 	let picked = pick(&dir, &both, &args, base)?;
 	// A wanted benchmark may be new at the head or gone from it, but must be on one side.
-	let before = count(&dir, &both, &picked, base)?;
+	let before = count(&dir, &both, &counter, &picked, base)?;
 	checkout(&top, &tree, &head)?;
 	eprintln!(
 		"swole: counting the working tree ({}) in {}",
@@ -55,7 +57,7 @@ pub fn compare(base: &str, options: &Options) -> Result<(), String> {
 	);
 	let head_picked = pick(&dir, &both, &args, "the working tree")?;
 	neither(base, &picked, &head_picked)?;
-	let after = count(&dir, &both, &head_picked, "the working tree")?;
+	let after = count(&dir, &both, &counter, &head_picked, "the working tree")?;
 	drop(lock);
 	if let Some(wanted) = &options.benchmarks {
 		missing(wanted, |name| {
@@ -66,8 +68,14 @@ pub fn compare(base: &str, options: &Options) -> Result<(), String> {
 		return Err("no benchmark ran".to_owned());
 	}
 	print!("{}", table(&before, &after)?);
-	let threaded: BTreeSet<String> = before.threaded.union(&after.threaded).cloned().collect();
-	print!("{}", crate::threaded(&threaded));
+	let mut threaded = Counts::none(&counter);
+	threaded.threaded = before.threaded.union(&after.threaded).cloned().collect();
+	print!("{}", crate::threaded(&threaded, mode));
+	print!("{}", metrics::details(Some(&before.details), &after.details));
+	if let Some(report) = &options.report {
+		metrics::report(&after, Some(&before), &counter, Some(&sha)).write(report)?;
+		eprintln!("swole: wrote {}", report.display());
+	}
 	Ok(())
 }
 
@@ -428,20 +436,22 @@ fn none(args: &[Arg], side: &str, absent: String) -> Result<Selection, String> {
 	Ok(Selection { args: None, lacks })
 }
 
-/// Counts the side checked out under `dir`, which the log calls `side`, building what `selection` picked.
-fn count(dir: &Path, options: &Options, selection: &Selection, side: &str) -> Result<Counts, String> {
+/// Counts the side checked out under `dir`, which the log calls `side`, with `counter`, building
+/// what `selection` picked.
+fn count(
+	dir: &Path,
+	options: &Options,
+	counter: &Counter,
+	selection: &Selection,
+	side: &str,
+) -> Result<Counts, String> {
 	let Some(args) = &selection.args else {
 		eprintln!("swole: {side} has nothing the cargo args select, so counts none");
-		return Ok(Counts {
-			// Labeled as `measure` labels the other side's, so the two compare.
-			fingerprint: crate::counter(options)?.1,
-			counts: BTreeMap::new(),
-			threaded: BTreeSet::new(),
-		});
+		return Ok(Counts::none(counter));
 	};
 	let mut options = options.clone();
 	options.cargo = args.clone();
-	measure(dir, &options, false)
+	measure(dir, &options, counter, false)
 }
 
 /// The working tree of the repository at `top` as a commit: `HEAD` when nothing differs from
@@ -649,7 +659,8 @@ fn output(args: &[&str], out: std::process::Output) -> Result<String, String> {
 }
 
 /// The change of each benchmark from `before` to `after`, a Markdown table, refusing counts
-/// from two environments, which do not compare.
+/// from two environments, which do not compare. A count of several samples shows their least and
+/// most beside their median.
 fn table(before: &Counts, after: &Counts) -> Result<String, String> {
 	if before.fingerprint != after.fingerprint {
 		return Err(format!(
@@ -659,7 +670,11 @@ fn table(before: &Counts, after: &Counts) -> Result<String, String> {
 	}
 	let names: BTreeSet<&String> = before.counts.keys().chain(after.counts.keys()).collect();
 	let mut out = String::from("| benchmark | base | head | change |\n|---|---:|---:|---:|\n");
-	let cell = |counts: &BTreeMap<String, u64>, name: &str| counts.get(name).map_or("-".to_owned(), u64::to_string);
+	let cell = |counts: &Counts, name: &str| match (counts.counts.get(name), counts.spread.get(name)) {
+		(Some(count), Some((least, most))) => format!("{count} ({least} to {most})"),
+		(Some(count), None) => count.to_string(),
+		(None, _) => "-".to_owned(),
+	};
 	for name in names {
 		let change = match (before.counts.get(name), after.counts.get(name)) {
 			(Some(&b), Some(&a)) => format!("{:+.2}%", (a as f64 - b as f64) / b as f64 * 100.0),
@@ -672,8 +687,8 @@ fn table(before: &Counts, after: &Counts) -> Result<String, String> {
 		writeln!(
 			out,
 			"| {shown} | {} | {} | {change} |",
-			cell(&before.counts, name),
-			cell(&after.counts, name)
+			cell(before, name),
+			cell(after, name)
 		)
 		.expect("a String takes every write");
 	}
@@ -682,6 +697,8 @@ fn table(before: &Counts, after: &Counts) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+	use std::collections::BTreeMap;
+
 	use super::*;
 
 	#[test]
@@ -759,18 +776,21 @@ mod tests {
 		Counts {
 			fingerprint: fingerprint.to_owned(),
 			counts: names.iter().map(|(name, ir)| ((*name).to_owned(), *ir)).collect(),
+			spread: BTreeMap::new(),
 			threaded: BTreeSet::new(),
+			details: BTreeMap::new(),
 		}
 	}
 
 	#[test]
 	fn tables_each_change_and_each_benchmark_one_side_has() {
 		let before = counts("f", &[("a", 200), ("gone", 5)]);
-		let after = counts("f", &[("a", 150), ("new", 7)]);
+		let mut after = counts("f", &[("a", 150), ("new", 7)]);
+		after.spread.insert("a".to_owned(), (140, 160));
 		assert_eq!(
 			table(&before, &after).unwrap(),
 			"| benchmark | base | head | change |\n|---|---:|---:|---:|\n\
-			 | a | 200 | 150 | -25.00% |\n| gone | 5 | - | removed |\n| new | - | 7 | added |\n"
+			 | a | 200 | 150 (140 to 160) | -25.00% |\n| gone | 5 | - | removed |\n| new | - | 7 | added |\n"
 		);
 	}
 

@@ -21,10 +21,6 @@ Recommendations for the implementer:
   - Use AMD IBS (`ibs_op`) or Intel PEBS / `cycles:pp` sampling into a perf ring buffer during a dedicated attribution pass, resolve instruction pointers against the benchmark ELF + loaded DSOs (symbol table + DWARF/symtab), and print per-function native diffs in `swole bench <base>` just as [Callgrind attribution](/quest/m0/callgrind-attribution.md) does for `sim`.
 - Verify each tier on a real Linux host (`fedora` / `nixos`, AMD Zen 5 with `amd_l3`, `amd_df`, `amd_umc_*`, `ibs_op`, `power`, `tracepoint`): a memory-streaming benchmark moves DRAM bandwidth and energy; a mutex-contended benchmark moves futex/off-CPU wait time; a regression in one helper function shows up in IBS/PEBS attribution.
 
-## Required
-
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - builds on the setup capability probe and multi-pass perf collector
-
 ## Hosts
 
 - linux - L0/L-1 perf PMUs, uncore, RAPL, tracepoints, and IBS/PEBS

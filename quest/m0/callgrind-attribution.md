@@ -16,7 +16,3 @@ Recommendations for the implementer:
 - Diff per-function self and inclusive deltas between `<base>` and head for each benchmark that moved, ranking the largest contributors to the net delta and attributing added/removed functions cleanly.
 - Keep output concise and readable in Markdown: show the top 3–5 functions explaining the majority of each changed benchmark's delta, omitting unchanged benchmarks.
 - Verify with unit tests on synthetic multi-function Callgrind profiles (compressed IDs, inlined/called frames, added/removed symbols) and an end-to-end integration test comparing two commits where one helper function does extra work and confirming the compare output names that exact function.
-
-## Required
-
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - hooks into `swole sim <base>` reporting

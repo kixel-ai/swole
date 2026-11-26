@@ -59,8 +59,10 @@ fn times(sample: &Value, measure: &str) -> Vec<(String, f64)> {
 fn times_each_harness_benchmark() {
 	let dir = scratch("time-alone");
 	let out = Command::new(env!("CARGO_BIN_EXE_swole"))
-		.args(["time", "--out"])
+		.args(["bench", "--out"])
 		.arg(dir.join("metrics.json"))
+		.arg("--report")
+		.arg(dir.join("report.json"))
 		.args(["--", "-p", "swole", "--bench", "fixture"])
 		.current_dir(env!("CARGO_MANIFEST_DIR"))
 		// The target directory the count tests build the fixture in, apart from this test's own.
@@ -104,7 +106,43 @@ fn times_each_harness_benchmark() {
 	assert!(time("unstable[8000]") > 2.0 * time("unstable[1000]"), "{times:?}");
 	let table = String::from_utf8(out.stdout).unwrap();
 	assert!(table.starts_with("| benchmark | time |\n"), "{table}");
-	assert_eq!(table.lines().count(), 2 + names.len(), "{table}");
+	assert_eq!(
+		table.lines().take_while(|line| !line.is_empty()).count(),
+		2 + names.len(),
+		"{table}"
+	);
+	// Beside each time, what the process used over its samples on any host, and where the host
+	// has perf counters, each one's share of a call.
+	let report: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("report.json")).unwrap()).unwrap();
+	assert_eq!(report["mode"], "bench");
+	assert!(measure.contains(report["fingerprint"].as_str().unwrap()), "{measure}");
+	let head = |name: &str| report["benchmarks"][format!("{file}{name}")]["head"].clone();
+	for name in &names {
+		let head = head(name);
+		assert_eq!(head["time"]["unit"], "ns", "{name}: {head}");
+		assert!(head["max RSS"]["value"].as_f64().unwrap() > 0.0, "{name}: {head}");
+		assert!(head["user time"].is_object(), "{name}: {head}");
+	}
+	let host: Vec<&str> = report["host"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.map(|line| line.as_str().unwrap())
+		.collect();
+	if host.iter().any(|line| line.starts_with("perf: tier")) {
+		// A call of `alone` spins a thousand times, some four thousand instructions, as Valgrind
+		// counts it, and as many calls of a counter pass share them.
+		let instructions = head("alone")["instructions:u"]["value"].as_f64().unwrap();
+		assert!((3600.0..4400.0).contains(&instructions), "{instructions}");
+		let unstable = head("unstable[8000]")["instructions:u"]["value"].as_f64().unwrap();
+		assert!(
+			(7.5..8.5).contains(&(unstable / instructions)),
+			"{unstable} {instructions}"
+		);
+		assert!(head("alone")["IPC:u"]["value"].as_f64().unwrap() > 0.0);
+	} else {
+		assert!(head("alone").get("instructions:u").is_none());
+	}
 }
 
 /// A benchmark target spinning `work` times in `work`, a thousand in `same`, and with `extra`,
@@ -172,7 +210,7 @@ fn pairs_a_base_commit_with_the_working_tree() {
 	std::fs::write(repo.join("benches/spin.rs"), spins(2000, "new")).unwrap();
 
 	let out = Command::new(env!("CARGO_BIN_EXE_swole"))
-		.args(["time", "HEAD", "--out", "metrics.json"])
+		.args(["bench", "HEAD", "--out", "metrics.json"])
 		.current_dir(&repo)
 		// The base's worktree, outside the scratch repository, and one target directory both
 		// sides share, so the harness builds once.
@@ -287,7 +325,7 @@ fn times_a_selection_only_one_side_has() {
 	package(&repo, "b", "y");
 	let time = |cargo: &[&str]| {
 		Command::new(env!("CARGO_BIN_EXE_swole"))
-			.args(["time", "HEAD", "--"])
+			.args(["bench", "HEAD", "--"])
 			.args(cargo)
 			.current_dir(&repo)
 			.env("XDG_CACHE_HOME", dir.join("cache"))
@@ -302,7 +340,9 @@ fn times_a_selection_only_one_side_has() {
 	assert!(out.status.success(), "{err}");
 	assert!(err.contains("HEAD has no -p b"), "{err}");
 	assert!(err.contains("HEAD has no --bench y"), "{err}");
-	let table = String::from_utf8(out.stdout).unwrap();
+	let stdout = String::from_utf8(out.stdout).unwrap();
+	// The times' table, before what else each benchmark measured.
+	let table = stdout.split("\n\n").next().unwrap();
 	// Each package's three benchmarks, `b`'s only at the head.
 	assert_eq!(table.lines().count(), 2 + 6, "{table}");
 	for row in table.lines().skip(2) {
@@ -321,7 +361,8 @@ fn times_a_selection_only_one_side_has() {
 		err.contains("HEAD has nothing the cargo args select, so times none"),
 		"{err}"
 	);
-	let table = String::from_utf8(out.stdout).unwrap();
+	let stdout = String::from_utf8(out.stdout).unwrap();
+	let table = stdout.split("\n\n").next().unwrap();
 	assert_eq!(table.matches("| added |").count(), 3, "{table}");
 	assert_eq!(table.lines().count(), 2 + 3, "{table}");
 
