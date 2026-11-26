@@ -9,6 +9,7 @@
 Decided 2026-11-26 (maintainer, on [kixel-ai/swole#5](https://github.com/kixel-ai/swole/pull/5)):
 
 - ✅ Count a threaded benchmark through inherited counters, started and stopped with `prctl(PR_TASK_PERF_EVENTS_ENABLE/DISABLE)` and read with `read()`, chosen per benchmark at setup from the preload's thread detection, and labeled statistical like time (rejected: per-CPU counters on CPUs the calling thread avoids; building it in #5).
+- ✅ Keep this quest as a follow-up of #5 (maintainer, 2026-11-26, [on the PR](https://github.com/kixel-ai/swole/pull/5#issuecomment-7202958517)).
 
 Recommendations for the implementer:
 

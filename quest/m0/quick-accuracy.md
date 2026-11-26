@@ -8,6 +8,8 @@
 
 Decided 2026-11-26 (maintainer, on [kixel-ai/swole#5](https://github.com/kixel-ai/swole/pull/5)): keep `quick` as the spot-check, documented as exact for calls far shorter than the tick, where an interrupt is unlikely, with `sim` the mode that repeats exactly, and make it more accurate here.
 
+- ✅ Keep this quest as a follow-up of #5 (maintainer, 2026-11-26, [on the PR](https://github.com/kixel-ai/swole/pull/5#issuecomment-7202958517)).
+
 Ideas, in the order to try them:
 
 - Subtract counted interrupts (recommended first): open an event counting the interrupts the calling thread takes, such as Intel's `HW_INTERRUPTS.RECEIVED` or AMD's `ls_int_taken`, in the same group as `instructions:u`, and subtract it from `instructions:u` and `branches:u`.

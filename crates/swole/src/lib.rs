@@ -159,14 +159,18 @@ fn run() -> Result<(), String> {
 		let watch = meter.finish().map_err(|err| format!("{name}: {err}"))?;
 		// The records start on a fresh line, as a benchmark's own output may not have ended one,
 		// so a record never runs into it; the rest follow the first, all under one lock, so a
-		// thread the benchmark left printing cannot write between them.
-		let mut out = std::io::stdout().lock();
-		let mut fresh = false;
+		// thread the benchmark left printing cannot write between them. The lock is taken only
+		// once there is a record, so a quiet run that writes none never waits on it.
+		let mut out = None;
 		let mut record = |line: std::fmt::Arguments| -> Result<(), String> {
-			if !fresh {
-				writeln!(out).map_err(|e| format!("cannot write to stdout: {e}"))?;
-				fresh = true;
-			}
+			let out = match &mut out {
+				Some(out) => out,
+				None => {
+					let mut lock = std::io::stdout().lock();
+					writeln!(lock).map_err(|e| format!("cannot write to stdout: {e}"))?;
+					out.insert(lock)
+				}
+			};
 			writeln!(out, "{line}").map_err(|e| format!("cannot write to stdout: {e}"))
 		};
 		match watch.threaded {
