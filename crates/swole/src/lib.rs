@@ -174,6 +174,14 @@ fn run() -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn open((hardware, software): (usize, usize)) -> Result<Counters, String> {
 	perf::preloaded()?;
+	// The counters see the calling thread alone, so swole must learn of every other thread a
+	// call starts, even one gone by its end, which only the preload's count tells.
+	if perf::started().is_none() {
+		return Err(format!(
+			"{COUNTERS} counts only under swole's preload, whose thread count tells whether another thread ran beside \
+			 a call"
+		));
+	}
 	Counters::inherited(hardware, software)
 }
 
@@ -446,13 +454,6 @@ pub mod __private {
 			let watch = watch.into_inner();
 			if let Some(err) = watch.error {
 				return Err(err);
-			}
-			if watch.threaded && self.counters.is_some() {
-				return Err(
-					"another thread ran beside a counted call, whose work perf counters read in user space cannot see: \
-					 quick and bench count the calling thread alone, and sim counts every thread"
-						.to_owned(),
-				);
 			}
 			#[cfg(all(unix, target_pointer_width = "64"))]
 			let usage = watch.usage.map(|(_, used)| used.fields());

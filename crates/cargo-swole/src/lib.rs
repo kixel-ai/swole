@@ -886,7 +886,11 @@ type Measured = Result<Vec<Found>, String>;
 
 /// The whole environment `command` launches with, spelled out so its size is known exactly:
 /// the library at `preload` first in `LD_PRELOAD`, and padded, so it starts at the same place.
-fn environment(command: &Command, preload: &Path, label: &str) -> Result<BTreeMap<OsString, OsString>, String> {
+pub(crate) fn environment(
+	command: &Command,
+	preload: &Path,
+	label: &str,
+) -> Result<BTreeMap<OsString, OsString>, String> {
 	let mut env: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
 	for (key, value) in command.get_envs() {
 		match value {
@@ -965,6 +969,13 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 		}
 	}
 	let first = first.expect("a host that counts has a pass");
+	if first.threaded {
+		return Err(format!(
+			"{}: another thread ran beside a counted call, whose work quick's perf counters, read in user space for \
+			 the calling thread alone, cannot see: count it with sim",
+			first.name
+		));
+	}
 	let mut details = perf::measures(passes, &values, 1);
 	let count = details
 		.iter()

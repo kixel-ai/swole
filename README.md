@@ -250,8 +250,8 @@ stop counting stay out of a count, which holds the call and the reads' own few d
 the same for every call. A counter that did not run the whole time it was enabled fails the run
 rather than be scaled up: another user of the host's counters multiplexed it, or the thread left
 the PMU's cores. The kernel maps no page for a counter a process's threads inherit, so a benchmark
-beside which the process had another thread fails `quick` and `bench`, naming it: `sim` counts
-every thread. Run under Valgrind, the same benchmark counts within those few dozen instructions.
+beside which the process had another thread fails `quick`, naming it, since `sim` counts every
+thread, and keeps only its time in `bench`. Run under Valgrind, the same benchmark counts within those few dozen instructions.
 
 ## Capabilities
 
@@ -367,8 +367,10 @@ involuntary context switches, each a call's share, and the process's peak reside
 Each covers a sample's whole, steps and inputs built between calls included, which the clock
 leaves out. Where the host has perf counters, it then counts each side's benchmark with every
 counter the [probe](#capabilities) found, one process for each pass, each calling the
-benchmark as many times as a sample did, a counter's share of a call. Those processes run as a
-time's do, neither preloaded nor padded, but pinned to the PMU's CPUs. A table after the times
+benchmark as many times as a sample did, a counter's share of a call. Those processes run
+pinned to the PMU's CPUs, and under the preload, whose thread count tells whether another
+thread ran beside a call: such a benchmark keeps its time but has no counters, which read the
+calling thread alone, and a note under the table names it. A table after the times
 prints every measure of each benchmark, beside the base's and its change when paired, and
 `--report` writes them all. A side whose harness predates counters, as a base from before an
 upgrade, says so and has none; one whose harness predates rusage has none of that.

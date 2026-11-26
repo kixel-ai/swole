@@ -8,7 +8,9 @@
 
 use std::cell::Cell;
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(target_arch = "x86_64")]
+use std::os::fd::AsRawFd;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::atomic::{Ordering, compiler_fence};
 
 /// The counters swole opened, in the order it opened them, which is the order of their
@@ -97,7 +99,7 @@ impl Counters {
 	#[inline(never)]
 	pub fn start(&self) {
 		prctl(PR_TASK_PERF_EVENTS_ENABLE);
-		let Some(last) = self.slots.last() else {
+		let Some(first) = self.slots.first() else {
 			return;
 		};
 		loop {
@@ -115,8 +117,9 @@ impl Counters {
 			}
 			compiler_fence(Ordering::SeqCst);
 			// The kernel rewrites every page at once, as it moves the thread's counters on or off a
-			// CPU, so one page unchanged since its read means none changed; `stop` checks each.
-			if last.page.lock() == last.snap.get().lock {
+			// CPU, so the first page read, unchanged since, means no page changed after its read;
+			// `stop` checks each.
+			if first.page.lock() == first.snap.get().lock {
 				return;
 			}
 		}
@@ -401,6 +404,7 @@ unsafe extern "C" {
 	fn dlopen(name: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
 	fn dlclose(handle: *mut std::ffi::c_void) -> i32;
 	fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+	#[cfg(target_arch = "x86_64")]
 	fn mmap(
 		addr: *mut std::ffi::c_void,
 		len: usize,

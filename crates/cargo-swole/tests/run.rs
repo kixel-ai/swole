@@ -404,23 +404,25 @@ fn single_threaded(dir: &Path) -> PathBuf {
 /// run fails, saying so.
 #[test]
 fn counts_with_perf_counters_what_valgrind_does() {
-	let out = harness(&["quick"]);
-	let err = String::from_utf8_lossy(&out.stderr);
-	if err.contains("quick counts with perf counters, and") {
-		assert!(!out.status.success());
-		return;
-	}
-	assert!(!out.status.success(), "{err}");
+	let dir = scratch("quick-single");
 	let file = "crates/swole/benches/fixture.rs::";
+	// Each alone, since a host with one PMU CPU runs one job at a time and stops at a failure.
 	for name in THREADED {
+		let list = dir.join("threaded");
+		std::fs::write(&list, format!("{file}{name}\n")).unwrap();
+		let out = harness(&["quick", "--benchmarks", list.to_str().unwrap()]);
+		let err = String::from_utf8_lossy(&out.stderr);
+		assert!(!out.status.success(), "{err}");
+		if err.contains("quick counts with perf counters, and") {
+			return;
+		}
 		assert!(
-			err.contains(&format!(
-				"{file}{name}: another thread ran beside a counted call, whose work perf counters read in user space cannot see"
-			)),
+			err.contains(&format!("{file}{name}: another thread ran beside a counted call"))
+				&& err.contains("count it with sim"),
 			"{name}: {err}"
 		);
 	}
-	let list = single_threaded(&scratch("quick-single"));
+	let list = single_threaded(&dir);
 	let list = list.to_str().unwrap();
 	let out = harness(&["quick", "--benchmarks", list]);
 	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));

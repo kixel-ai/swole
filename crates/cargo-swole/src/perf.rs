@@ -894,6 +894,7 @@ mod sys {
 		pub fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
 		pub fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
 		pub fn personality(persona: u64) -> i32;
+		#[cfg(target_arch = "x86_64")]
 		pub fn mmap(
 			addr: *mut std::ffi::c_void,
 			len: usize,
@@ -902,6 +903,7 @@ mod sys {
 			fd: i32,
 			offset: i64,
 		) -> *mut std::ffi::c_void;
+		#[cfg(target_arch = "x86_64")]
 		pub fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
 	}
 }
