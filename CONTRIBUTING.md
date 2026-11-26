@@ -13,9 +13,9 @@ Have at least these sections:
 - **Approach**: a summary of the approach taken to solve the problem.
 - **Impact**: a bullet point for every public API change, including the harness's attribute, the command line, `metrics.json`, and what changes a count's fingerprint.
 - **Alternatives**: any alternative approaches considered.
-- **Follow-ups**: the quests it adds.
+- **Follow-ups**: the quests it adds, and work for another repository's quest tree, named with that repository.
 
 # Landing
 
-A PR lands once CI's `check` job and its local `quest review` rounds pass; queue the reviewed head with `quest merge --squash <pr>`.
+A PR lands once CI's `check` job and its local `quest review` rounds pass; queue the reviewed head with `quest merge --squash --land <reviewed head's full SHA> <pr>`.
 The admin bypass of `main`'s rulesets is for emergencies.
