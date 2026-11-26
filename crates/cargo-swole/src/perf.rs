@@ -630,6 +630,18 @@ pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 			});
 		}
 	}
+	// A threaded case's harness reads no counters, which swole would discard, and says only that
+	// it was threaded.
+	for (name, &threaded) in &threads {
+		if threaded && !readings.iter().any(|reading| reading.name == *name) {
+			readings.push(Reading {
+				name: name.clone(),
+				values: Vec::new(),
+				usage: None,
+				threaded,
+			});
+		}
+	}
 	Ok(readings)
 }
 
@@ -1143,6 +1155,16 @@ mod tests {
 					threaded: true
 				}
 			]
+		);
+		// A threaded case's harness reads no counters, and says it was threaded.
+		assert_eq!(
+			readings("\nswole threaded a.rs::h\nswole ran a.rs::h\n", 2).unwrap(),
+			[Reading {
+				name: "a.rs::h".to_owned(),
+				values: Vec::new(),
+				usage: None,
+				threaded: true
+			}]
 		);
 		// A thread record a fragment without a newline swallowed is no record.
 		assert!(readings("own outputswole threaded a.rs::f\nswole counted 1 2 a.rs::f\n", 2).is_err());

@@ -146,6 +146,9 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	let mut details: [BTreeMap<String, Vec<Measure>>; 2] = Default::default();
 	// The benchmarks beside which another thread ran, on either side, which have no counters.
 	let mut threaded = std::collections::BTreeSet::new();
+	// Whether another thread ran beside each benchmark, where every side was watched or one
+	// was seen threaded.
+	let mut seen = BTreeMap::new();
 	let total = names.len();
 	for (index, name) in names.into_iter().enumerate() {
 		let started = Instant::now();
@@ -188,6 +191,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				)
 			}
 		};
+		let mut watched = true;
 		for (i, (side, job)) in [(Which::Base, &base), (Which::Head, &head)].into_iter().enumerate() {
 			let Some(job) = job else { continue };
 			let mut measures = match (perf, &preload) {
@@ -197,8 +201,15 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 						threaded.insert(name.clone());
 						Vec::new()
 					}
+					Counted::Unwatched => {
+						watched = false;
+						Vec::new()
+					}
 				},
-				_ => Vec::new(),
+				_ => {
+					watched = false;
+					Vec::new()
+				}
 			};
 			if let Some((used, calls)) = &used[i] {
 				measures.extend(used.measures(*calls * iterations));
@@ -206,6 +217,11 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 			if !measures.is_empty() {
 				details[i].insert(name.clone(), measures);
 			}
+		}
+		if threaded.contains(&name) {
+			seen.insert(name.clone(), true);
+		} else if watched {
+			seen.insert(name.clone(), false);
 		}
 		eprintln!(
 			"swole: [{}/{total}] {name}: {}, {:.1}s",
@@ -235,15 +251,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 		eprintln!("swole: wrote {}", out.display());
 	}
 	if let Some(path) = &options.report {
-		report(
-			&times,
-			&details,
-			perf.map(|_| &threaded),
-			&host,
-			&native.describe(),
-			sha,
-		)
-		.write(path)?;
+		report(&times, &details, &seen, &host, &native.describe(), sha).write(path)?;
 		eprintln!("swole: wrote {}", path.display());
 	}
 	Ok(())
@@ -263,11 +271,13 @@ fn usage<'a>(samples: impl Iterator<Item = &'a Sample>) -> Option<(perf::Usage, 
 
 /// What counting a benchmark found.
 enum Counted {
-	/// Each counter's share of a call, or none when the job's harness is too old to count.
+	/// Each counter's share of a call.
 	Measures(Vec<Measure>),
 	/// Another thread ran beside a call, whose work the counters, reading the calling thread
 	/// alone, would leave out.
 	Threaded,
+	/// The job's harness is too old to count, or to say whether another thread ran.
+	Unwatched,
 }
 
 /// Counts `job`'s benchmark with each of `perf`'s passes, in a process of its own for each under
@@ -310,7 +320,7 @@ fn count(job: &Job, perf: &perf::Perf, preload: &Path, iterations: u64, dir: &Pa
 					"swole: {}'s swole harness is too old to count, so it has no counters",
 					job.label
 				);
-				return Ok(Counted::Measures(Vec::new()));
+				return Ok(Counted::Unwatched);
 			}
 			[reading] if reading.threaded => return Ok(Counted::Threaded),
 			[reading] => values.push(reading.values.clone()),
@@ -663,8 +673,8 @@ fn file(times: &BTreeMap<String, Times>, host: &str, base: Option<&str>) -> metr
 fn report(
 	times: &BTreeMap<String, Times>,
 	details: &[BTreeMap<String, Vec<Measure>>; 2],
-	// The benchmarks beside which other threads ran, when perf counters watched for them.
-	threaded: Option<&std::collections::BTreeSet<String>>,
+	// Whether another thread ran beside each benchmark, where that is known.
+	seen: &BTreeMap<String, bool>,
 	host: &str,
 	describe: &str,
 	base: Option<&str>,
@@ -678,8 +688,8 @@ fn report(
 			measures.extend(details[i].get(name).cloned().unwrap_or_default());
 			entry.insert(side.to_owned(), metrics::side(&measures));
 		}
-		if let Some(threaded) = threaded {
-			entry.insert("threaded".to_owned(), threaded.contains(name).into());
+		if let Some(&threaded) = seen.get(name) {
+			entry.insert("threaded".to_owned(), threaded.into());
 		}
 		if let Times::Both { ratio, .. } = timed {
 			entry.insert(

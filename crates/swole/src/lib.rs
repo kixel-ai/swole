@@ -264,15 +264,19 @@ fn serve(mut sampler: Box<dyn __private::Sampler>, commands: impl BufRead, mut o
 		#[cfg(all(unix, target_pointer_width = "64"))]
 		let start = rusage::Usage::now();
 		let nanos = sampler.time(iterations);
+		// What the process used goes before the sample's line, which an older swole waits for,
+		// reading what precedes it as the benchmark's own output.
 		#[cfg(all(unix, target_pointer_width = "64"))]
-		{
+		let used = {
 			let mut used = rusage::Usage::default();
 			rusage::Usage::now().add_since(start, &mut used);
-			// Before the sample's line, which an older swole waits for, reading what precedes
-			// it as the benchmark's own output.
-			write!(out, "\n{RUSAGE}{}", used.fields()).map_err(|e| format!("cannot write a sample: {e}"))?;
-		}
-		write!(out, "\n{SAMPLE}{nanos}\n")
+			format!("\n{RUSAGE}{}", used.fields())
+		};
+		#[cfg(not(all(unix, target_pointer_width = "64")))]
+		let used = "";
+		// One write, which takes stdout's lock once, so a thread the benchmark left printing
+		// cannot write between the records.
+		write!(out, "{used}\n{SAMPLE}{nanos}\n")
 			.and_then(|()| out.flush())
 			.map_err(|e| format!("cannot write a sample: {e}"))?;
 	}
@@ -481,8 +485,13 @@ pub mod __private {
 			let usage = watch.usage.map(|(_, used)| used.fields());
 			#[cfg(not(all(unix, target_pointer_width = "64")))]
 			let usage = None;
+			// A threaded case's counters missed the other threads, so swole discards them, and a
+			// failed read of them must not cost the case its times.
 			#[cfg(target_os = "linux")]
-			let counted = self.counters.map(|counters| counters.read()).transpose()?;
+			let counted = match watch.threaded {
+				true => None,
+				false => self.counters.map(|counters| counters.read()).transpose()?,
+			};
 			#[cfg(not(target_os = "linux"))]
 			let counted = self.counters.map(|counters| match counters {});
 			Ok(Watched {
