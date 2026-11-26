@@ -8,7 +8,7 @@ A measured spike determines whether a QEMU TCG plugin (`qemu-user` + `libcache` 
 
 Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
-- ✅ Plan as a deferred m3 research spike rather than blocking `swole sim`'s v1 on custom binary-instrumentation plugins (rejected: building a custom QEMU/DynamoRIO backend before shipping Valgrind `sim`; omitting the spike entirely). Valgrind Callgrind with `--cache-sim=yes --branch-sim=yes` is already pinned and working, at 50–100× native cost; this spike tests whether QEMU TCG or DynamoRIO beats it enough to justify maintaining a custom plugin and trigger mechanism.
+- ✅ Plan as a deferred m1 research spike rather than blocking `swole sim`'s v1 on custom binary-instrumentation plugins (rejected: building a custom QEMU/DynamoRIO backend before shipping Valgrind `sim`; omitting the spike entirely). Valgrind Callgrind with `--cache-sim=yes --branch-sim=yes`, which [simulated cycles](/quest/m0/sim-cycles.md) pins, runs at 50–100× native cost; this spike tests whether QEMU TCG or DynamoRIO beats it enough to justify maintaining a custom plugin and trigger mechanism.
 
 Recommendations for the implementer:
 

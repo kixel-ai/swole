@@ -10,11 +10,13 @@ Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
 - ✅ Include L0 uncore/RAPL and L-1 tracepoint/IBS-PEBS metrics in the `swole` epic. Our Linux hosts run with `perf_event_paranoid = -1` (or `CAP_PERFMON`), and `moq`'s async/contention and memory-bound benchmarks directly benefit from off-CPU wait time, lock contention, memory bandwidth, energy, and native per-function attribution.
 
+Decided 2026-11-26 (maintainer, `/quest-run`, [kixel-ai/swole#6](https://github.com/kixel-ai/swole/pull/6)): ✅ require exclusive-cores, take a host-enforced whole-socket lease for the uncore/RAPL pass, and report bandwidth, L3 misses, and energy as socket-wide, timing-like measurements that include device I/O and DMA (rejected: also fail the pass unless the host keeps device traffic out, which no host setting can guarantee; report socket-wide readings on shared hosts without a lease, which other agents' traffic would swamp; drop uncore/RAPL).
+
 Recommendations for the implementer:
 
-- **L0 uncore & energy** (active only when the host exposes L0 and the benchmark runs with exclusive/unshared measurement, since uncore and RAPL counters are socket/package-wide):
+- **L0 uncore & energy** (active only when the host exposes L0 and the pass holds a whole-socket lease through [exclusive cores](/quest/m0/exclusive-cores.md)' lease mechanism, since uncore and RAPL counters are socket/package-wide; a pass that cannot take a host-enforced lease fails the run rather than reporting socket-wide counts on a shared host):
   - Probe `/sys/bus/event_source/devices/` for `power` / `power_core` (RAPL `energy-pkg`, `energy-cores` with their `*.scale` and `*.unit` sysfs files) and uncore memory/L3 PMUs (`amd_l3`, `amd_df`, `amd_umc_*` on AMD; `uncore_imc_*` on Intel), failing loudly if a probed sysfs event cannot open.
-  - Report energy in joules (or microjoules) per iteration and memory bandwidth / L3 misses per benchmark.
+  - Report energy in joules (or microjoules) per iteration, and memory bandwidth / L3 misses as socket-wide counts for the pass. The lease excludes other CPU work but not device I/O and DMA, which reach the memory controllers and package power, so label all three as socket-wide measurements that include device traffic, timed like wall clock rather than trusted as exact counts.
 - **L-1 off-CPU & contention**:
   - Open `sched:sched_switch` and `syscalls:sys_enter_futex` / `sys_exit_futex` (or `sched:sched_stat_sleep` / `sched:sched_stat_blocked` when available) scoped to the benchmark's threads to separate on-CPU execution from blocked/contended time.
 - **L-1 native per-function attribution**:
@@ -23,6 +25,7 @@ Recommendations for the implementer:
 
 ## Required
 
+- [Exclusive pinned cores for bench mode](/quest/m0/exclusive-cores.md) - its lease mechanism grants the whole-socket lease the uncore/RAPL pass needs
 - [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - builds on the setup capability probe and multi-pass perf collector
 
 ## Hosts
