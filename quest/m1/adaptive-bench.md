@@ -13,7 +13,7 @@ Decided 2026-11-26 (maintainer, `/quest-plan`):
 Recommendations for the implementer:
 
 - Keep a minimum sample/pair floor (at least `MIN_SAMPLES` and a short minimum wall window such as 100 ms so drift and periodic load still have a chance to appear) and a hard upper cap (such as 3 s) so noisy benchmarks cannot stall a run.
-- Check convergence only at geometric checkpoints (e.g., 20, 40, 80, 160 pairs) rather than after every single pair to avoid sequential peeking inflation, or apply an alpha-spending / anytime-valid confidence sequence for the median ratio.
+- Check convergence using sequentially valid inference for both stopping and reporting: either alpha spending across planned geometric checkpoints (e.g., 20, 40, 80, 160 pairs) or an anytime-valid confidence sequence for the median ratio, never a naive fixed-sample 95% interval peeked repeatedly.
 - For standalone `swole bench` (no `<base>`), stop once the median's relative half-width stabilizes below a tight threshold after the minimum window.
 - Verify with unit tests over synthetic `Fake` sides (clean constant ratio stops early; noisy borderline ratio runs past 1 s up to the cap) and record the wall-clock speedup on a real multi-benchmark suite.
 

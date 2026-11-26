@@ -3,7 +3,7 @@ swole measures Rust benchmarks from one compiled binary across three roles: `qui
 # Required
 
 - Everything is configless, with opinionated names and defaults: a benchmark is a plain function, and a consumer needs no config. Each config key a consumer needs is a gap to close.
-- A measurement that cannot be trusted fails the run: an input swole cannot pin, a multiplexed counter, or a benchmark that measured nothing. One that can still move, such as a count other threads ran beside or native timing, is labeled so, never reported as exact.
+- A measurement that cannot be trusted fails the run: a multiplexed counter, a benchmark that measured nothing, or an unpinned input in a mode that promises pinned inputs (`sim` and `quick`; native `bench` keeps the host clock and randomness unshimmed). One that can still move, such as a count other threads ran beside or native timing, is labeled so, never reported as exact.
 - `sim` alone owns cross-host bit-exact repeatability: a `sim` count swole reports as exact repeats across runs, checkouts, and environments that share a fingerprint, and whatever can move it either enters the fingerprint or is pinned (Valgrind's version, the preload, and the launch's padding). `quick` optimizes for fast whole-workspace local feedback, and `bench` for real hardware behavior. Prove a change keeps `sim`'s repeatability with the tests, which count under the dev shell's Valgrind.
 - The harness stays small, since it is in every consumer's `[dev-dependencies]`: what only the runner needs lives in `cargo-swole`.
 - moq and rind are the first consumers of every change.
