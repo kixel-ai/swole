@@ -2,11 +2,11 @@
 
 ## Goal
 
-`swole quick`, an agent's local spot-check, gives the same `instructions:u` count on every run for a benchmark of any length on one host, not only for calls shorter than the timer's tick. Today each hardware interrupt during a call adds one instruction and one branch to the count, as x86's counters count the return to user space. On one host, an Intel Core Ultra 7 270K Plus at `CONFIG_HZ=1000`, a 10 ms loop counted 2 to 7 over its 40,000,092 across 15 runs ([kixel-ai/swole#5](https://github.com/kixel-ai/swole/pull/5)). `sim` stays what gates a merge and `bench` what gates a release; this quest only sharpens `quick`.
+`swole quick`, an agent's local spot-check, gives the same `instructions:u` count on every run for a benchmark of any length on one host, not only for calls far shorter than the timer's tick, where an interrupt is unlikely. Today each hardware interrupt during a call adds one instruction and one branch to the count, as x86's counters count the return to user space. On one host, an Intel Core Ultra 7 270K Plus at `CONFIG_HZ=1000`, a 10 ms loop counted 2 to 7 over its 40,000,092 across 15 runs ([kixel-ai/swole#5](https://github.com/kixel-ai/swole/pull/5)). `sim` stays what gates a merge and `bench` what gates a release; this quest only sharpens `quick`.
 
 ## Plan
 
-Decided 2026-11-26 (maintainer, on [kixel-ai/swole#5](https://github.com/kixel-ai/swole/pull/5)): keep `quick` as the spot-check, documented as exact only for calls shorter than the tick, and make it more accurate here.
+Decided 2026-11-26 (maintainer, on [kixel-ai/swole#5](https://github.com/kixel-ai/swole/pull/5)): keep `quick` as the spot-check, documented as exact for calls far shorter than the tick, where an interrupt is unlikely, with `sim` the mode that repeats exactly, and make it more accurate here.
 
 Ideas, in the order to try them:
 

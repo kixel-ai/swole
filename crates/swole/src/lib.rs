@@ -158,29 +158,31 @@ fn run() -> Result<(), String> {
 		drop(sampler);
 		let watch = meter.finish().map_err(|err| format!("{name}: {err}"))?;
 		// The records start on a fresh line, as a benchmark's own output may not have ended one,
-		// so a record never runs into it; the rest follow the first.
+		// so a record never runs into it; the rest follow the first, all under one lock, so a
+		// thread the benchmark left printing cannot write between them.
+		let mut out = std::io::stdout().lock();
 		let mut fresh = false;
-		let mut record = |line: std::fmt::Arguments| {
+		let mut record = |line: std::fmt::Arguments| -> Result<(), String> {
 			if !fresh {
-				println!();
+				writeln!(out).map_err(|e| format!("cannot write to stdout: {e}"))?;
 				fresh = true;
 			}
-			println!("{line}");
+			writeln!(out, "{line}").map_err(|e| format!("cannot write to stdout: {e}"))
 		};
 		match watch.threaded {
-			Some(true) => record(format_args!("{THREADED}{name}")),
-			Some(false) => record(format_args!("{ALONE}{name}")),
+			Some(true) => record(format_args!("{THREADED}{name}"))?,
+			Some(false) => record(format_args!("{ALONE}{name}"))?,
 			None => {}
 		}
 		if let Some(usage) = watch.usage {
-			record(format_args!("{RUSAGE}{usage}"));
+			record(format_args!("{RUSAGE}{usage}"))?;
 		}
 		if let Some(values) = watch.counted {
 			let values: Vec<String> = values.iter().map(u64::to_string).collect();
-			record(format_args!("{COUNTED}{} {name}", values.join(" ")));
+			record(format_args!("{COUNTED}{} {name}", values.join(" ")))?;
 		}
 		if !quiet {
-			record(format_args!("{RAN}{name}"));
+			record(format_args!("{RAN}{name}"))?;
 		}
 	}
 	Ok(())

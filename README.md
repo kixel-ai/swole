@@ -11,7 +11,8 @@ tree:
   written for it.
 - `swole quick`, an agent's local spot-check, counts them [natively](#quick), once each, with
   the host's Linux perf counters, 20 to 50 times faster, comparable only on hosts like this one,
-  and exact only for a call shorter than the timer's tick.
+  and exact for a call far shorter than the timer's tick, where an interrupt is unlikely; `sim`
+  is the mode that repeats exactly.
 - `swole bench`, what gates a release, [times](#bench) them by wall clock on any Linux or macOS host, alone or paired
   with a base commit's, beside what each process used and every perf counter the host's
   [capabilities](#capabilities) allow.
@@ -254,10 +255,11 @@ rather than be scaled up: another user of the host's counters multiplexed it, or
 the PMU's cores. The kernel maps no page for a counter a process's threads inherit, so a benchmark
 beside which the process had another thread fails `quick`, naming it, since `sim` counts every
 thread, and keeps only its time in `bench`. Run under Valgrind, the same benchmark counts within those few dozen instructions.
-So `quick` is exact only for a call shorter than the timer's tick: each hardware interrupt that
-lands during a call, the tick's or a device's, adds an instruction and a branch to its count, as
-x86's counters count the return to user space, so a longer call's count moves with how many
-interrupts it took. On one host, an Intel Core Ultra 7 270K Plus at `CONFIG_HZ=1000`, a 10 ms
+So `quick` is exact for a call far shorter than the timer's tick, where an interrupt is
+unlikely, and `sim` is the mode that repeats exactly: each hardware interrupt that lands during a
+call, the tick's or a device's, adds an instruction and a branch to its count, as x86's counters
+count the return to user space, so a call's count moves with how many interrupts it took, which
+a longer call takes more often. On one host, an Intel Core Ultra 7 270K Plus at `CONFIG_HZ=1000`, a 10 ms
 loop counted 2 to 7 over its 40,000,092 across 15 runs.
 
 ## Capabilities
