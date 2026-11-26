@@ -2,13 +2,13 @@
 
 ## Goal
 
-`swole` fits asymptotic scaling across numeric `args = [...]` sweeps (distinguishing `O(1)`, `O(log n)`, `O(n)`, `O(n log n)`, and `O(n²)`) on instruction counts, simulated cycles, allocations, and wall-clock time, and flags complexity-class regressions in `compare` even when a single benchmark size barely moved.
+`swole` fits asymptotic scaling across numeric `args = [...]` sweeps (distinguishing `O(1)`, `O(log n)`, `O(n)`, `O(n log n)`, and `O(n²)`) on instruction counts, simulated cycles, allocations, and wall-clock time, and flags complexity-class regressions in every `<base>` comparison even when a single benchmark size barely moved.
 
 ## Plan
 
 Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
-- ✅ Defer to m3 (rejected: including in the initial m2 `swole` epic; dropping). Easy to layer once multi-metric runs land, and no consumer blocks on it yet.
+- ✅ Defer to m1 (rejected: including in m0; dropping). Easy to layer once multi-metric runs land, and no consumer blocks on it yet.
 
 Recommendations for the implementer:
 
