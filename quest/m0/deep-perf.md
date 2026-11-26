@@ -16,7 +16,7 @@ Recommendations for the implementer:
 
 - **L0 uncore & energy** (active only when the host exposes L0 and the pass holds a whole-socket lease through [exclusive cores](/quest/m0/exclusive-cores.md)' lease mechanism, since uncore and RAPL counters are socket/package-wide; a pass that cannot take a host-enforced lease fails the run rather than reporting socket-wide counts on a shared host):
   - Probe `/sys/bus/event_source/devices/` for `power` / `power_core` (RAPL `energy-pkg`, `energy-cores` with their `*.scale` and `*.unit` sysfs files) and uncore memory/L3 PMUs (`amd_l3`, `amd_df`, `amd_umc_*` on AMD; `uncore_imc_*` on Intel), failing loudly if a probed sysfs event cannot open.
-  - Report energy in joules (or microjoules) per iteration and memory bandwidth / L3 misses per benchmark.
+  - Report energy in joules (or microjoules) per iteration, and memory bandwidth / L3 misses as socket-wide counts for the pass. The lease excludes other CPU work but not device I/O and DMA, which reach the memory controllers and package power, so label all three as socket-wide measurements that include device traffic, timed like wall clock rather than trusted as exact counts.
 - **L-1 off-CPU & contention**:
   - Open `sched:sched_switch` and `syscalls:sys_enter_futex` / `sys_exit_futex` (or `sched:sched_stat_sleep` / `sched:sched_stat_blocked` when available) scoped to the benchmark's threads to separate on-CPU execution from blocked/contended time.
 - **L-1 native per-function attribution**:
