@@ -38,11 +38,3 @@ updates:
       cargo:
         patterns:
           - "*"
-
-  # rust-toolchain.toml, which flake.nix also reads.
-  - package-ecosystem: "rust-toolchain"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    cooldown:
-      default-days: 7
