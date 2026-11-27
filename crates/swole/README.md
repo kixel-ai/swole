@@ -158,6 +158,12 @@ used over the sample: user and system CPU nanoseconds, peak resident bytes, mino
 faults, and voluntary and involuntary context switches. swole drives it so, and reads a
 benchmark's own output on stdout around its samples.
 
+With `SWOLE_PROFILE=1` beside `SWOLE_TIME`, on Linux, it starts every perf event swole opened on
+the process with a `prctl` as its clock starts and stops them as the clock stops, around the
+calls of a sample or each call its clock brackets alone, or around each call of a benchmark that
+times itself, and prints `swole profiles` before its first sample, so swole samples what a time
+holds and nothing else, and knows a harness too old to.
+
 Under Valgrind with `--instr-atstart=no`, as swole runs it, each case's count is
 everything its call executes on every thread, between `ZERO_STATS` and
 `START_INSTRUMENTATION` before it and `STOP_INSTRUMENTATION` and `DUMP_STATS_AT <name>` after:

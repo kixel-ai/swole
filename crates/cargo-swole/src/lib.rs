@@ -48,6 +48,7 @@ mod metrics;
 )]
 mod perf;
 mod preload;
+mod profile;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};

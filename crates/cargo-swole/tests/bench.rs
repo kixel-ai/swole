@@ -357,6 +357,15 @@ fn pairs_a_base_commit_with_the_working_tree() {
 		.parse()
 		.unwrap();
 	assert!(change > 50.0, "{table}");
+	// On a host that samples precise cycles, the function whose spins doubled leads those behind
+	// the change, inlined though it is, by the symbols and line tables bench builds with.
+	if String::from_utf8_lossy(&out.stderr).contains("swole: sampling each changed benchmark with cycles:pp") {
+		let first = table
+			.lines()
+			.find(|line| line.starts_with("| benches/spin.rs::work | cycles |"))
+			.unwrap_or_else(|| panic!("{table}"));
+		assert!(first.contains("| `spin::spin` |"), "{table}");
+	}
 }
 
 /// Writes a workspace package `name` under `repo` with one harness benchmark target, `bench`.

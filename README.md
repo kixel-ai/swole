@@ -463,6 +463,32 @@ prints every measure of each benchmark, beside the base's and its change when pa
 upgrade, says so and has none, as does a threaded benchmark whose harness predates counting every
 thread; one whose harness predates rusage has none of that.
 
+### Functions
+
+When a paired benchmark's time changes, its interval leaving out no change, `swole bench <base>`
+says which functions changed it. On the CPUs its times took, it runs each side once more, in a
+timed process of its own, over a quarter second of calls, sampling `cycles:pp`: precise cycles,
+which the kernel takes with AMD's IBS op or Intel's PEBS, every 250,007 cycles, some 20,000
+times a second, each sample at the instruction its cycles end on. It samples each of those CPUs
+whole and keeps the process's samples alone, since an event each thread inherited would start its
+period afresh with every thread and miss a worker that lives shorter than one. The harness starts
+the sampling as its clock starts and stops it as the clock stops, so setup, steps, and inputs
+built between calls stay out of a profile as they stay out of a time, and neither the times nor
+the counters share a process with it. swole resolves each sample's instruction pointer against the executable or library mapped
+there, by the symbols and line tables `bench` builds every benchmark with
+(`profile.bench.debug = "limited"`, which leaves the code it times as it is), and names the
+innermost function inlined there that is not Rust's standard library's, whose generic helpers
+count as the code that called them; a sample in the kernel counts as `[kernel]`. A table under
+the measures prints the three to five functions whose sampled self cycles a call (`~`) moved the
+benchmark's most its way, past three only until they explain the majority of its change, and `--report` writes every function of each side under the
+benchmark's `functions`. A sample the kernel dropped, or a stretch it stopped sampling, fails the
+run, since the other functions would claim its cycles.
+
+Sampling needs a PMU that takes precise samples, which a VM's often lacks, and, since it samples
+whole CPUs, `perf_event_paranoid` at most 0 or `CAP_PERFMON`, as [Privileges](#privileges)
+grants; a paired run without them says why and names no functions, as does a side whose harness
+predates profiling.
+
 ### Cores
 
 On Linux, `bench` leases one physical core once its builds are done and runs every benchmark
