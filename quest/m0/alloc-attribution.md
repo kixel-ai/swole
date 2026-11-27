@@ -6,6 +6,8 @@ Beside each benchmark's heap allocation counts, `swole` names the call sites or 
 
 ## Plan
 
+Decided 2026-11-27 (maintainer, /quest-run): keep.
+
 Split out of the allocation counters' quest, whose recommendations listed per-site attribution beside the three scalar counts; the counts landed without it.
 
 Recommendations for the implementer:
