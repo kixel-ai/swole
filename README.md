@@ -98,9 +98,10 @@ A harness benchmark beside which the process had another thread, one there when 
 started or ended, or one its call started, which the [preload](#randomness-and-the-clock) sees
 even when it is gone by the call's end, counts what that thread ran meanwhile, which the
 scheduler decides. So `sim` counts each such benchmark's job five times in all, and records the
-median of the five, with their least and most beside it in the table and as `lower_value` and
-`upper_value` in `metrics.json`, for its instructions, cache misses, branch mispredicts, and
-estimated cycles alike. So does every benchmark whose threads swole cannot see: those of
+median of the five, with their least and most beside it: for every measure, its instructions,
+cache misses, branch mispredicts, and estimated cycles alike, in the tables and as `lower` and
+`upper` in `--report`, and for the instructions and estimated cycles, as `lower_value` and
+`upper_value` in `metrics.json`. So does every benchmark whose threads swole cannot see: those of
 CodSpeed's crates and of a `--program`, whose harness runs every benchmark in one process, and of
 a harness too old to say. A harness benchmark that ran alone counts once: under the preload's
 randomness and clock it repeats exactly, but for an input the host decides, such as the order a
@@ -119,7 +120,9 @@ and branches it cannot predict. So every count also runs Callgrind's cache and b
 (`--cache-sim=yes --branch-sim=yes`), with its caches sized outright, as CodSpeed's runner sizes
 them, rather than from the host's CPUID: a 32 KiB, 8-way first level for instructions
 (`--I1=32768,8,64`) and one for data (`--D1=32768,8,64`), and an 8 MiB, 16-way last level
-(`--LL=8388608,16,64`), each of 64-byte lines. Each benchmark reports Callgrind's every event:
+(`--LL=8388608,16,64`), each of 64-byte lines. Valgrind runs with `--command-line-only=yes`, so a
+`.valgrindrc` or `VALGRIND_OPTS`, which could turn on its hardware prefetch model, never changes a
+count behind the fingerprint's back. Each benchmark reports Callgrind's every event:
 
 | event | measure |
 |---|---|
@@ -235,8 +238,8 @@ version moves too, since a new Valgrind can count differently and starts new ser
 
 `swole sim <base>` and `swole quick <base>` count `<base>` and the working tree in one worktree kept under
 `~/.cache/swole` (or `$XDG_CACHE_HOME`), each from the directory there that matches where
-it runs, and print a Markdown table of each benchmark's base, head, and change, then, for `quick`, one
-of every other measure. `swole bench <base>` builds both sides in the same worktree and times
+it runs, and print a Markdown table of each benchmark's base, head, and change, then one of every
+other measure: for `sim`, each [simulated event](#simulated-cycles) and the estimated cycles. `swole bench <base>` builds both sides in the same worktree and times
 them [paired](#bench). One directory
 counts both sides, so a path the build compiles in, such as a panic's location, is the same in
 each and moves neither count. The worktree sits outside the repository, so no

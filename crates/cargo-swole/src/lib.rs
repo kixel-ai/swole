@@ -512,10 +512,12 @@ pub(crate) fn threaded(counts: &Counts) -> String {
 
 /// The Valgrind every count and the fingerprint's probe run under: Callgrind, counting only
 /// what the hooks bracket, following each exec, so a program a shell or `just` execs is
-/// measured, leaving the exit code the program's, and simulating caches and branches.
+/// measured, leaving the exit code the program's, and simulating caches and branches. It reads
+/// no options from a `.valgrindrc` or `VALGRIND_OPTS`, which the fingerprint never sees.
 fn valgrind() -> Result<Command, String> {
 	let mut command = Command::new(valgrind_path()?);
 	command.args([
+		"--command-line-only=yes",
 		"--tool=callgrind",
 		"--instr-atstart=no",
 		"--trace-children=yes",
