@@ -360,8 +360,9 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					)? {
 					measures.extend(allocs);
 				}
-				if let Some((used, calls)) = &used[i] {
+				if let Some((used, calls, wall)) = &used[i] {
 					measures.extend(used.measures(*calls * iterations));
+					measures.extend(crate::diagnose::busy(used.user_ns + used.system_ns, wall.as_nanos()));
 				}
 				// What derives from the side's time and counts, per what each of its calls processes.
 				if let (Some(throughput), Some(time)) = (declared[i], [timed.base(), timed.head()][i]) {
@@ -373,6 +374,8 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					all.extend(measures.iter().cloned());
 					measures.extend(throughput.measures(&all));
 				}
+				let derived = crate::diagnose::derive(&measures, true);
+				measures.extend(derived);
 				if !measures.is_empty() {
 					details[i].insert(name.clone(), measures);
 				}
@@ -422,7 +425,8 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	let host = native.label();
 	eprintln!("swole: fingerprint {host}");
 	let paired = checkout.is_some();
-	print!("{}", table(&times, paired));
+	let (rendered, order) = table(&times, paired, &details);
+	print!("{rendered}");
 	if let Some(kernel) = kernel.filter(|_| !every.is_empty()) {
 		let names: Vec<&str> = every.iter().map(String::as_str).collect();
 		// The kernel's work to start and stop counting stays in an inherited count, which no
@@ -443,7 +447,12 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	let [base_details, head_details] = &details;
 	print!(
 		"{}",
-		metrics::details(paired.then_some(base_details), head_details, &rates)
+		metrics::details(
+			paired.then_some(base_details),
+			head_details,
+			&rates,
+			&metrics::Pick::new(order, options.all_details, paired)
+		)
 	);
 	let sha = checkout.as_ref().map(|checkout| checkout.sha.as_str());
 	if let Some(out) = &options.out {
@@ -477,16 +486,18 @@ fn spread(
 	Ok(Some(spread))
 }
 
-/// What the process used over `samples`, in all, and how many samples that took, when its harness
-/// says what it used.
-fn usage<'a>(samples: impl Iterator<Item = &'a Sample>) -> Option<(perf::Usage, u64)> {
+/// What the process used over `samples`, in all, how many samples that took, and their wall
+/// clock, when its harness says what it used.
+fn usage<'a>(samples: impl Iterator<Item = &'a Sample>) -> Option<(perf::Usage, u64, Duration)> {
 	let mut total = perf::Usage::default();
 	let mut count = 0;
+	let mut wall = Duration::ZERO;
 	for sample in samples {
 		total.add(&sample.usage?);
 		count += 1;
+		wall += sample.wall;
 	}
-	(count > 0).then_some((total, count))
+	(count > 0).then_some((total, count, wall))
 }
 
 /// What counting a benchmark found.
@@ -953,42 +964,73 @@ fn change(ratio: Estimate) -> String {
 	)
 }
 
-/// Each benchmark's time as a Markdown table, and with a base, the base's and the change.
-fn table(times: &BTreeMap<String, Times>, paired: bool) -> String {
+/// Each benchmark's time as a Markdown table, and with a base, the base's and the change: the
+/// largest changes whose interval excludes none first, then each benchmark one side has, then the
+/// rest, with the likely cause beside each regression its measures in `details` explain. And
+/// each benchmark in the table's order, with whether it moved.
+fn table(
+	times: &BTreeMap<String, Times>,
+	paired: bool,
+	details: &[BTreeMap<String, Vec<Measure>>; 2],
+) -> (String, Vec<(String, bool)>) {
 	let cell = |time: Option<f64>| time.map_or("-".to_owned(), duration);
-	let mut out = if paired {
-		String::from("| benchmark | base | head | change | 95% interval |\n|---|---:|---:|---:|---:|\n")
-	} else {
-		String::from("| benchmark | time |\n|---|---:|\n")
-	};
-	for (name, times) in times {
-		// A `|` in a name would split its cell.
-		let shown = name.replace('|', "\\|");
-		if paired {
-			let (change, interval) = match times {
-				Times::Both { ratio, .. } => {
-					let percent = |ratio: f64| format!("{:+.2}%", (ratio - 1.0) * 100.0);
-					(
-						percent(ratio.value),
-						format!("{} to {}", percent(ratio.lower), percent(ratio.upper)),
-					)
-				}
-				Times::Base(_) => ("removed".to_owned(), String::new()),
-				Times::Head(_) => ("added".to_owned(), String::new()),
-			};
-			writeln!(
-				out,
-				"| {shown} | {} | {} | {change} | {interval} |",
-				cell(times.base()),
-				cell(times.head())
-			)
-		} else {
+	if !paired {
+		let mut out = String::from("| benchmark | time |\n|---|---:|\n");
+		for (name, times) in times {
 			let head = times.head().expect("an unpaired run times the working tree's alone");
-			writeln!(out, "| {shown} | {} |", duration(head))
+			// A `|` in a name would split its cell.
+			writeln!(out, "| {} | {} |", name.replace('|', "\\|"), duration(head)).expect("a String takes every write");
 		}
-		.expect("a String takes every write");
+		return (out, times.keys().map(|name| (name.clone(), false)).collect());
 	}
-	out
+	// Each row, its rank (moved, one side's, held), and how far it moved.
+	let mut rows: Vec<(u8, f64, &String, String, String, Option<String>)> = Vec::new();
+	for (name, times) in times {
+		let percent = |ratio: f64| format!("{:+.2}%", (ratio - 1.0) * 100.0);
+		let row = match times {
+			Times::Both { ratio, .. } => {
+				let moved = ratio.lower > 1.0 || ratio.upper < 1.0;
+				let cause = (ratio.lower > 1.0)
+					.then(|| crate::diagnose::cause(details[0].get(name)?, details[1].get(name)?, Some(ratio.value - 1.0)))
+					.flatten();
+				(
+					if moved { 0 } else { 2 },
+					ratio.value.ln().abs(),
+					percent(ratio.value),
+					format!("{} to {}", percent(ratio.lower), percent(ratio.upper)),
+					cause,
+				)
+			}
+			Times::Base(_) => (1, 0.0, "removed".to_owned(), String::new(), None),
+			Times::Head(_) => (1, 0.0, "added".to_owned(), String::new(), None),
+		};
+		rows.push((row.0, row.1, name, row.2, row.3, row.4));
+	}
+	rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)).then(a.2.cmp(b.2)));
+	let causes = rows.iter().any(|row| row.5.is_some());
+	let mut out = String::from("| benchmark | base | head | change | 95% interval |");
+	out += if causes {
+		" likely cause |\n|---|---:|---:|---:|---:|---|\n"
+	} else {
+		"\n|---|---:|---:|---:|---:|\n"
+	};
+	for (_, _, name, change, interval, cause) in &rows {
+		let times = &times[*name];
+		write!(
+			out,
+			"| {} | {} | {} | {change} | {interval} |",
+			name.replace('|', "\\|"),
+			cell(times.base()),
+			cell(times.head())
+		)
+		.expect("a String takes every write");
+		if causes {
+			write!(out, " {} |", cause.as_deref().unwrap_or_default()).expect("a String takes every write");
+		}
+		out.push('\n');
+	}
+	let order = rows.into_iter().map(|(rank, _, name, ..)| (name.clone(), rank < 2)).collect();
+	(out, order)
 }
 
 /// The times, and each side's allocations from `details`, as a `metrics.json`: the working tree's
@@ -1491,15 +1533,38 @@ mod tests {
 			("gone".to_owned(), Times::Base(5.0)),
 			("new|x".to_owned(), Times::Head(12_345_678.0)),
 		]);
+		let mut details: [BTreeMap<String, Vec<Measure>>; 2] = Default::default();
 		assert_eq!(
-			table(&times, true),
+			table(&times, true, &details).0,
 			"| benchmark | base | head | change | 95% interval |\n|---|---:|---:|---:|---:|\n\
 			 | a | 2.000 µs | 1.500 µs | -25.00% | -32.50% to -17.50% |\n\
 			 | gone | 5.000 ns | - | removed |  |\n\
 			 | new\\|x | - | 12.35 ms | added |  |\n"
 		);
-		let base = "c".repeat(40);
+		// The largest change first; one whose interval holds none after the benchmarks one side
+		// has; and the likely cause beside a regression whose measures explain it.
+		let mut sorted = BTreeMap::from([
+			("held".to_owned(), Times::Both { base: 10.0, head: 10.1, ratio: estimate(1.01) }),
+			("slow".to_owned(), Times::Both { base: 10.0, head: 12.0, ratio: estimate(1.2) }),
+		]);
+		sorted.extend(times.iter().map(|(name, _)| (name.clone(), Times::Head(1.0))).take(1));
+		let mpki = |value: f64| vec![Measure::new("LLC MPKI:u", value, "MPKI")];
+		details[0].insert("slow".to_owned(), mpki(1.0));
+		details[1].insert("slow".to_owned(), mpki(3.0));
+		let (rendered, order) = table(&sorted, true, &details);
+		assert_eq!(
+			rendered,
+			"| benchmark | base | head | change | 95% interval | likely cause |\n|---|---:|---:|---:|---:|---|\n\
+			 | slow | 10.00 ns | 12.00 ns | +20.00% | +8.00% to +32.00% | memory-bound (LLC MPKI:u 1.000 → 3.000) |\n\
+			 | a | - | 1.000 ns | added |  |  |\n\
+			 | held | 10.00 ns | 10.10 ns | +1.00% | -9.10% to +11.10% |  |\n"
+		);
+		assert_eq!(
+			order,
+			[("slow", true), ("a", true), ("held", false)].map(|(name, moved)| (name.to_owned(), moved))
+		);
 		let mut details: [BTreeMap<String, Vec<Measure>>; 2] = Default::default();
+		let base = "c".repeat(40);
 		details[1].insert(
 			"a".to_owned(),
 			vec![

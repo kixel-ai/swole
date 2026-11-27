@@ -416,8 +416,8 @@ pub fn table(counts: &Counts) -> String {
 pub const SAMPLED: &str = "~";
 
 /// A change from `base` to `head`, each a value and the least and most of its samples when
-/// sampled, as a table shows it: none from an exact base of zero, and from a sampled base whose
-/// spread holds zero, the absolute change and the least and most its spreads allow. A sampled value moves within its
+/// sampled, as a table shows it: from an exact base of zero, the absolute change, and from a
+/// sampled base whose spread holds zero, that and the least and most its spreads allow. A sampled value moves within its
 /// samples' spread, so the change between two says whether their spreads overlap; with one side's
 /// spread alone, it gives no verdict and is marked sampled.
 pub fn change(
@@ -439,18 +439,51 @@ pub fn change(
 			signed(head_most - base_least)
 		)
 	} else {
-		String::new()
+		signed(head - base)
 	};
+	verdict(change, base_spread, head_spread)
+}
+
+/// A change from `base` to `head` in percentage points, as a table shows a percentage's.
+fn points(
+	(base, base_spread): (f64, Option<(f64, f64)>),
+	(head, head_spread): (f64, Option<(f64, f64)>),
+) -> String {
+	verdict(format!("{:+.2} pp", head - base), base_spread, head_spread)
+}
+
+/// `change` between two sides with the spreads given, marked sampled, and between two sampled
+/// sides, whether their spreads overlap.
+fn verdict(change: String, base_spread: Option<(f64, f64)>, head_spread: Option<(f64, f64)>) -> String {
 	match (base_spread, head_spread) {
 		(None, None) => change,
-		(Some((base_least, base_most)), Some((head_least, head_most))) => {
-			if head_least <= base_most && base_least <= head_most {
+		(Some(base), Some(head)) => {
+			if overlap(base, head) {
 				format!("{SAMPLED}{change} (within spread)")
 			} else {
 				format!("{change} (beyond spread)")
 			}
 		}
 		_ => format!("{SAMPLED}{change}"),
+	}
+}
+
+/// Whether two sampled values' spreads overlap, so neither tells them apart.
+pub fn overlap((base_least, base_most): (f64, f64), (head_least, head_most): (f64, f64)) -> bool {
+	head_least <= base_most && base_least <= head_most
+}
+
+/// Whether a measure held from `base` to `head`, its unit `unit`: two sampled values within their
+/// spreads, or any other pair whose change a table shows as none.
+fn held(base: &Measure, head: &Measure) -> bool {
+	if let (Some(base), Some(head)) = (base.spread, head.spread) {
+		return overlap(base, head);
+	}
+	let delta = (head.value - base.value).abs();
+	match head.unit {
+		"%" => delta < 0.005,
+		_ if base.value == 0.0 => delta == 0.0,
+		_ => delta / base.value.abs() < 0.00005,
 	}
 }
 
@@ -465,7 +498,11 @@ fn signed(value: f64) -> String {
 
 /// A measure's value as a table shows it, in its unit.
 pub fn shown(value: f64, unit: &str) -> String {
-	let number = if value.fract() == 0.0 {
+	// A ratio reads alike whole or not.
+	let ratio = matches!(unit, "ratio" | "MPKI" | "CPUs" | "GHz" | "instructions/cycle");
+	let number = if ratio && value.abs() < 100.0 {
+		format!("{value:.3}")
+	} else if value.fract() == 0.0 {
 		format!("{value}")
 	} else if value.abs() >= 100.0 {
 		format!("{value:.1}")
@@ -476,7 +513,9 @@ pub fn shown(value: f64, unit: &str) -> String {
 		format!("{value:.3}")
 	};
 	match unit {
-		"events" | "instructions" | "cycles" | "instructions/cycle" => number,
+		// A measure whose name says what it counts, such as `LLC MPKI:u`.
+		"events" | "instructions" | "cycles" | "instructions/cycle" | "ratio" | "MPKI" => number,
+		"%" => format!("{value:.2}%"),
 		"bytes/s" => rate(value, 1024.0, &["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"]),
 		"items/s" => rate(
 			value,
@@ -497,28 +536,54 @@ fn rate(mut value: f64, step: f64, units: &[&str]) -> String {
 	format!("{value:.2} {}", units[unit])
 }
 
-/// Every measure of each benchmark beyond its headline, a row each, as a Markdown table: with
-/// `before`, the base's beside the head's, and the change, which for a benchmark `paired` names
-/// is its `throughput`'s from its paired timing, rather than from its sides' medians; empty when
-/// no benchmark has any. A measure whose unit differs by side, as a rate in bytes on one and
-/// items on the other, takes a row a side.
+/// How many benchmarks a suite may hold for its details to print every one's: a larger one's
+/// print only those whose headline moved.
+const SMALL: usize = 10;
+
+/// Which benchmarks a details table prints, in the order the headline's table shows them, and
+/// whether every row of each or only those that moved.
+pub struct Pick {
+	names: Vec<String>,
+	every_row: bool,
+	/// How many benchmarks it leaves out, and why.
+	left_out: (usize, &'static str),
+}
+
+impl Pick {
+	/// From each benchmark in the order a table shows it and whether its headline moved: with
+	/// `all`, every one and every row; else every one in a suite of at most [`SMALL`], or the moved
+	/// alone, each with only the rows that moved.
+	pub fn new(order: Vec<(String, bool)>, all: bool, paired: bool) -> Self {
+		let total = order.len();
+		let every = all || total <= SMALL;
+		let names: Vec<String> = order
+			.into_iter()
+			.filter(|(_, moved)| every || *moved)
+			.map(|(name, _)| name)
+			.collect();
+		let why = if paired { " whose headline held" } else { "" };
+		Self {
+			left_out: (total - names.len(), why),
+			names,
+			every_row: all,
+		}
+	}
+}
+
+/// Each measure of the benchmarks `pick` names beyond its headline, a row each, as a Markdown
+/// table: with `before`, the base's beside the head's, and the change, which for a benchmark
+/// `paired` names is its `throughput`'s from its paired timing, rather than from its sides'
+/// medians, and a percentage's in points; empty when no benchmark has any. A measure whose unit
+/// differs by side, as a rate in bytes on one and items on the other, takes a row a side. Unless
+/// `pick` takes every row, one that held is left out, and a note says what else is.
 pub fn details(
 	before: Option<&BTreeMap<String, Vec<Measure>>>,
 	after: &BTreeMap<String, Vec<Measure>>,
 	paired: &BTreeMap<String, f64>,
+	pick: &Pick,
 ) -> String {
-	if after.is_empty() && before.is_none_or(BTreeMap::is_empty) {
-		return String::new();
-	}
-	let mut out = match before {
-		Some(_) => String::from("\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n"),
-		None => String::from("\n| benchmark | measure | value |\n|---|---|---:|\n"),
-	};
-	let names: BTreeSet<&String> = after
-		.keys()
-		.chain(before.into_iter().flat_map(BTreeMap::keys))
-		.collect();
-	for name in names {
+	let mut rows = String::new();
+	for name in &pick.names {
 		// A `|` in a name would split its cell.
 		let shown_name = name.replace('|', "\\|");
 		let head = after.get(name).map(Vec::as_slice).unwrap_or_default();
@@ -553,18 +618,25 @@ pub fn details(
 			};
 			match base {
 				Some(base) => {
+					let rate = (measure == "throughput").then(|| paired.get(name)).flatten();
 					let change = match (find(base, measure, unit), find(head, measure, unit)) {
-						// A paired rate's change is the one its pairing gives.
-						(Some(_), Some(_)) if measure == "throughput" && paired.contains_key(name) => {
-							format!("{:+.2}%", paired[name] * 100.0)
+						(Some(b), Some(a)) => {
+							if !pick.every_row && rate.map_or(held(b, a), |rate| rate.abs() < 0.00005) {
+								continue;
+							}
+							match rate {
+								// A paired rate's change is the one its pairing gives.
+								Some(rate) => format!("{:+.2}%", rate * 100.0),
+								None if unit == "%" => points((b.value, b.spread), (a.value, a.spread)),
+								None => change((b.value, b.spread), (a.value, a.spread)),
+							}
 						}
-						(Some(b), Some(a)) => change((b.value, b.spread), (a.value, a.spread)),
 						(None, Some(_)) => "added".to_owned(),
 						(Some(_), None) => "removed".to_owned(),
 						(None, None) => unreachable!("every measure comes from one side"),
 					};
 					writeln!(
-						out,
+						rows,
 						"| {shown_name} | {measure} | {} | {} | {change} |",
 						cell(find(base, measure, unit)),
 						cell(find(head, measure, unit))
@@ -572,19 +644,36 @@ pub fn details(
 				}
 				None if before.is_some() => {
 					writeln!(
-						out,
+						rows,
 						"| {shown_name} | {measure} | - | {} | added |",
 						cell(find(head, measure, unit))
 					)
 				}
 				None => writeln!(
-					out,
+					rows,
 					"| {shown_name} | {measure} | {} |",
 					cell(find(head, measure, unit))
 				),
 			}
 			.expect("a String takes every write");
 		}
+	}
+	let mut out = String::new();
+	if !rows.is_empty() {
+		out += match before {
+			Some(_) => "\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n",
+			None => "\n| benchmark | measure | value |\n|---|---|---:|\n",
+		};
+		out += &rows;
+	}
+	let (left_out, why) = pick.left_out;
+	if left_out > 0 {
+		writeln!(
+			out,
+			"\nThe other measures of {left_out} benchmarks{why} are left out: --all-details prints them, and --report \
+			 writes them."
+		)
+		.expect("a String takes every write");
 	}
 	out
 }
@@ -614,6 +703,60 @@ mod tests {
 				.collect(),
 			throughput: Default::default(),
 		}
+	}
+
+	/// Every row of each of `names`, in their order.
+	fn every(names: &[&str]) -> Pick {
+		Pick::new(names.iter().map(|name| ((*name).to_owned(), true)).collect(), true, true)
+	}
+
+	#[test]
+	fn prints_only_what_moved_in_a_large_suite() {
+		let side = |cycles: f64, percent: f64| {
+			vec![
+				Measure::new("cycles:u", cycles, "events"),
+				Measure::new("user time", 1.5, "ns"),
+				Measure::new("topdown retiring", percent, "%"),
+			]
+		};
+		let names: Vec<String> = (0..12).map(|i| format!("b{i:02}")).collect();
+		let base: BTreeMap<String, Vec<Measure>> = names.iter().map(|name| (name.clone(), side(100.0, 40.0))).collect();
+		let mut head = base.clone();
+		head.insert("b07".to_owned(), side(150.0, 42.5));
+		// The table's order, the moved first; a large suite prints the moved alone, each row that held
+		// left out, and a percentage's change in points.
+		let order = |moved: &str| {
+			std::iter::once((moved.to_owned(), true))
+				.chain(names.iter().filter(|name| *name != moved).map(|name| (name.clone(), false)))
+				.collect::<Vec<_>>()
+		};
+		assert_eq!(
+			details(Some(&base), &head, &BTreeMap::new(), &Pick::new(order("b07"), false, true)),
+			"\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n\
+			 | b07 | cycles:u | 100 | 150 | +50.00% |\n| b07 | topdown retiring | 40.00% | 42.50% | +2.50 pp |\n\
+			 \nThe other measures of 11 benchmarks whose headline held are left out: --all-details prints them, and \
+			 --report writes them.\n"
+		);
+		// Every row of every one with --all-details.
+		let all = details(Some(&base), &head, &BTreeMap::new(), &Pick::new(order("b07"), true, true));
+		assert_eq!(all.lines().count(), 3 + 12 * 3, "{all}");
+		assert!(!all.contains("left out"), "{all}");
+		// A small suite prints every benchmark, but still only the rows that moved.
+		let few: BTreeMap<String, Vec<Measure>> = base.iter().take(3).map(|(k, v)| (k.clone(), v.clone())).collect();
+		let mut moved = few.clone();
+		moved.insert("b01".to_owned(), side(100.0, 41.0));
+		let order = few.keys().map(|name| (name.clone(), false)).collect();
+		assert_eq!(
+			details(Some(&few), &moved, &BTreeMap::new(), &Pick::new(order, false, true)),
+			"\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n\
+			 | b01 | topdown retiring | 40.00% | 41.00% | +1.00 pp |\n"
+		);
+		// Without a base, a large suite prints no details, and says so.
+		let order = names.iter().map(|name| (name.clone(), false)).collect();
+		assert_eq!(
+			details(None, &head, &BTreeMap::new(), &Pick::new(order, false, false)),
+			"\nThe other measures of 12 benchmarks are left out: --all-details prints them, and --report writes them.\n"
+		);
 	}
 
 	fn sim() -> Counter {
@@ -647,7 +790,7 @@ mod tests {
 		let mut counts = counts(&[("a", 10)]);
 		counts.details.get_mut("a").unwrap()[1].spread = Some((27.0, 33.0));
 		assert_eq!(
-			details(None, &counts.details, &BTreeMap::new()),
+			details(None, &counts.details, &BTreeMap::new(), &every(&["a"])),
 			"\n| benchmark | measure | value |\n|---|---|---:|\n| a | instructions | 10 |\n\
 			 | a | estimated cycles | ~30 (27 to 33) |\n| a | data reads | 1 |\n"
 		);
@@ -673,19 +816,19 @@ mod tests {
 		let base = BTreeMap::from([("a".to_owned(), side(100.0)), ("gone".to_owned(), side(1.0))]);
 		let head = BTreeMap::from([("a".to_owned(), side(150.0))]);
 		assert_eq!(
-			details(Some(&base), &head, &BTreeMap::new()),
+			details(Some(&base), &head, &BTreeMap::new(), &every(&["a", "gone"])),
 			"\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n\
 			 | a | cycles:u | 100 | 150 | +50.00% |\n| a | user time | 1.500 ns | 1.500 ns | +0.00% |\n\
 			 | gone | cycles:u | 1 | - | removed |\n| gone | user time | 1.500 ns | - | removed |\n"
 		);
-		assert_eq!(details(None, &BTreeMap::new(), &BTreeMap::new()), "");
+		assert_eq!(details(None, &BTreeMap::new(), &BTreeMap::new(), &every(&[])), "");
 		// A rate in bytes on one side and items on the other takes a row each, with no change; a
 		// paired rate's change is the one its pairing gives.
 		let rate = |unit| vec![Measure::new("throughput", 10.0, unit)];
 		let base = BTreeMap::from([("a".to_owned(), rate("items/s")), ("b".to_owned(), rate("bytes/s"))]);
 		let head = BTreeMap::from([("a".to_owned(), rate("bytes/s")), ("b".to_owned(), rate("bytes/s"))]);
 		assert_eq!(
-			details(Some(&base), &head, &BTreeMap::from([("b".to_owned(), 0.25)])),
+			details(Some(&base), &head, &BTreeMap::from([("b".to_owned(), 0.25)]), &every(&["a", "b"])),
 			"\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n\
 			 | a | throughput | - | 10.00 B/s | added |\n| a | throughput | 10.00 items/s | - | removed |\n\
 			 | b | throughput | 10.00 B/s | 10.00 B/s | +25.00% |\n"
@@ -699,7 +842,7 @@ mod tests {
 			BTreeMap::from([("a".to_owned(), vec![measure])])
 		};
 		let change = |base, head| {
-			details(Some(&base), &head, &BTreeMap::new())
+			details(Some(&base), &head, &BTreeMap::new(), &every(&["a"]))
 				.lines()
 				.last()
 				.unwrap()
@@ -839,7 +982,8 @@ mod tests {
 			change((0.0, Some((0.0, 1.0))), (2.0, Some((2.0, 3.0)))),
 			"+2 (+1 to +3) (beyond spread)"
 		);
-		assert_eq!(change((0.0, None), (2.0, None)), "");
+		assert_eq!(change((0.0, None), (2.0, None)), "+2");
+		assert_eq!(change((0.0, None), (0.5, None)), "+0.500");
 		assert_eq!(
 			change((1.0, Some((0.0, 2.0))), (2.0, Some((1.0, 3.0)))),
 			"~+1 (-1 to +3) (within spread)"

@@ -6,6 +6,7 @@ mod bench;
 mod callgrind;
 mod cargo;
 mod compare;
+mod diagnose;
 #[cfg(target_os = "linux")]
 mod cores;
 /// No host but Linux leases a core.
@@ -85,6 +86,8 @@ options:
                        for quick, instructions and estimated cycles for sim, time for bench,
                        each beside its heap allocations (sim and quick: no <base>)
   --report <file>      write every measure of every benchmark as JSON
+  --all-details        print every measure of every benchmark, not only those that moved in a
+                       suite of more than 10
   --jobs <n>           how many jobs run at once (default: every core, or for quick, every core
                        of the PMU it counts on; bench runs one at a time)
   --build <command>    a shell command that builds the programs, run first (sim, with --program)
@@ -170,7 +173,12 @@ fn cli(args: &[String]) -> Result<(), String> {
 				}
 				print!("{}", metrics::table(&counts));
 				print!("{}", threaded(&counts));
-				print!("{}", metrics::details(None, &counts.shown(), &BTreeMap::new()));
+				let pick = metrics::Pick::new(
+					counts.counts.keys().map(|name| (name.clone(), false)).collect(),
+					options.all_details,
+					false,
+				);
+				print!("{}", metrics::details(None, &counts.shown(), &BTreeMap::new(), &pick));
 				if let Some(out) = &options.out {
 					metrics::File::counts(&counts, &counter)?.write(out)?;
 					eprintln!("swole: wrote {}", out.display());
@@ -234,6 +242,8 @@ pub(crate) struct Options {
 	allow_missing: bool,
 	out: Option<PathBuf>,
 	report: Option<PathBuf>,
+	/// Whether stdout prints every measure of every benchmark, rather than only what moved.
+	all_details: bool,
 	/// How many jobs run at once, when given.
 	jobs: Option<usize>,
 	build: Option<String>,
@@ -248,6 +258,7 @@ impl Options {
 			allow_missing: false,
 			out: None,
 			report: None,
+			all_details: false,
 			jobs: None,
 			build: None,
 			programs: Vec::new(),
@@ -265,6 +276,7 @@ impl Options {
 				"--allow-missing" => options.allow_missing = true,
 				"--out" => options.out = Some(PathBuf::from(value()?)),
 				"--report" => options.report = Some(PathBuf::from(value()?)),
+				"--all-details" => options.all_details = true,
 				"--jobs" => {
 					let jobs = value()?;
 					options.jobs = Some(
@@ -407,7 +419,7 @@ impl Counts {
 	}
 
 	/// Every measure of the benchmark `name`, when counted: its details, or its headline count
-	/// alone, then what derives from them and what each call processes.
+	/// alone, then what derives from them per what each call processes, and the ratios they give.
 	pub(crate) fn measures(&self, name: &str) -> Option<Vec<Measure>> {
 		let count = *self.counts.get(name)?;
 		let mut measures = match self.details.get(name) {
@@ -421,6 +433,8 @@ impl Counts {
 		if let Some(throughput) = self.throughput.get(name) {
 			measures.extend(throughput.measures(&measures));
 		}
+		let derived = diagnose::derive(&measures, false);
+		measures.extend(derived);
 		Some(measures)
 	}
 

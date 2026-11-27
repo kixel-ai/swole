@@ -68,6 +68,9 @@ pub struct Event {
 	kernel: bool,
 	/// Whether it takes one of the PMU's counters, as every event but the kernel's software ones does.
 	hardware: bool,
+	/// What each count it reads stands for: AMD's dispatch slots are its cycles times how many ops
+	/// the core dispatches a cycle.
+	scale: u64,
 }
 
 impl Event {
@@ -103,6 +106,9 @@ impl Event {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pass {
 	pub groups: Vec<Vec<Event>>,
+	/// Whether the harness reads every counter with `read()`, as Intel's top-down metrics need,
+	/// rather than its hardware ones with `rdpmc`, which reads them as fractions of `slots`.
+	pub read: bool,
 }
 
 impl Pass {
@@ -116,8 +122,12 @@ impl Pass {
 		self.events().count()
 	}
 
-	/// How many of them are hardware counters, which it opens before its software ones.
+	/// How many of them the harness reads in user space: the hardware counters, which it opens
+	/// before its software ones, unless it reads them all with `read()`.
 	pub fn hardware(&self) -> usize {
+		if self.read {
+			return 0;
+		}
 		self.events().filter(|event| event.hardware).count()
 	}
 }
@@ -230,7 +240,9 @@ impl Host {
 				.expect("a String takes every write");
 				for (i, pass) in perf.passes.iter().enumerate() {
 					let names: Vec<&str> = pass.events().map(|event| event.name.as_str()).collect();
-					writeln!(out, "pass {}: {}", i + 1, names.join(" ")).expect("a String takes every write");
+					// A pass the harness reads with `read()` alone, which changes what its counts hold.
+					let read = if pass.read { " (read)" } else { "" };
+					writeln!(out, "pass {}{read}: {}", i + 1, names.join(" ")).expect("a String takes every write");
 				}
 				if !perf.absent.is_empty() {
 					writeln!(out, "absent: {}", perf.absent.join(" ")).expect("a String takes every write");
@@ -291,17 +303,18 @@ impl Perf {
 				matches!(trial(&branches), Ok(true))
 			})
 			.last();
-		let mut units: Vec<Vec<Event>> = Vec::new();
+		let rings: &[bool] = if kernel && !quick { &[false, true] } else { &[false] };
 		let mut absent = Vec::new();
+		// Each generic event the PMU counts, in each ring it counts it in, in `GENERIC`'s order.
+		let mut opened: Vec<Event> = Vec::new();
 		for (name, kind, config) in GENERIC {
 			if quick && !QUICK.contains(&name) {
 				continue;
 			}
-			let rings: &[bool] = if kernel && !quick { &[false, true] } else { &[false] };
 			for &ring in rings {
 				let event = generic(&pmu, name, kind, config, ring);
 				match trial(std::slice::from_ref(&event)) {
-					Ok(true) => units.push(vec![event]),
+					Ok(true) => opened.push(event),
 					Ok(false) => return Err(format!("PMU {} cannot schedule {} alone", pmu.name, event.name)),
 					Err(err) if unsupported(&err) => {
 						if !ring {
@@ -313,33 +326,88 @@ impl Perf {
 				}
 			}
 		}
-		// A breakdown led by `slots` is Intel's top-down metrics, which a read in user space gets
-		// as fractions of `slots` rather than counts.
-		if let Some(topdown) = topdown(&pmu)?.filter(|_| !quick) {
-			if topdown[0].name == "slots:u" {
-				absent.push("topdown".to_owned());
-			} else {
-				match trial(&topdown) {
-					Ok(true) => units.push(topdown),
-					Ok(_) => absent.push("topdown".to_owned()),
-					Err(err) if unsupported(&err) => absent.push("topdown".to_owned()),
-					Err(err) => return Err(format!("cannot open PMU {}'s top-down counters: {err}", pmu.name)),
-				}
+		// A ring's clock events count in one group, so instructions a cycle and cycles a reference
+		// cycle each divide counts of one window, then every other event alone.
+		let mut units: Vec<Vec<Event>> = Vec::new();
+		for ring in ["u", "k"] {
+			let clock: Vec<Event> = opened
+				.iter()
+				.filter(|event| CLOCK.iter().any(|name| event.name == format!("{name}:{ring}")))
+				.cloned()
+				.collect();
+			match trial(&clock) {
+				_ if clock.is_empty() => {}
+				Ok(true) => units.push(clock),
+				// Counted apart, they derive no ratio.
+				_ => units.extend(clock.into_iter().map(|event| vec![event])),
 			}
 		}
+		units.extend(
+			opened
+				.into_iter()
+				.filter(|event| !CLOCK.iter().any(|name| event.name.starts_with(&format!("{name}:"))))
+				.map(|event| vec![event]),
+		);
+		// Intel's top-down metrics, which `rdpmc` reads as fractions of `slots`, take a pass the
+		// harness reads with `read()`; a PMU that counts its breakdown as events packs it as any.
+		let mut metrics = None;
+		match topdown(&pmu)?.filter(|_| !quick) {
+			None => {}
+			Some(Topdown::Metrics(group)) => match trial(&group) {
+				Ok(true) => {
+					metrics = Some(Pass {
+						groups: vec![group],
+						read: true,
+					});
+				}
+				Ok(false) => absent.push("topdown".to_owned()),
+				Err(err) if unsupported(&err) => absent.push("topdown".to_owned()),
+				Err(err) => return Err(format!("cannot open PMU {}'s top-down metrics: {err}", pmu.name)),
+			},
+			Some(Topdown::Events(breakdown)) => {
+				for (level, mut unit) in breakdown {
+					loop {
+						match trial(&unit) {
+							Ok(true) => units.push(unit),
+							// A PMU with a counter fewer, such as one the NMI watchdog holds, counts
+							// the breakdown without the SMT sibling's share.
+							Ok(false) if unit.last().is_some_and(|event| event.name == SMT) => {
+								unit.pop();
+								continue;
+							}
+							Ok(false) => absent.push(level.to_owned()),
+							Err(err) if unsupported(&err) => absent.push(level.to_owned()),
+							Err(err) => {
+								return Err(format!("cannot open PMU {}'s {level} counters: {err}", pmu.name));
+							}
+						}
+						break;
+					}
+				}
+				absent.dedup();
+			}
+		}
+		// Each unit in the first group it fits beside, so no PMU counter idles while a later pass
+		// needs one.
 		let mut groups: Vec<Vec<Event>> = Vec::new();
-		for unit in units {
-			if let Some(group) = groups.last_mut() {
+		'units: for unit in units {
+			for group in &mut groups {
 				let mut wider = group.clone();
 				wider.extend(unit.iter().cloned());
 				if matches!(trial(&wider), Ok(true)) {
 					*group = wider;
-					continue;
+					continue 'units;
 				}
 			}
 			groups.push(unit);
 		}
-		let mut passes: Vec<Pass> = groups.into_iter().map(|group| Pass { groups: vec![group] }).collect();
+		let mut passes: Vec<Pass> = groups
+			.into_iter()
+			.map(|group| Pass {
+				groups: vec![group],
+				read: false,
+			})
+			.collect();
 		for (name, config, scheduler) in SOFTWARE.into_iter().filter(|_| !quick) {
 			// The scheduler counts its events in the kernel, so they need its ring, as only tier L1
 			// opens; a page fault counts in the ring that took it.
@@ -354,11 +422,13 @@ impl Perf {
 				config1: 0,
 				kernel,
 				hardware: false,
+				scale: 1,
 			};
 			trial(std::slice::from_ref(&event))
 				.map_err(|err| format!("cannot open a perf counter of {name}: {err}"))?;
 			passes[0].groups.push(vec![event]);
 		}
+		passes.extend(metrics);
 		Ok(Self {
 			pmu,
 			kernel: kernel && !quick,
@@ -380,9 +450,12 @@ const QUICK: [&str; 6] = [
 ];
 
 /// The generic hardware events: each name, perf type, and config.
-const GENERIC: [(&str, u32, u64); 11] = [
+const GENERIC: [(&str, u32, u64); 12] = [
 	("instructions", PERF_TYPE_HARDWARE, 1),
 	("cycles", PERF_TYPE_HARDWARE, 0),
+	// Cycles at the core's base frequency, whatever it runs at: Intel's fixed reference counter,
+	// or AMD's `ls_not_halted_p0_cyc` from Zen 4 on.
+	("ref-cycles", PERF_TYPE_HARDWARE, 9),
 	("branches", PERF_TYPE_HARDWARE, 4),
 	("branch-misses", PERF_TYPE_HARDWARE, 5),
 	("stalled-cycles-frontend", PERF_TYPE_HARDWARE, 7),
@@ -396,6 +469,9 @@ const GENERIC: [(&str, u32, u64); 11] = [
 	("iTLB-load-misses", PERF_TYPE_HW_CACHE, 4 | 1 << 16),
 ];
 
+/// The generic events each ring counts in one group, so the ratios between them hold.
+const CLOCK: [&str; 3] = ["instructions", "cycles", "ref-cycles"];
+
 /// The software events: each name, config, and whether the scheduler counts it.
 /// The calling thread's time on a CPU, task-clock, is not among them: read in user space, the
 /// counters cannot keep their own reads out of it.
@@ -405,13 +481,46 @@ const SOFTWARE: [(&str, u64, bool); 3] = [
 	("cpu-migrations", 4, true),
 ];
 
-/// The first level of the top-down breakdown, as a PMU exports it among its own events.
-const TOPDOWN: [&str; 4] = [
+/// The top-down breakdown, as a PMU exports it among its own events: the first level, then the
+/// second level's share of each.
+const TOPDOWN: [&str; 8] = [
 	"topdown-retiring",
 	"topdown-bad-spec",
 	"topdown-fe-bound",
 	"topdown-be-bound",
+	"topdown-heavy-ops",
+	"topdown-br-mispredict",
+	"topdown-fetch-lat",
+	"topdown-mem-bound",
 ];
+
+/// What `slots` is named, the dispatch slots a breakdown divides.
+pub const SLOTS: &str = "slots:u";
+
+/// AMD's events of its breakdown's first level, after the slots, by perf's names.
+pub const FRONTEND: &str = "de_no_dispatch_per_slot.no_ops_from_frontend:u";
+pub const BACKEND: &str = "de_no_dispatch_per_slot.backend_stalls:u";
+pub const DISPATCHED: &str = "de_src_op_disp.all:u";
+pub const RETIRED: &str = "ex_ret_ops:u";
+/// The slots the SMT sibling took, the first level's last event, which a PMU a counter short
+/// leaves out.
+pub const SMT: &str = "de_no_dispatch_per_slot.smt_contention:u";
+/// AMD's events of its breakdown's second level, a pair each: cycles and those no op came from the
+/// frontend at all, mispredicted branches and resyncs, and stalls on loads and on anything.
+pub const CYCLES: &str = "ls_not_halted_cyc:u";
+pub const FRONTEND_IDLE: &str = "de_no_dispatch_per_slot.no_ops_from_frontend,cmask:u";
+pub const MISPREDICTS: &str = "ex_ret_brn_misp:u";
+pub const RESYNCS: &str = "resyncs:u";
+pub const LOAD_STALLS: &str = "ex_no_retire.load_not_complete:u";
+pub const STALLS: &str = "ex_no_retire.not_complete:u";
+
+/// The top-down breakdown a PMU counts.
+enum Topdown {
+	/// Intel's metrics, a group led by `slots`.
+	Metrics(Vec<Event>),
+	/// Events the PMU counts as any other, a group of each level, named for what it is.
+	Events(Vec<(&'static str, Vec<Event>)>),
+}
 
 /// A generic event of `pmu`, in user space or, when `kernel`, the kernel.
 fn generic(pmu: &Pmu, name: &str, kind: u32, config: u64, kernel: bool) -> Event {
@@ -422,18 +531,59 @@ fn generic(pmu: &Pmu, name: &str, kind: u32, config: u64, kernel: bool) -> Event
 		config1: 0,
 		kernel,
 		hardware: true,
+		scale: 1,
 	}
 }
 
-/// The top-down events `pmu` exports, in user space, as one group: led by its `slots` event
-/// where it has one, as a PMU that computes them from it requires.
-fn topdown(pmu: &Pmu) -> Result<Option<Vec<Event>>, String> {
+/// The top-down breakdown `pmu` counts in user space: the events it exports, led by its `slots`
+/// event where it has one, as a PMU that computes them from it requires, or on AMD's Zen 4 and 5,
+/// which export none, the events perf's own metrics divide.
+fn topdown(pmu: &Pmu) -> Result<Option<Topdown>, String> {
 	let Some(dir) = &pmu.dir else {
 		return Ok(None);
 	};
 	let kind = read(&dir.join("type"))?
 		.parse()
 		.map_err(|_| format!("{}/type is no perf type", dir.display()))?;
+	let event = |name: &str, spec: &str, scale: u64| -> Result<Event, String> {
+		let (config, config1) = sysfs(dir, spec).map_err(|err| format!("{name}'s {spec}: {err}"))?;
+		Ok(Event {
+			name: name.to_owned(),
+			kind,
+			config,
+			config1,
+			kernel: false,
+			hardware: true,
+			scale,
+		})
+	};
+	if pmu.name == "cpu"
+		&& let Some(zen) = Zen::of(&std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default())
+	{
+		let width = zen.width();
+		let first = vec![
+			event(SLOTS, "event=0x76", width)?,
+			event(FRONTEND, "event=0x1a0,umask=0x01", 1)?,
+			event(BACKEND, "event=0x1a0,umask=0x1e", 1)?,
+			event(DISPATCHED, "event=0xaa,umask=0x07", 1)?,
+			event(RETIRED, "event=0xc1", 1)?,
+			event(SMT, "event=0x1a0,umask=0x60", 1)?,
+		];
+		let second = [
+			vec![
+				event(CYCLES, "event=0x76", 1)?,
+				event(FRONTEND_IDLE, &format!("event=0x1a0,umask=0x01,cmask={width}"), 1)?,
+			],
+			vec![event(MISPREDICTS, "event=0xc3", 1)?, event(RESYNCS, zen.resyncs(), 1)?],
+			vec![
+				event(LOAD_STALLS, "event=0xd6,umask=0xa2", 1)?,
+				event(STALLS, "event=0xd6,umask=0x02", 1)?,
+			],
+		];
+		let mut levels = vec![("topdown", first)];
+		levels.extend(second.into_iter().map(|pair| ("topdown level 2", pair)));
+		return Ok(Some(Topdown::Events(levels)));
+	}
 	let mut events = Vec::new();
 	for name in std::iter::once("slots").chain(TOPDOWN) {
 		let path = dir.join("events").join(name);
@@ -442,18 +592,64 @@ fn topdown(pmu: &Pmu) -> Result<Option<Vec<Event>>, String> {
 		};
 		// The kernel pads some specs with NULs.
 		let spec = spec.trim_matches(|c: char| c == '\0' || c.is_whitespace());
-		let (config, config1) = sysfs(dir, spec).map_err(|err| format!("{}: {err}", path.display()))?;
-		events.push(Event {
-			name: format!("{name}:u"),
-			kind,
-			config,
-			config1,
-			kernel: false,
-			hardware: true,
-		});
+		events.push(event(&format!("{name}:u"), spec, 1).map_err(|err| format!("{}: {err}", path.display()))?);
 	}
 	// `slots` alone is no breakdown.
-	Ok(events.iter().any(|event| event.name != "slots:u").then_some(events))
+	if !events.iter().any(|event| event.name != SLOTS) {
+		return Ok(None);
+	}
+	Ok(Some(if events[0].name == SLOTS {
+		Topdown::Metrics(events)
+	} else {
+		Topdown::Events(vec![("topdown", events)])
+	}))
+}
+
+/// An AMD core whose breakdown swole knows, as perf's own event lists name each.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Zen {
+	Four,
+	Five,
+}
+
+impl Zen {
+	/// The core `/proc/cpuinfo` describes, when it is one: Zen 4 is family 25 but Zen 3's models,
+	/// and Zen 5 family 26 but Zen 6's.
+	fn of(cpuinfo: &str) -> Option<Self> {
+		let field = |key: &str| {
+			cpuinfo.lines().find_map(|line| {
+				let (name, value) = line.split_once(':')?;
+				(name.trim() == key).then(|| value.trim())
+			})
+		};
+		if field("vendor_id")? != "AuthenticAMD" {
+			return None;
+		}
+		let family: u32 = field("cpu family")?.parse().ok()?;
+		let model: u32 = field("model")?.parse().ok()?;
+		match (family, model >> 4) {
+			(25, 0 | 2..=5) => None,
+			(25, _) => Some(Self::Four),
+			(26, 0..=2 | 4 | 6 | 7) => Some(Self::Five),
+			_ => None,
+		}
+	}
+
+	/// How many ops it dispatches a cycle, which are its slots.
+	fn width(self) -> u64 {
+		match self {
+			Self::Four => 6,
+			Self::Five => 8,
+		}
+	}
+
+	/// Its event of the pipeline restarts a resync takes.
+	fn resyncs(self) -> &'static str {
+		match self {
+			Self::Four => "event=0x96",
+			Self::Five => "event=0x9f,umask=0x01",
+		}
+	}
 }
 
 /// The config words a PMU's event spec, such as `event=0xc2,umask=0x02`, sets, by the bit ranges
@@ -827,47 +1023,153 @@ impl Usage {
 }
 
 /// Each counter `passes` read, a call's share over each pass's calls, then what derives from
-/// them: instructions a cycle, in each ring where both counters ran in the same group.
+/// counters that ran in the same group, over the same window: instructions a cycle and cycles a
+/// reference cycle in each ring, and the top-down breakdown.
 pub fn measures(passes: &[Pass], values: &[(Vec<u64>, u64)]) -> Vec<crate::Measure> {
-	let mut out: Vec<crate::Measure> = passes
+	// Each group's events by name, a call's share of each, its scale applied.
+	let groups: Vec<Vec<(&str, f64)>> = passes
 		.iter()
 		.zip(values)
 		.flat_map(|(pass, (values, calls))| {
-			pass.events()
-				.zip(values)
-				.map(move |(event, &value)| (event, value, *calls))
+			let mut values = values.iter();
+			pass.groups.iter().map(move |group| {
+				group
+					.iter()
+					.zip(values.by_ref())
+					.map(|(event, &value)| (event.name.as_str(), (value * event.scale) as f64 / *calls as f64))
+					.collect::<Vec<_>>()
+			})
 		})
-		.map(|(event, value, calls)| crate::Measure::new(&event.name, value as f64 / calls as f64, event.unit()))
 		.collect();
+	let mut out: Vec<crate::Measure> = passes
+		.iter()
+		.flat_map(Pass::events)
+		.zip(groups.iter().flatten())
+		.map(|(event, &(name, value))| crate::Measure::new(name, value, event.unit()))
+		.collect();
+	let together = Together(&groups);
 	for ring in ["u", "k"] {
-		let inst_name = format!("instructions:{ring}");
-		let cyc_name = format!("cycles:{ring}");
-		let ratio = passes.iter().zip(values).find_map(|(pass, (values, _))| {
-			let mut offset = 0;
-			for group in &pass.groups {
-				let slice = &values[offset..offset + group.len()];
-				offset += group.len();
-				let find = |name: &str| {
-					group
-						.iter()
-						.zip(slice)
-						.find(|(event, _)| event.name == name)
-						.map(|(_, &value)| value)
-				};
-				if let (Some(instructions), Some(cycles)) = (find(&inst_name), find(&cyc_name))
-					&& cycles > 0
-				{
-					return Some(instructions as f64 / cycles as f64);
-				}
+		let [instructions, cycles, reference] = ["instructions", "cycles", "ref-cycles"].map(|name| format!("{name}:{ring}"));
+		if let Some([instructions, cycles]) = together.find([instructions.as_str(), cycles.as_str()])
+			&& cycles > 0.0
+		{
+			out.push(crate::Measure::new(&format!("IPC:{ring}"), instructions / cycles, "instructions/cycle"));
+		}
+		if let Some([cycles, reference]) = together.find([cycles.as_str(), reference.as_str()])
+			&& reference > 0.0
+		{
+			out.push(crate::Measure::new(&format!("cycles/ref-cycles:{ring}"), cycles / reference, "ratio"));
+		}
+	}
+	out.extend(breakdown(&together));
+	out
+}
+
+/// Counters by group, which find the values of events counted together.
+struct Together<'a>(&'a [Vec<(&'a str, f64)>]);
+
+impl Together<'_> {
+	/// The values of `names`, in their order, from the first group that counted every one.
+	fn find<const N: usize>(&self, names: [&str; N]) -> Option<[f64; N]> {
+		self.0.iter().find_map(|group| {
+			let mut found = [0.0; N];
+			for (slot, name) in found.iter_mut().zip(names) {
+				*slot = group.iter().find(|(event, _)| *event == name)?.1;
 			}
-			None
-		});
-		if let Some(ipc) = ratio {
-			out.push(crate::Measure::new(&format!("IPC:{ring}"), ipc, "instructions/cycle"));
+			Some(found)
+		})
+	}
+}
+
+/// The top-down breakdown, each a percentage of the dispatch slots: the first level's retiring,
+/// bad speculation, frontend and backend bound, and where the PMU counts it, the second level's
+/// split of each. Intel's divide its `slots`, Intel's E-cores', which have none, their first
+/// level's sum, and AMD's the slots its cycles hold, as perf's own metrics do. AMD's second level
+/// divides each first-level share as a pair counted together splits it, with the pair's group
+/// counted in a pass of its own.
+fn breakdown(together: &Together) -> Vec<crate::Measure> {
+	let mut out = Vec::new();
+	let percent = |name: &str, share: f64| crate::Measure::new(name, 100.0 * share.max(0.0), "%");
+	// A second-level share and what is left of its parent.
+	let split = |out: &mut Vec<crate::Measure>, [part, rest]: [&str; 2], parent: f64, share: f64| {
+		let parent = parent.max(0.0);
+		let share = share.clamp(0.0, parent);
+		out.push(percent(part, share));
+		out.push(percent(rest, parent - share));
+	};
+	let names = |names: [&str; 4]| names.map(|name| format!("{name}:u"));
+	let [retiring, bad, frontend, backend] = names(["topdown-retiring", "topdown-bad-spec", "topdown-fe-bound", "topdown-be-bound"]);
+	let first = |shares: [f64; 4], out: &mut Vec<crate::Measure>| {
+		for (name, share) in LEVEL_ONE.into_iter().zip(shares) {
+			out.push(percent(name, share));
+		}
+	};
+	if let Some([slots, r, b, f, e]) = together.find([SLOTS, retiring.as_str(), bad.as_str(), frontend.as_str(), backend.as_str()]) {
+		if slots <= 0.0 {
+			return out;
+		}
+		let [r, b, f, e] = [r, b, f, e].map(|value| value / slots);
+		first([r, b, f, e], &mut out);
+		let [heavy, mispredict, fetch, memory] = names(["topdown-heavy-ops", "topdown-br-mispredict", "topdown-fetch-lat", "topdown-mem-bound"]);
+		for (child, parent, pair) in [
+			(&heavy, r, LEVEL_TWO[0]),
+			(&mispredict, b, LEVEL_TWO[1]),
+			(&fetch, f, LEVEL_TWO[2]),
+			(&memory, e, LEVEL_TWO[3]),
+		] {
+			if let Some([slots, child]) = together.find([SLOTS, child.as_str()]) {
+				split(&mut out, pair, parent, child / slots);
+			}
+		}
+	} else if let Some(shares) = together.find([retiring.as_str(), bad.as_str(), frontend.as_str(), backend.as_str()]) {
+		let total: f64 = shares.iter().sum();
+		if total > 0.0 {
+			first(shares.map(|value| value / total), &mut out);
+		}
+	} else if let Some([slots, f, e, dispatched, retired]) = together.find([SLOTS, FRONTEND, BACKEND, DISPATCHED, RETIRED]) {
+		if slots <= 0.0 {
+			return out;
+		}
+		let [r, b, f, e] = [retired, dispatched - retired, f, e].map(|value| value / slots);
+		first([r, b, f, e], &mut out);
+		if let Some([slots, smt]) = together.find([SLOTS, SMT]) {
+			out.push(percent("topdown SMT contention", smt / slots));
+		}
+		// Cycles no op came from the frontend at all, every slot of each, are its latency.
+		if let Some([cycles, idle]) = together.find([CYCLES, FRONTEND_IDLE])
+			&& cycles > 0.0
+		{
+			split(&mut out, LEVEL_TWO[2], f, idle / cycles);
+		}
+		if let Some([mispredicts, resyncs]) = together.find([MISPREDICTS, RESYNCS])
+			&& mispredicts + resyncs > 0.0
+		{
+			split(&mut out, LEVEL_TWO[1], b, b * mispredicts / (mispredicts + resyncs));
+		}
+		if let Some([loads, stalls]) = together.find([LOAD_STALLS, STALLS])
+			&& stalls > 0.0
+		{
+			split(&mut out, LEVEL_TWO[3], e, e * loads / stalls);
 		}
 	}
 	out
 }
+
+/// The breakdown's first level, as swole names each share.
+pub const LEVEL_ONE: [&str; 4] = [
+	"topdown retiring",
+	"topdown bad speculation",
+	"topdown frontend bound",
+	"topdown backend bound",
+];
+
+/// The breakdown's second level, each first-level share's split, the counted part first.
+pub const LEVEL_TWO: [[&str; 2]; 4] = [
+	["topdown heavy operations", "topdown light operations"],
+	["topdown branch mispredicts", "topdown machine clears"],
+	["topdown fetch latency", "topdown fetch bandwidth"],
+	["topdown memory bound", "topdown core bound"],
+];
 
 /// Clears the capabilities swole would hand every program it runs: a wrapper such as NixOS's
 /// raises the ones it grants into the ambient set, which survives `exec` into an ordinary
@@ -1322,23 +1624,177 @@ mod tests {
 			groups: vec![vec![
 				generic(&pmu, "instructions", PERF_TYPE_HARDWARE, 1, false),
 				generic(&pmu, "cycles", PERF_TYPE_HARDWARE, 0, false),
+				generic(&pmu, "ref-cycles", PERF_TYPE_HARDWARE, 9, false),
 			]],
+			read: false,
 		};
-		let same = measures(&[pass], &[(vec![300, 100], 2)]);
+		let same = measures(&[pass], &[(vec![300, 100, 80], 2)]);
 		let shown: Vec<(&str, f64)> = same.iter().map(|m| (m.name.as_str(), m.value)).collect();
-		assert_eq!(shown, [("instructions:u", 150.0), ("cycles:u", 50.0), ("IPC:u", 3.0)]);
+		assert_eq!(
+			shown,
+			[
+				("instructions:u", 150.0),
+				("cycles:u", 50.0),
+				("ref-cycles:u", 40.0),
+				("IPC:u", 3.0),
+				("cycles/ref-cycles:u", 1.25)
+			]
+		);
 
 		// Separate passes (different processes) must not derive IPC across them.
 		let split = [
 			Pass {
 				groups: vec![vec![generic(&pmu, "instructions", PERF_TYPE_HARDWARE, 1, false)]],
+				read: false,
 			},
 			Pass {
-				groups: vec![vec![generic(&pmu, "cycles", PERF_TYPE_HARDWARE, 0, false)]],
+				groups: vec![
+					vec![generic(&pmu, "cycles", PERF_TYPE_HARDWARE, 0, false)],
+					vec![generic(&pmu, "ref-cycles", PERF_TYPE_HARDWARE, 9, false)],
+				],
+				read: false,
 			},
 		];
-		let split_measures = measures(&split, &[(vec![300], 2), (vec![100], 2)]);
+		let split_measures = measures(&split, &[(vec![300], 2), (vec![100, 80], 2)]);
 		let split_shown: Vec<(&str, f64)> = split_measures.iter().map(|m| (m.name.as_str(), m.value)).collect();
-		assert_eq!(split_shown, [("instructions:u", 150.0), ("cycles:u", 50.0)]);
+		assert_eq!(
+			split_shown,
+			[("instructions:u", 150.0), ("cycles:u", 50.0), ("ref-cycles:u", 40.0)]
+		);
+	}
+
+	/// An event of a PMU's own, as the breakdown names them.
+	fn own(name: &str, scale: u64) -> Event {
+		Event {
+			name: name.to_owned(),
+			kind: 4,
+			config: 0,
+			config1: 0,
+			kernel: false,
+			hardware: true,
+			scale,
+		}
+	}
+
+	/// Each measure that `passes` derive, counting `values`, as a percentage.
+	fn percentages(passes: &[Pass], values: &[(Vec<u64>, u64)]) -> Vec<(String, f64)> {
+		measures(passes, values)
+			.into_iter()
+			.filter(|measure| measure.unit == "%")
+			.map(|measure| (measure.name, (measure.value * 1000.0).round() / 1000.0))
+			.collect()
+	}
+
+	fn named(shares: &[(&str, f64)]) -> Vec<(String, f64)> {
+		shares.iter().map(|&(name, share)| (name.to_owned(), share)).collect()
+	}
+
+	#[test]
+	fn breaks_intels_metrics_down_by_their_slots() {
+		let names = ["slots", "topdown-retiring", "topdown-bad-spec", "topdown-fe-bound", "topdown-be-bound"];
+		let mut group: Vec<Event> = names.iter().map(|name| own(&format!("{name}:u"), 1)).collect();
+		group.extend(["topdown-heavy-ops", "topdown-br-mispredict", "topdown-fetch-lat", "topdown-mem-bound"].map(|name| own(&format!("{name}:u"), 1)));
+		let pass = Pass { groups: vec![group], read: true };
+		// The harness reads them all with `read()`.
+		assert_eq!(pass.hardware(), 0);
+		assert_eq!(
+			percentages(&[pass], &[(vec![1000, 400, 100, 300, 200, 50, 80, 120, 150], 4)]),
+			named(&[
+				("topdown retiring", 40.0),
+				("topdown bad speculation", 10.0),
+				("topdown frontend bound", 30.0),
+				("topdown backend bound", 20.0),
+				("topdown heavy operations", 5.0),
+				("topdown light operations", 35.0),
+				("topdown branch mispredicts", 8.0),
+				("topdown machine clears", 2.0),
+				("topdown fetch latency", 12.0),
+				("topdown fetch bandwidth", 18.0),
+				("topdown memory bound", 15.0),
+				("topdown core bound", 5.0),
+			])
+		);
+		// Intel's E-cores count the first level as events, with no slots: their sum is.
+		let atom = Pass {
+			groups: vec![names[1..].iter().map(|name| own(&format!("{name}:u"), 1)).collect()],
+			read: false,
+		};
+		assert_eq!(
+			percentages(&[atom], &[(vec![50, 25, 15, 10], 1)]),
+			named(&[
+				("topdown retiring", 50.0),
+				("topdown bad speculation", 25.0),
+				("topdown frontend bound", 15.0),
+				("topdown backend bound", 10.0),
+			])
+		);
+	}
+
+	#[test]
+	fn breaks_amds_dispatch_slots_down_as_perfs_metrics_do() {
+		// Zen 5's eight slots a cycle, and the second level's pairs in a pass of their own.
+		let first = Pass {
+			groups: vec![vec![
+				own(SLOTS, 8),
+				own(FRONTEND, 1),
+				own(BACKEND, 1),
+				own(DISPATCHED, 1),
+				own(RETIRED, 1),
+				own(SMT, 1),
+			]],
+			read: false,
+		};
+		let second = Pass {
+			groups: vec![
+				vec![own(CYCLES, 1), own(FRONTEND_IDLE, 1)],
+				vec![own(MISPREDICTS, 1), own(RESYNCS, 1)],
+				vec![own(LOAD_STALLS, 1), own(STALLS, 1)],
+			],
+			read: false,
+		};
+		assert_eq!(
+			percentages(
+				&[first, second],
+				&[(vec![100, 240, 160, 400, 320, 80], 2), (vec![100, 10, 3, 1, 30, 40], 2)]
+			),
+			named(&[
+				("topdown retiring", 40.0),
+				("topdown bad speculation", 10.0),
+				("topdown frontend bound", 30.0),
+				("topdown backend bound", 20.0),
+				("topdown SMT contention", 10.0),
+				("topdown fetch latency", 10.0),
+				("topdown fetch bandwidth", 20.0),
+				("topdown branch mispredicts", 7.5),
+				("topdown machine clears", 2.5),
+				("topdown memory bound", 15.0),
+				("topdown core bound", 5.0),
+			])
+		);
+		// The slots are the cycles they stand for.
+		let slots = measures(
+			&[Pass {
+				groups: vec![vec![own(SLOTS, 8)]],
+				read: false,
+			}],
+			&[(vec![100], 2)],
+		);
+		assert_eq!(slots[0].value, 400.0);
+	}
+
+	#[test]
+	fn knows_zen_4_and_5_by_family_and_model() {
+		let cpu = |vendor: &str, family: u32, model: u32| {
+			Zen::of(&format!("processor\t: 0\nvendor_id\t: {vendor}\ncpu family\t: {family}\nmodel\t\t: {model}\n"))
+		};
+		assert_eq!(cpu("AuthenticAMD", 26, 0x44), Some(Zen::Five));
+		assert_eq!(cpu("AuthenticAMD", 26, 0x50), None);
+		assert_eq!(cpu("AuthenticAMD", 25, 0x61), Some(Zen::Four));
+		assert_eq!(cpu("AuthenticAMD", 25, 0x21), None);
+		assert_eq!(cpu("AuthenticAMD", 25, 0x01), None);
+		assert_eq!(cpu("AuthenticAMD", 23, 0x71), None);
+		assert_eq!(cpu("GenuineIntel", 6, 0xc6), None);
+		assert_eq!(Zen::Four.width(), 6);
+		assert_eq!(Zen::Five.width(), 8);
 	}
 }
