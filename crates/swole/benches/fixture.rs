@@ -94,7 +94,7 @@ fn stepped(heavy: &mut Heavy) -> u64 {
 }
 
 /// Counts near `alone`, called for one iteration: its clock's reads count too.
-#[bench]
+#[bench(items = 1000)]
 fn timed(iterations: Iterations) -> Duration {
 	let start = Instant::now();
 	for _ in iterations {

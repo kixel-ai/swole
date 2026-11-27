@@ -25,6 +25,10 @@ const RAN: &str = "swole ran ";
 /// before `bytes` or `items`, how many, and its name.
 const THROUGHPUT: &str = "swole throughput ";
 
+/// What a timed run of a benchmark that times itself prints, with its name, after its throughput,
+/// since a rate over the time it returns is not its calls' wall clock.
+const OWN_TIMER: &str = "swole timer own ";
+
 /// What a timed run prints, alone on a line, before each sample's nanoseconds.
 const SAMPLE: &str = "swole sample ";
 
@@ -153,13 +157,19 @@ fn run() -> Result<(), String> {
 	}
 	if timed {
 		let (name, case) = cases.pop_first().expect("one case is left");
+		let sampler = (case.build)();
 		let throughput = case.throughput.as_ref().and_then(|throughput| {
 			let n = throughput.amount?;
-			Some(format!("\n{THROUGHPUT}{} {n} {name}", throughput.unit))
+			let own = if sampler.self_timed() {
+				format!("\n{OWN_TIMER}{name}")
+			} else {
+				String::new()
+			};
+			Some(format!("\n{THROUGHPUT}{} {n} {name}{own}", throughput.unit))
 		});
 		return serve(
 			&name,
-			(case.build)(),
+			sampler,
 			throughput.unwrap_or_default(),
 			std::io::stdin().lock(),
 			std::io::stdout(),
@@ -574,6 +584,10 @@ pub mod __private {
 		fn count(&mut self, meter: &Meter, iterations: u64) -> u64;
 		/// Calls the benchmark `iterations` times, returning the nanoseconds its timed part took.
 		fn time(&mut self, iterations: u64) -> u64;
+		/// Whether the benchmark returns its own time, rather than its calls' wall clock.
+		fn self_timed(&self) -> bool {
+			false
+		}
 	}
 
 	/// A deterministic, phase-free subset of `iterations` calls: every call when `iterations <=
@@ -1030,6 +1044,10 @@ pub mod __private {
 			let input = (self.make)();
 			nanos((self.call)(input, Iterations(iterations)))
 		}
+
+		fn self_timed(&self) -> bool {
+			true
+		}
 	}
 
 	/// A benchmark that times itself, given the iterations to run, borrowing one input
@@ -1050,6 +1068,10 @@ pub mod __private {
 
 		fn time(&mut self, iterations: u64) -> u64 {
 			nanos((self.call)(&mut self.input, Iterations(iterations)))
+		}
+
+		fn self_timed(&self) -> bool {
+			true
 		}
 	}
 
@@ -1437,6 +1459,12 @@ mod tests {
 			|seven: u64, iterations: Iterations| Duration::from_nanos(seven * iterations.get()),
 		);
 		assert_eq!(sampler.time(2), 14);
+	}
+
+	#[test]
+	fn only_a_benchmark_that_times_itself_says_so() {
+		assert!(!nothing().self_timed());
+		assert!(kept_timed((), |_: &mut (), _: Iterations| Duration::ZERO).self_timed());
 	}
 
 	#[test]

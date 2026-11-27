@@ -544,7 +544,7 @@ counted several times, the `lower` and `upper` of its samples, for `sim` every
 another thread ran beside it, and for a paired `bench`, the change and its interval. A benchmark
 that declares its [throughput](crates/swole/README.md#throughput) has each count and its
 allocations' per byte or item beside it, such as `estimated cycles/byte` or `instructions:u/byte`,
-and under `bench` a `throughput` in `bytes/s` or `items/s`:
+and under `bench` a `throughput` in `bytes/s` or `items/s`, except for a benchmark that times itself, whose returned time is not wall clock:
 
 ```json
 {"schema_version":1,"mode":"bench","fingerprint":"x86_64-1a2b3c4d5e6f","host":["arch: x86_64","..."],"base":"<the base's full commit ID>",

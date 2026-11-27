@@ -102,8 +102,8 @@ negative, or over a `u64` fails the run, since such a call processes nothing to 
 swole then reports each count its mode measured per byte or item, such as `instructions/byte`
 and `estimated cycles/byte` under `sim` and each perf counter's under `quick` and `bench`, the
 allocations and allocated bytes per byte or item where swole counts them, and under `bench`, which alone
-times natively, a `throughput` in `bytes/s` or `items/s`, over the time the benchmark reports: its calls' wall clock, or
-the `Duration` one that times itself returns. A benchmark that declares neither
+times natively, a `throughput` in `bytes/s` or `items/s` over its calls' wall clock; a benchmark that times itself
+returns a time that may not be one, so it gets the per-byte or per-item counts and no rate. A benchmark that declares neither
 reports as it would without.
 
 A borrowed input may take steps between calls that neither the count nor the clock sees:
