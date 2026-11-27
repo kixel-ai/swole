@@ -155,7 +155,8 @@ each iteration count a line of stdin holds, printing its `swole throughput` line
 the first, and `swole sample <nanoseconds>` on a
 line of its own after each, until stdin ends, after a `swole rusage` line of what the process
 used over the sample: user and system CPU nanoseconds, peak resident bytes, minor and major page
-faults, and voluntary and involuntary context switches. swole drives it so, and reads a
+faults, and voluntary and involuntary context switches, and a `swole wall <nanoseconds>` line of
+the wall clock that covers. swole drives it so, and reads a
 benchmark's own output on stdout around its samples.
 
 Under Valgrind with `--instr-atstart=no`, as swole runs it, each case's count is

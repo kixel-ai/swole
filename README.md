@@ -242,8 +242,11 @@ version moves too, since a new Valgrind can count differently and starts new ser
 
 `swole sim <base>` and `swole quick <base>` count `<base>` and the working tree in one worktree kept under
 `~/.cache/swole` (or `$XDG_CACHE_HOME`), each from the directory there that matches where
-it runs, and print a Markdown table of each benchmark's base, head, and change, then one of every
-other measure: for `sim`, each [simulated event](#simulated-cycles) and the estimated cycles. A
+it runs, and print a Markdown table of each benchmark's base, head, and change, the largest
+changes first, then the benchmarks one side has, then those that held, with the [likely
+cause](#diagnostics) beside each regression; then one of every other measure that moved: for
+`sim`, each [simulated event](#simulated-cycles) and the estimated cycles, whose change moves a
+benchmark as its instructions' does. A
 sampled (`~`) value compares by its spread, never as one exact count: between two sampled values,
 the change says whether their spreads overlap (`within spread`) or not (`beyond spread`), and with
 one side's spread alone, it is marked `~` and gives no verdict. `swole bench <base>` builds both sides in the same worktree and times
@@ -339,12 +342,12 @@ job will, on a thread pinned to the PMU's CPUs, with swole's own privileges, so 
 what each job gets; the native [fingerprint](#fingerprints) holds all of it.
 
 - Tier L2, `perf_event_paranoid` at most 2: user-space instructions, cycles and instructions a
-  cycle, branches and mispredicts, L1 data and instruction, last-level, and data and instruction
-  TLB misses, the top-down breakdown's first level where the PMU exports it (retiring, bad
-  speculation, frontend and backend bound) where it counts them as events, rather than as Intel's
-  top-down metrics, which a read in user space gets as fractions, frontend and backend stall
-  cycles where the PMU counts them, and the kernel's `page-faults` taken in user space. The
-  thread's time on a CPU, `task-clock`, is left out: the reads would count in it.
+  cycle, reference cycles (`ref-cycles`, cycles at the core's base frequency: Intel's fixed
+  counter, or AMD's from Zen 4 on), each ring's three in one group, branches and mispredicts, L1
+  data and instruction, last-level, and data and instruction TLB misses, the
+  [top-down breakdown](#diagnostics), frontend and backend stall cycles where the PMU counts them,
+  and the kernel's `page-faults` taken in user space. The thread's time on a CPU, `task-clock`, is
+  left out: the reads would count in it.
 - Tier L1, `perf_event_paranoid` at most 1 or `CAP_PERFMON`: each hardware counter in the kernel
   as well (`:k` beside `:u`), so a syscall's or `io_uring`'s cost shows apart from user space's,
   `page-faults` in both, and `context-switches` and `cpu-migrations`, which the scheduler counts
@@ -458,8 +461,9 @@ it. Each `:k` count of such a benchmark also holds the kernel's own work to star
 which no read in user space keeps out: some 10,000 instructions a call on an AMD Ryzen 9 9950X, 18,000
 on an Intel E-core, and more with each other thread alive. swole leaves it in rather than subtract a
 floor, which would take the other threads' kernel work with it. A table after the times
-prints every measure of each benchmark, beside the base's and its change when paired, and
-`--report` writes them all. A side whose harness predates counters, as a base from before an
+prints every measure of each benchmark that moved, beside the base's and its change when paired,
+with the [ratios they derive](#diagnostics), as [Output](#output) says, and `--report` writes
+them all. A side whose harness predates counters, as a base from before an
 upgrade, says so and has none, as does a threaded benchmark whose harness predates counting every
 thread; one whose harness predates rusage has none of that.
 
@@ -534,7 +538,59 @@ counts can move them, beside the headline for each benchmark that has them, a sa
 `--report` marks each as the allocation pass's (`"pass":"allocation"`) and says whether it is
 `sampled`, and adds `alloc_churn`, the bytes a call allocated for each byte of its peak.
 
+## Diagnostics
+
+Beside each measure a run takes, swole derives the ratios that say why a benchmark runs as it
+does, each where the run took what it divides, into the details table and `--report`:
+
+- misses per thousand instructions (`MPKI`): natively the L1 data and instruction, last-level,
+  and data and instruction TLB misses and the branch mispredicts, in each ring (`L1d MPKI:u`),
+  and under `sim` the simulated L1 instruction and data, last-level, and branch misses
+  (`LL MPKI`);
+- the branch miss rate, mispredicts over branches;
+- the kernel's share of the instructions, where tier L1 counts both rings, and under `bench` of
+  the CPU time, from rusage;
+- under `bench`, `CPUs busy`: the CPU time the process used over its samples' wall clock, as the
+  harness measures both. Under one, the benchmark waited off the CPU, as on a lock or I/O; over
+  one, it ran threads in parallel;
+- `cycles/ref-cycles` in each ring, counted in one group over one window, which falls as the core
+  throttles and rises with turbo; or, where the PMU counts no reference cycles, under `bench`, an
+  `estimated clock:u` in GHz, the counted cycles over the timed process's user time, which also
+  holds what a sample ran between calls;
+- the top-down breakdown under `bench`, each a percentage of the dispatch slots: the first level's
+  retiring, bad speculation, frontend bound, and backend bound, and the second level's split of
+  each, heavy and light operations, branch mispredicts and machine clears, fetch latency and
+  bandwidth, and memory and core bound. Intel's performance cores count it as `slots` and its
+  top-down metrics, which `rdpmc` would read as fractions, so the harness reads that pass with
+  `read()` alone, marked `(read)` in the probe's passes; Intel's E-cores count the first level as
+  events, divided by their sum; AMD's Zen 4 and 5 export none of it, so swole opens the events
+  perf's own metrics divide (`de_no_dispatch_per_slot.*`, `ex_ret_ops`, and the rest, by perf's
+  names), the slots six or eight a cycle, and the SMT sibling's share where the PMU has a counter
+  to spare. The breakdown counts user space alone, and splits each AMD first-level share as a
+  pair counted together divides it.
+
+A ratio of a sampled measure is sampled, its spread the widest its inputs' allow. A percentage's
+change shows in points (`pp`).
+
+A paired `bench`'s regression, a slowdown whose whole interval lies above no change, and a
+compare's, a headline count, or `sim`'s estimated cycles, grown past its spread, names its likely cause in a column beside it, from the
+first two of these its measures show, each citing the measure on both sides: `throttled`
+(`cycles/ref-cycles:u` fell 2%, or the estimated clock 5%), `off-CPU` (`CPUs busy` lost 0.1 and
+ended under 0.9), `more instructions` (1% more), `memory-bound` (the last-level, L1 data, or data
+TLB MPKI grew by a quarter and 0.1, or the breakdown's memory or backend bound gained 3 points),
+`branch mispredicts`, `frontend-bound`, `kernel` (its share gained 5 points), and for a time that
+moved 1 to 3% with its instructions, branches, and MPKI the same, the frontend bound no lower,
+`likely code alignment`: the same code at other addresses, as an unrelated change can shift it.
+A sampled measure counts only past its spread.
+
 ## Output
+
+stdout keeps a large suite's results short: each headline table prints every benchmark, sorted
+by its change, and the details table after it prints every other measure only of the benchmarks
+that moved (or one side has), and of each, only the rows that moved, with a note of what it
+left out; a suite of at most ten benchmarks prints every one, and `--all-details` every row of
+every one. `--report` holds them all. A change from an exact zero shows the absolute change, as
+`+3`, rather than a percentage of none.
 
 `--out` writes only the headline measures of each benchmark, so a run of a large workspace stays
 well within the 1 MiB Kixel Quest reads, and fails a run that would not. `sim --out` and

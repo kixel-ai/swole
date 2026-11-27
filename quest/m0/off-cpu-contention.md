@@ -13,7 +13,7 @@ Decided 2026-11-26 (maintainer, `/quest-plan`, splitting the former `quest/m0/de
 Recommendations for the implementer:
 
 - Note that plain tracepoint event counting (`perf stat`) only yields event counts, not wait durations, and scheduler sleep/blocked records alone lack futex attribution. Measure total off-CPU blocked time from scheduler records (`sched:sched_stat_sleep` / `sched:sched_stat_blocked` when `kernel.sched_schedstats=1`, or paired `sched:sched_switch` timestamps from a perf ring buffer), correlate `syscalls:sys_enter_futex` / `sys_exit_futex` operations with those intervals to measure futex wait time, and reserve any lock-contention label for waits identified as lock acquisitions rather than async workers parked idle on a futex waiting for work. Fail loudly at setup if the required tracepoint path is unavailable rather than silently reporting zero wait time.
-- Report off-CPU blocked time and futex wait time per call alongside wall-clock time in `--report` and changed-benchmark details, and integrate with [derived diagnostics](/quest/m0/diagnostics.md)'s zero-privilege `(user_ns + system_ns) / wall_ns` off-CPU ratio.
+- Report off-CPU blocked time and futex wait time per call alongside wall-clock time in `--report` and changed-benchmark details, and integrate with `bench`'s zero-privilege `CPUs busy` ratio (`(user_ns + system_ns) / wall_ns` over the harness's own sample window, in `crates/cargo-swole/src/diagnose.rs`), whose `off-CPU` likely cause it can sharpen.
 - Verify on a real Linux host with a mutex-contended benchmark, an idle-parked async worker, and a sleeping benchmark, confirming blocked time matches the sleep, futex wait captures futex waits, and only lock acquisitions carry a lock-contention label.
 
 ## Hosts

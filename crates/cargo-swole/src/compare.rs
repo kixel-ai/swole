@@ -681,8 +681,8 @@ fn output(args: &[&str], out: std::process::Output) -> Result<String, String> {
 /// The change of each benchmark from `before` to `after`, a Markdown table, refusing counts from
 /// two environments, which do not compare: the largest changes first, sim's estimated cycles
 /// among them, then each benchmark one side has, then those that held, with the likely cause
-/// beside each regression its measures explain, and a count of several samples their least and most beside their median. And each
-/// benchmark in the table's order, with whether it moved.
+/// beside each regression its measures explain, and a count of several samples their least and
+/// most beside their median. And each benchmark in the table's order, with whether it moved.
 fn table(before: &Counts, after: &Counts) -> Result<(String, Vec<(String, bool)>), String> {
 	if before.fingerprint != after.fingerprint {
 		return Err(format!(
