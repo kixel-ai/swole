@@ -335,8 +335,10 @@ impl Perf {
 				.filter(|event| CLOCK.iter().any(|name| event.name == format!("{name}:{ring}")))
 				.cloned()
 				.collect();
+			if clock.is_empty() {
+				continue;
+			}
 			match trial(&clock) {
-				_ if clock.is_empty() => {}
 				Ok(true) => units.push(clock),
 				// Counted apart, they derive no ratio.
 				_ => units.extend(clock.into_iter().map(|event| vec![event])),
@@ -1049,16 +1051,25 @@ pub fn measures(passes: &[Pass], values: &[(Vec<u64>, u64)]) -> Vec<crate::Measu
 		.collect();
 	let together = Together(&groups);
 	for ring in ["u", "k"] {
-		let [instructions, cycles, reference] = ["instructions", "cycles", "ref-cycles"].map(|name| format!("{name}:{ring}"));
+		let [instructions, cycles, reference] =
+			["instructions", "cycles", "ref-cycles"].map(|name| format!("{name}:{ring}"));
 		if let Some([instructions, cycles]) = together.find([instructions.as_str(), cycles.as_str()])
 			&& cycles > 0.0
 		{
-			out.push(crate::Measure::new(&format!("IPC:{ring}"), instructions / cycles, "instructions/cycle"));
+			out.push(crate::Measure::new(
+				&format!("IPC:{ring}"),
+				instructions / cycles,
+				"instructions/cycle",
+			));
 		}
 		if let Some([cycles, reference]) = together.find([cycles.as_str(), reference.as_str()])
 			&& reference > 0.0
 		{
-			out.push(crate::Measure::new(&format!("cycles/ref-cycles:{ring}"), cycles / reference, "ratio"));
+			out.push(crate::Measure::new(
+				&format!("cycles/ref-cycles:{ring}"),
+				cycles / reference,
+				"ratio",
+			));
 		}
 	}
 	out.extend(breakdown(&together));
@@ -1102,19 +1113,35 @@ fn breakdown(together: &Together) -> Vec<crate::Measure> {
 		out.push(percent(rest, parent - share));
 	};
 	let names = |names: [&str; 4]| names.map(|name| format!("{name}:u"));
-	let [retiring, bad, frontend, backend] = names(["topdown-retiring", "topdown-bad-spec", "topdown-fe-bound", "topdown-be-bound"]);
+	let [retiring, bad, frontend, backend] = names([
+		"topdown-retiring",
+		"topdown-bad-spec",
+		"topdown-fe-bound",
+		"topdown-be-bound",
+	]);
 	let first = |shares: [f64; 4], out: &mut Vec<crate::Measure>| {
 		for (name, share) in LEVEL_ONE.into_iter().zip(shares) {
 			out.push(percent(name, share));
 		}
 	};
-	if let Some([slots, r, b, f, e]) = together.find([SLOTS, retiring.as_str(), bad.as_str(), frontend.as_str(), backend.as_str()]) {
+	if let Some([slots, r, b, f, e]) = together.find([
+		SLOTS,
+		retiring.as_str(),
+		bad.as_str(),
+		frontend.as_str(),
+		backend.as_str(),
+	]) {
 		if slots <= 0.0 {
 			return out;
 		}
 		let [r, b, f, e] = [r, b, f, e].map(|value| value / slots);
 		first([r, b, f, e], &mut out);
-		let [heavy, mispredict, fetch, memory] = names(["topdown-heavy-ops", "topdown-br-mispredict", "topdown-fetch-lat", "topdown-mem-bound"]);
+		let [heavy, mispredict, fetch, memory] = names([
+			"topdown-heavy-ops",
+			"topdown-br-mispredict",
+			"topdown-fetch-lat",
+			"topdown-mem-bound",
+		]);
 		for (child, parent, pair) in [
 			(&heavy, r, LEVEL_TWO[0]),
 			(&mispredict, b, LEVEL_TWO[1]),
@@ -1130,7 +1157,9 @@ fn breakdown(together: &Together) -> Vec<crate::Measure> {
 		if total > 0.0 {
 			first(shares.map(|value| value / total), &mut out);
 		}
-	} else if let Some([slots, f, e, dispatched, retired]) = together.find([SLOTS, FRONTEND, BACKEND, DISPATCHED, RETIRED]) {
+	} else if let Some([slots, f, e, dispatched, retired]) =
+		together.find([SLOTS, FRONTEND, BACKEND, DISPATCHED, RETIRED])
+	{
 		if slots <= 0.0 {
 			return out;
 		}
@@ -1695,10 +1724,27 @@ mod tests {
 
 	#[test]
 	fn breaks_intels_metrics_down_by_their_slots() {
-		let names = ["slots", "topdown-retiring", "topdown-bad-spec", "topdown-fe-bound", "topdown-be-bound"];
+		let names = [
+			"slots",
+			"topdown-retiring",
+			"topdown-bad-spec",
+			"topdown-fe-bound",
+			"topdown-be-bound",
+		];
 		let mut group: Vec<Event> = names.iter().map(|name| own(&format!("{name}:u"), 1)).collect();
-		group.extend(["topdown-heavy-ops", "topdown-br-mispredict", "topdown-fetch-lat", "topdown-mem-bound"].map(|name| own(&format!("{name}:u"), 1)));
-		let pass = Pass { groups: vec![group], read: true };
+		group.extend(
+			[
+				"topdown-heavy-ops",
+				"topdown-br-mispredict",
+				"topdown-fetch-lat",
+				"topdown-mem-bound",
+			]
+			.map(|name| own(&format!("{name}:u"), 1)),
+		);
+		let pass = Pass {
+			groups: vec![group],
+			read: true,
+		};
 		// The harness reads them all with `read()`.
 		assert_eq!(pass.hardware(), 0);
 		assert_eq!(
@@ -1789,7 +1835,9 @@ mod tests {
 	#[test]
 	fn knows_zen_4_and_5_by_family_and_model() {
 		let cpu = |vendor: &str, family: u32, model: u32| {
-			Zen::of(&format!("processor\t: 0\nvendor_id\t: {vendor}\ncpu family\t: {family}\nmodel\t\t: {model}\n"))
+			Zen::of(&format!(
+				"processor\t: 0\nvendor_id\t: {vendor}\ncpu family\t: {family}\nmodel\t\t: {model}\n"
+			))
 		};
 		assert_eq!(cpu("AuthenticAMD", 26, 0x44), Some(Zen::Five));
 		assert_eq!(cpu("AuthenticAMD", 26, 0x50), None);

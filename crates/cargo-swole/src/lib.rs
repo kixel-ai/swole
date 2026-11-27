@@ -6,9 +6,9 @@ mod bench;
 mod callgrind;
 mod cargo;
 mod compare;
-mod diagnose;
 #[cfg(target_os = "linux")]
 mod cores;
+mod diagnose;
 /// No host but Linux leases a core.
 #[cfg(not(target_os = "linux"))]
 mod cores {

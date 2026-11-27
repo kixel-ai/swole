@@ -93,6 +93,7 @@ fn times_each_harness_benchmark() {
 		dir.join("metrics.json").as_os_str(),
 		"--report".as_ref(),
 		dir.join("report.json").as_os_str(),
+		"--all-details".as_ref(),
 	]);
 	succeeded(&out);
 	let (measure, metrics) = read(&dir.join("metrics.json"));
@@ -145,7 +146,12 @@ fn times_each_harness_benchmark() {
 		assert_eq!(head["time"]["unit"], "ns", "{name}: {head}");
 		assert!(head["max RSS"]["value"].as_f64().unwrap() > 0.0, "{name}: {head}");
 		assert!(head["user time"].is_object(), "{name}: {head}");
+		assert_eq!(head["CPUs busy"]["unit"], "CPUs", "{name}: {head}");
 	}
+	// A benchmark that sleeps through its calls waits off the CPU, and one that spins does not.
+	let busy = |name: &str| head(name)["CPUs busy"]["value"].as_f64().unwrap();
+	assert!(busy("slept") < 0.5, "{}", busy("slept"));
+	assert!(busy("unstable[8000]") > busy("slept"), "{}", busy("unstable[8000]"));
 	assert_eq!(report["schema_version"], 1);
 	// A benchmark that declares what each call processes reports how many it processes a second,
 	// from its time.
@@ -213,6 +219,41 @@ fn times_each_harness_benchmark() {
 			"{unstable} {instructions}"
 		);
 		assert!(head("alone")["IPC:u"]["value"].as_f64().unwrap() > 0.0);
+		// What derives from the counters: misses a thousand instructions, the clock against its
+		// reference where the PMU counts one, else an estimate from user time, and the top-down
+		// breakdown's first level, which divides every slot, where the PMU breaks it down.
+		let alone = head("alone");
+		assert_eq!(alone["branch MPKI:u"]["unit"], "MPKI", "{alone}");
+		assert!(
+			alone["branch miss rate:u"]["value"].as_f64().unwrap() < 100.0,
+			"{alone}"
+		);
+		let pass = |event: &str| {
+			host.iter()
+				.any(|line| line.starts_with("pass ") && line.contains(event))
+		};
+		if pass("ref-cycles:u") {
+			let clock = alone["cycles/ref-cycles:u"]["value"].as_f64().unwrap();
+			assert!((0.1..10.0).contains(&clock), "{alone}");
+			assert!(alone.get("estimated clock:u").is_none(), "{alone}");
+		} else if pass("cycles:u") {
+			assert_eq!(alone["estimated clock:u"]["unit"], "GHz", "{alone}");
+		}
+		if pass("slots:u") || pass("topdown-retiring:u") {
+			let first = [
+				"retiring",
+				"bad speculation",
+				"frontend bound",
+				"backend bound",
+				"SMT contention",
+			];
+			let total: f64 = first
+				.iter()
+				.filter_map(|share| alone[format!("topdown {share}")]["value"].as_f64())
+				.sum();
+			// The SMT sibling's share, which a PMU a counter short leaves out, is all that is missing.
+			assert!((90.0..=100.5).contains(&total), "{total}: {alone}");
+		}
 		// And each counter per byte, cycles among them where the host counts them.
 		let sized = head("sized[2000]");
 		let per_byte = sized["instructions:u/byte"]["value"].as_f64().unwrap();

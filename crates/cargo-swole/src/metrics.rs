@@ -445,10 +445,7 @@ pub fn change(
 }
 
 /// A change from `base` to `head` in percentage points, as a table shows a percentage's.
-fn points(
-	(base, base_spread): (f64, Option<(f64, f64)>),
-	(head, head_spread): (f64, Option<(f64, f64)>),
-) -> String {
+fn points((base, base_spread): (f64, Option<(f64, f64)>), (head, head_spread): (f64, Option<(f64, f64)>)) -> String {
 	verdict(format!("{:+.2} pp", head - base), base_spread, head_spread)
 }
 
@@ -534,6 +531,57 @@ fn rate(mut value: f64, step: f64, units: &[&str]) -> String {
 		unit += 1;
 	}
 	format!("{value:.2} {}", units[unit])
+}
+
+/// Where a headline table's row sorts: the moved first, then each benchmark one side has, then
+/// those that held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rank {
+	Moved,
+	OneSide,
+	Held,
+}
+
+/// A headline table's row: its benchmark, its cells after the name, where it sorts, how far it
+/// moved, and why it likely regressed, when its measures say.
+pub struct Row<'a> {
+	pub name: &'a String,
+	pub cells: String,
+	pub rank: Rank,
+	pub impact: f64,
+	pub cause: Option<String>,
+}
+
+/// A headline table of `rows` under the cells `header` names and `align`s, the largest changes
+/// first within each rank, with a `likely cause` column when any row has one; and each benchmark
+/// in that order, with whether it moved or one side has it.
+pub fn headline(header: &str, align: &str, mut rows: Vec<Row>) -> (String, Vec<(String, bool)>) {
+	rows.sort_by(|a, b| {
+		a.rank
+			.cmp(&b.rank)
+			.then(b.impact.total_cmp(&a.impact))
+			.then(a.name.cmp(b.name))
+	});
+	let causes = rows.iter().any(|row| row.cause.is_some());
+	let mut out = format!("| benchmark | {header} |");
+	out += &if causes {
+		format!(" likely cause |\n|---|{align}|---|\n")
+	} else {
+		format!("\n|---|{align}|\n")
+	};
+	for row in &rows {
+		// A `|` in a name would split its cell.
+		write!(out, "| {} | {} |", row.name.replace('|', "\\|"), row.cells).expect("a String takes every write");
+		if causes {
+			write!(out, " {} |", row.cause.as_deref().unwrap_or_default()).expect("a String takes every write");
+		}
+		out.push('\n');
+	}
+	let order = rows
+		.into_iter()
+		.map(|row| (row.name.clone(), row.rank != Rank::Held))
+		.collect();
+	(out, order)
 }
 
 /// How many benchmarks a suite may hold for its details to print every one's: a larger one's
@@ -707,7 +755,11 @@ mod tests {
 
 	/// Every row of each of `names`, in their order.
 	fn every(names: &[&str]) -> Pick {
-		Pick::new(names.iter().map(|name| ((*name).to_owned(), true)).collect(), true, true)
+		Pick::new(
+			names.iter().map(|name| ((*name).to_owned(), true)).collect(),
+			true,
+			true,
+		)
 	}
 
 	#[test]
@@ -727,18 +779,33 @@ mod tests {
 		// left out, and a percentage's change in points.
 		let order = |moved: &str| {
 			std::iter::once((moved.to_owned(), true))
-				.chain(names.iter().filter(|name| *name != moved).map(|name| (name.clone(), false)))
+				.chain(
+					names
+						.iter()
+						.filter(|name| *name != moved)
+						.map(|name| (name.clone(), false)),
+				)
 				.collect::<Vec<_>>()
 		};
 		assert_eq!(
-			details(Some(&base), &head, &BTreeMap::new(), &Pick::new(order("b07"), false, true)),
+			details(
+				Some(&base),
+				&head,
+				&BTreeMap::new(),
+				&Pick::new(order("b07"), false, true)
+			),
 			"\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n\
 			 | b07 | cycles:u | 100 | 150 | +50.00% |\n| b07 | topdown retiring | 40.00% | 42.50% | +2.50 pp |\n\
 			 \nThe other measures of 11 benchmarks whose headline held are left out: --all-details prints them, and \
 			 --report writes them.\n"
 		);
 		// Every row of every one with --all-details.
-		let all = details(Some(&base), &head, &BTreeMap::new(), &Pick::new(order("b07"), true, true));
+		let all = details(
+			Some(&base),
+			&head,
+			&BTreeMap::new(),
+			&Pick::new(order("b07"), true, true),
+		);
 		assert_eq!(all.lines().count(), 3 + 12 * 3, "{all}");
 		assert!(!all.contains("left out"), "{all}");
 		// A small suite prints every benchmark, but still only the rows that moved.
@@ -828,7 +895,12 @@ mod tests {
 		let base = BTreeMap::from([("a".to_owned(), rate("items/s")), ("b".to_owned(), rate("bytes/s"))]);
 		let head = BTreeMap::from([("a".to_owned(), rate("bytes/s")), ("b".to_owned(), rate("bytes/s"))]);
 		assert_eq!(
-			details(Some(&base), &head, &BTreeMap::from([("b".to_owned(), 0.25)]), &every(&["a", "b"])),
+			details(
+				Some(&base),
+				&head,
+				&BTreeMap::from([("b".to_owned(), 0.25)]),
+				&every(&["a", "b"])
+			),
 			"\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n\
 			 | a | throughput | - | 10.00 B/s | added |\n| a | throughput | 10.00 items/s | - | removed |\n\
 			 | b | throughput | 10.00 B/s | 10.00 B/s | +25.00% |\n"

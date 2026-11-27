@@ -94,7 +94,10 @@ const NATIVE: [(&str, &str); 6] = [
 const SIMULATED: [(&[&str], &str); 4] = [
 	(&["I1 misses"], "L1i MPKI"),
 	(&["D1 read misses", "D1 write misses"], "L1d MPKI"),
-	(&["LL instruction misses", "LL read misses", "LL write misses"], "LL MPKI"),
+	(
+		&["LL instruction misses", "LL read misses", "LL write misses"],
+		"LL MPKI",
+	),
 	(&["conditional mispredicts", "indirect mispredicts"], "branch MPKI"),
 ];
 
@@ -210,7 +213,9 @@ struct Moved {
 impl Moved {
 	/// Whether the head is past the base, when both are sampled, rather than within their spreads.
 	fn beyond(&self) -> bool {
-		!(self.base.sampled && self.head.sampled) || self.head.least > self.base.most || self.head.most < self.base.least
+		!(self.base.sampled && self.head.sampled)
+			|| self.head.least > self.base.most
+			|| self.head.most < self.base.least
 	}
 
 	fn delta(&self) -> f64 {
@@ -309,33 +314,40 @@ pub fn cause(base: &[Measure], head: &[Measure], timed: Option<f64>) -> Option<S
 			sides.grew(&["instructions:u"], (moved::INSTRUCTIONS, 0.0)),
 		);
 	}
-	add(
-		"kernel",
-		sides.gained(&["kernel instruction share", "kernel time share"], moved::KERNEL),
-	);
+	// Misses first, which say where the time went, then the breakdown's share, which says only how
+	// much of it.
 	add(
 		"memory-bound",
 		sides
-			.gained(&["topdown memory bound", "topdown backend bound"], moved::TOPDOWN)
-			.or_else(|| {
-				sides.grew(
-					&["LLC MPKI:u", "LL MPKI", "L1d MPKI:u", "L1d MPKI", "dTLB MPKI:u"],
-					moved::MPKI,
-				)
-			}),
+			.grew(
+				&["LLC MPKI:u", "LL MPKI", "L1d MPKI:u", "L1d MPKI", "dTLB MPKI:u"],
+				moved::MPKI,
+			)
+			.or_else(|| sides.gained(&["topdown memory bound", "topdown backend bound"], moved::TOPDOWN)),
 	);
 	add(
 		"branch mispredicts",
 		sides
-			.gained(&["topdown branch mispredicts", "topdown bad speculation"], moved::TOPDOWN)
-			.or_else(|| sides.gained(&["branch miss rate:u", "branch miss rate"], moved::MISS_RATE))
-			.or_else(|| sides.grew(&["branch MPKI:u", "branch MPKI"], moved::MPKI)),
+			.gained(&["branch miss rate:u", "branch miss rate"], moved::MISS_RATE)
+			.or_else(|| sides.grew(&["branch MPKI:u", "branch MPKI"], moved::MPKI))
+			.or_else(|| {
+				sides.gained(
+					&["topdown branch mispredicts", "topdown bad speculation"],
+					moved::TOPDOWN,
+				)
+			}),
 	);
 	add(
 		"frontend-bound",
 		sides
-			.gained(&["topdown fetch latency", "topdown frontend bound"], moved::TOPDOWN)
-			.or_else(|| sides.grew(&["L1i MPKI:u", "L1i MPKI", "iTLB MPKI:u"], moved::MPKI)),
+			.grew(&["L1i MPKI:u", "L1i MPKI", "iTLB MPKI:u"], moved::MPKI)
+			.or_else(|| sides.gained(&["topdown fetch latency", "topdown frontend bound"], moved::TOPDOWN)),
+	);
+	// The kernel's share last: it moves with the faults a larger input takes, beside the misses
+	// that explain more.
+	add(
+		"kernel",
+		sides.gained(&["kernel instruction share", "kernel time share"], moved::KERNEL),
 	);
 	// The same work, branches, and misses a little slower, the frontend busier where the PMU says:
 	// code that moved to other addresses, as an unrelated change shifts it.
@@ -352,9 +364,14 @@ pub fn cause(base: &[Measure], head: &[Measure], timed: Option<f64>) -> Option<S
 			.all(|name| sides.held(&name, moved::SAME_MPKI))
 	{
 		let frontend = sides.get("topdown frontend bound");
-		if frontend.as_ref().is_none_or(|frontend| frontend.beyond() && frontend.delta() > 0.0) {
+		if frontend
+			.as_ref()
+			.is_none_or(|frontend| frontend.beyond() && frontend.delta() > 0.0)
+		{
 			let evidence = frontend.map_or(String::new(), |frontend| format!("; {}", frontend.cited()));
-			causes.push(format!("likely code alignment (same instructions, branches, and misses{evidence})"));
+			causes.push(format!(
+				"likely code alignment (same instructions, branches, and misses{evidence})"
+			));
 		}
 	}
 	(!causes.is_empty()).then(|| causes.into_iter().take(2).collect::<Vec<_>>().join("; "))
@@ -448,7 +465,10 @@ mod tests {
 		let mpki = get(&derived, "L1d MPKI:u");
 		assert_eq!(mpki.value, 10.0);
 		let (least, most) = mpki.spread.unwrap();
-		assert!((least - 10.0 / 1.1).abs() < 1e-9 && (most - 10.0 / 0.9).abs() < 1e-9, "{mpki:?}");
+		assert!(
+			(least - 10.0 / 1.1).abs() < 1e-9 && (most - 10.0 / 0.9).abs() < 1e-9,
+			"{mpki:?}"
+		);
 		let share = get(&derived, "kernel instruction share");
 		assert_eq!(share.spread, Some((0.0, 100.0 * 200.0 / 1100.0)));
 		// A sampled denominator that may be zero bounds nothing.

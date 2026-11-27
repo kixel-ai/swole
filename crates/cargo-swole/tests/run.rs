@@ -480,6 +480,7 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 		metrics.to_str().unwrap(),
 		"--report",
 		report.to_str().unwrap(),
+		"--all-details",
 	]);
 	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 	// A benchmark that declares what each call processes reports its instructions per byte or item,
@@ -866,7 +867,8 @@ fn compares_a_base_with_every_change_in_the_working_tree_from_one_directory() {
 			.lines()
 			.find(|row| row.starts_with(&format!("| {name} |")))
 			.unwrap_or_else(|| panic!("no {name} in {table}"));
-		row.rsplit('|').nth(1).unwrap().trim().to_owned()
+		// The change, before any likely cause.
+		row.split('|').nth(4).unwrap().trim().to_owned()
 	};
 	// Both sides count from one working directory, whose path is in the count. A program's
 	// threads swole cannot see, so each count is sampled, and compares by its spread.

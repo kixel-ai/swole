@@ -45,6 +45,9 @@ const OWN_TIMER: &str = "swole timer own ";
 /// What a timed harness target prints, alone on a line, before each sample's nanoseconds.
 const SAMPLE: &str = "swole sample ";
 
+/// What a timed harness target prints before the wall clock its sample's rusage covers.
+const WINDOW: &str = "swole wall ";
+
 /// The unit every time is in.
 const UNIT: &str = "ns";
 
@@ -362,7 +365,10 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				}
 				if let Some((used, calls, wall)) = &used[i] {
 					measures.extend(used.measures(*calls * iterations));
-					measures.extend(crate::diagnose::busy(used.user_ns + used.system_ns, wall.as_nanos()));
+					// The harness's own wall clock, which none of swole's requests and replies add to.
+					if let Some(wall) = wall {
+						measures.extend(crate::diagnose::busy(used.user_ns + used.system_ns, wall.as_nanos()));
+					}
 				}
 				// What derives from the side's time and counts, per what each of its calls processes.
 				if let (Some(throughput), Some(time)) = (declared[i], [timed.base(), timed.head()][i]) {
@@ -486,16 +492,16 @@ fn spread(
 	Ok(Some(spread))
 }
 
-/// What the process used over `samples`, in all, how many samples that took, and their wall
-/// clock, when its harness says what it used.
-fn usage<'a>(samples: impl Iterator<Item = &'a Sample>) -> Option<(perf::Usage, u64, Duration)> {
+/// What the process used over `samples`, in all, how many samples that took, and the wall clock
+/// that covers, when its harness says what it used, and says over how long.
+fn usage<'a>(samples: impl Iterator<Item = &'a Sample>) -> Option<(perf::Usage, u64, Option<Duration>)> {
 	let mut total = perf::Usage::default();
 	let mut count = 0;
-	let mut wall = Duration::ZERO;
+	let mut wall = Some(Duration::ZERO);
 	for sample in samples {
 		total.add(&sample.usage?);
 		count += 1;
-		wall += sample.wall;
+		wall = wall.zip(sample.window).map(|(wall, window)| wall + window);
 	}
 	(count > 0).then_some((total, count, wall))
 }
@@ -709,8 +715,9 @@ struct Sample {
 	nanos: u64,
 	/// What the request took in all, steps and setup between calls included.
 	wall: Duration,
-	/// What the process used over the sample, when its harness says.
+	/// What the process used over the sample, and the wall clock that covers, when its harness says.
 	usage: Option<perf::Usage>,
+	window: Option<Duration>,
 	/// Whether the timing process observed another thread alive during this sample.
 	threaded: bool,
 }
@@ -983,54 +990,53 @@ fn table(
 		}
 		return (out, times.keys().map(|name| (name.clone(), false)).collect());
 	}
-	// Each row, its rank (moved, one side's, held), and how far it moved.
-	let mut rows: Vec<(u8, f64, &String, String, String, Option<String>)> = Vec::new();
-	for (name, times) in times {
-		let percent = |ratio: f64| format!("{:+.2}%", (ratio - 1.0) * 100.0);
-		let row = match times {
-			Times::Both { ratio, .. } => {
-				let moved = ratio.lower > 1.0 || ratio.upper < 1.0;
-				let cause = (ratio.lower > 1.0)
-					.then(|| crate::diagnose::cause(details[0].get(name)?, details[1].get(name)?, Some(ratio.value - 1.0)))
-					.flatten();
-				(
-					if moved { 0 } else { 2 },
-					ratio.value.ln().abs(),
-					percent(ratio.value),
-					format!("{} to {}", percent(ratio.lower), percent(ratio.upper)),
-					cause,
+	let percent = |ratio: f64| format!("{:+.2}%", (ratio - 1.0) * 100.0);
+	let rows = times
+		.iter()
+		.map(|(name, times)| {
+			let cells = |change: &str, interval: &str| {
+				format!(
+					"{} | {} | {change} | {interval}",
+					cell(times.base()),
+					cell(times.head())
 				)
+			};
+			let one_side = |change: &str| metrics::Row {
+				name,
+				cells: cells(change, ""),
+				rank: metrics::Rank::OneSide,
+				impact: 0.0,
+				cause: None,
+			};
+			match times {
+				Times::Both { ratio, .. } => metrics::Row {
+					name,
+					cells: cells(
+						&percent(ratio.value),
+						&format!("{} to {}", percent(ratio.lower), percent(ratio.upper)),
+					),
+					rank: if ratio.lower > 1.0 || ratio.upper < 1.0 {
+						metrics::Rank::Moved
+					} else {
+						metrics::Rank::Held
+					},
+					impact: ratio.value.ln().abs(),
+					cause: (ratio.lower > 1.0)
+						.then(|| {
+							crate::diagnose::cause(
+								details[0].get(name)?,
+								details[1].get(name)?,
+								Some(ratio.value - 1.0),
+							)
+						})
+						.flatten(),
+				},
+				Times::Base(_) => one_side("removed"),
+				Times::Head(_) => one_side("added"),
 			}
-			Times::Base(_) => (1, 0.0, "removed".to_owned(), String::new(), None),
-			Times::Head(_) => (1, 0.0, "added".to_owned(), String::new(), None),
-		};
-		rows.push((row.0, row.1, name, row.2, row.3, row.4));
-	}
-	rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)).then(a.2.cmp(b.2)));
-	let causes = rows.iter().any(|row| row.5.is_some());
-	let mut out = String::from("| benchmark | base | head | change | 95% interval |");
-	out += if causes {
-		" likely cause |\n|---|---:|---:|---:|---:|---|\n"
-	} else {
-		"\n|---|---:|---:|---:|---:|\n"
-	};
-	for (_, _, name, change, interval, cause) in &rows {
-		let times = &times[*name];
-		write!(
-			out,
-			"| {} | {} | {} | {change} | {interval} |",
-			name.replace('|', "\\|"),
-			cell(times.base()),
-			cell(times.head())
-		)
-		.expect("a String takes every write");
-		if causes {
-			write!(out, " {} |", cause.as_deref().unwrap_or_default()).expect("a String takes every write");
-		}
-		out.push('\n');
-	}
-	let order = rows.into_iter().map(|(rank, _, name, ..)| (name.clone(), rank < 2)).collect();
-	(out, order)
+		})
+		.collect();
+	metrics::headline("base | head | change | 95% interval", "---:|---:|---:|---:", rows)
 }
 
 /// The times, and each side's allocations from `details`, as a `metrics.json`: the working tree's
@@ -1239,6 +1245,7 @@ impl Side for Process {
 		// Bytes, since the benchmark's own output need not be UTF-8.
 		let mut line = Vec::new();
 		let mut usage = None;
+		let mut window = None;
 		let mut threaded = false;
 		loop {
 			line.clear();
@@ -1271,8 +1278,20 @@ impl Side for Process {
 					nanos,
 					wall: started.elapsed(),
 					usage: usage.take(),
+					window: window.take(),
 					threaded,
 				});
+			}
+			if let Some(nanos) = line
+				.strip_prefix(WINDOW.as_bytes())
+				.and_then(|rest| rest.strip_suffix(b"\n"))
+			{
+				let nanos = std::str::from_utf8(nanos)
+					.ok()
+					.and_then(|nanos| nanos.parse().ok())
+					.ok_or_else(|| format!("{} printed {WINDOW}{}", self.label, String::from_utf8_lossy(nanos)))?;
+				window = Some(Duration::from_nanos(nanos));
+				continue;
 			}
 			if let Some(fields) = line
 				.strip_prefix(perf::RUSAGE.as_bytes())
@@ -1371,6 +1390,7 @@ mod tests {
 				nanos,
 				wall: Duration::from_nanos(nanos + self.step * iterations),
 				usage: None,
+				window: None,
 				threaded: false,
 			})
 		}
@@ -1544,10 +1564,24 @@ mod tests {
 		// The largest change first; one whose interval holds none after the benchmarks one side
 		// has; and the likely cause beside a regression whose measures explain it.
 		let mut sorted = BTreeMap::from([
-			("held".to_owned(), Times::Both { base: 10.0, head: 10.1, ratio: estimate(1.01) }),
-			("slow".to_owned(), Times::Both { base: 10.0, head: 12.0, ratio: estimate(1.2) }),
+			(
+				"held".to_owned(),
+				Times::Both {
+					base: 10.0,
+					head: 10.1,
+					ratio: estimate(1.01),
+				},
+			),
+			(
+				"slow".to_owned(),
+				Times::Both {
+					base: 10.0,
+					head: 12.0,
+					ratio: estimate(1.2),
+				},
+			),
 		]);
-		sorted.extend(times.iter().map(|(name, _)| (name.clone(), Times::Head(1.0))).take(1));
+		sorted.extend(times.keys().map(|name| (name.clone(), Times::Head(1.0))).take(1));
 		let mpki = |value: f64| vec![Measure::new("LLC MPKI:u", value, "MPKI")];
 		details[0].insert("slow".to_owned(), mpki(1.0));
 		details[1].insert("slow".to_owned(), mpki(3.0));
