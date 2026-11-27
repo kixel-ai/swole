@@ -319,11 +319,22 @@ impl Report {
 pub fn side(measures: &[Measure]) -> Value {
 	let mut side = Map::new();
 	for measure in measures {
-		let mut value = json!({ "value": number(measure.value), "unit": measure.unit });
-		if let Some((least, most)) = measure.spread {
-			value["lower"] = number(least);
-			value["upper"] = number(most);
-		}
+		let value = match measure.spread {
+			None => json!({ "value": number(measure.value), "unit": measure.unit }),
+			Some((least, most)) => {
+				// One rule for all three, which rounding keeps in order, so the bounds hold the median.
+				let exact = [least, measure.value, most]
+					.iter()
+					.all(|v| v.fract() == 0.0 && v.abs() < 9e15);
+				let number = |value: f64| if exact { number(value) } else { rounded(value) };
+				json!({
+					"value": number(measure.value),
+					"unit": measure.unit,
+					"lower": number(least),
+					"upper": number(most),
+				})
+			}
+		};
 		side.insert(measure.name.clone(), value);
 	}
 	crate::heap::label(measures, &mut side);
@@ -366,16 +377,31 @@ pub fn number(value: f64) -> Value {
 	if value.fract() == 0.0 && value.abs() < 9e15 {
 		return (value as i64).into();
 	}
+	rounded(value)
+}
+
+/// `value` to five significant digits, which keeps any values in order, whole or not.
+fn rounded(value: f64) -> Value {
 	let rounded: f64 = format!("{value:.4e}").parse().expect("a float reads back");
 	Number::from_f64(rounded).map_or(Value::Null, Value::Number)
 }
 
 /// Each benchmark's count, a line each, with the least and most of its samples when it took more
-/// than one.
+/// than one, marked sampled (`~`).
 pub fn table(counts: &Counts) -> String {
-	let width = counts.counts.values().map(|n| n.to_string().len()).max().unwrap_or(0);
+	let shown = |name: &String, count: &u64| match counts.spread.get(name) {
+		Some(_) => format!("{SAMPLED}{count}"),
+		None => count.to_string(),
+	};
+	let width = counts
+		.counts
+		.iter()
+		.map(|(name, count)| shown(name, count).chars().count())
+		.max()
+		.unwrap_or(0);
 	let mut out = String::new();
 	for (name, count) in &counts.counts {
+		let count = shown(name, count);
 		match counts.spread.get(name) {
 			Some((least, most)) => writeln!(out, "{count:>width$}  {name}  ({least} to {most})"),
 			None => writeln!(out, "{count:>width$}  {name}"),
@@ -383,6 +409,58 @@ pub fn table(counts: &Counts) -> String {
 		.expect("a String takes every write");
 	}
 	out
+}
+
+/// What marks a value sampled, the median of counts another thread or the scheduler moves, rather
+/// than one exact count.
+pub const SAMPLED: &str = "~";
+
+/// A change from `base` to `head`, each a value and the least and most of its samples when
+/// sampled, as a table shows it: none from an exact base of zero, and from a sampled base whose
+/// spread holds zero, the absolute change and the least and most its spreads allow. A sampled value moves within its
+/// samples' spread, so the change between two says whether their spreads overlap; with one side's
+/// spread alone, it gives no verdict and is marked sampled.
+pub fn change(
+	(base, base_spread): (f64, Option<(f64, f64)>),
+	(head, head_spread): (f64, Option<(f64, f64)>),
+) -> String {
+	// A base that may be zero has no percentage change, only an absolute one.
+	let maybe_zero = base == 0.0 || base_spread.is_some_and(|(least, most)| least <= 0.0 && 0.0 <= most);
+	let change = if !maybe_zero {
+		format!("{:+.2}%", (head - base) / base * 100.0)
+	} else if base_spread.is_some() || head_spread.is_some() {
+		// No percentage grows from zero, but a sampled zero still moves by some amount.
+		let (base_least, base_most) = base_spread.unwrap_or((base, base));
+		let (head_least, head_most) = head_spread.unwrap_or((head, head));
+		format!(
+			"{} ({} to {})",
+			signed(head - base),
+			signed(head_least - base_most),
+			signed(head_most - base_least)
+		)
+	} else {
+		String::new()
+	};
+	match (base_spread, head_spread) {
+		(None, None) => change,
+		(Some((base_least, base_most)), Some((head_least, head_most))) => {
+			if head_least <= base_most && base_least <= head_most {
+				format!("{SAMPLED}{change} (within spread)")
+			} else {
+				format!("{change} (beyond spread)")
+			}
+		}
+		_ => format!("{SAMPLED}{change}"),
+	}
+}
+
+/// `value` with its sign, whole when it is, else to three decimals.
+fn signed(value: f64) -> String {
+	if value.fract() == 0.0 {
+		format!("{value:+}")
+	} else {
+		format!("{value:+.3}")
+	}
 }
 
 /// A measure's value as a table shows it, in its unit.
@@ -465,7 +543,7 @@ pub fn details(
 					spread: Some((least, most)),
 					..
 				}) => format!(
-					"~{} ({} to {})",
+					"{SAMPLED}{} ({} to {})",
 					shown(*value, unit),
 					shown(*least, unit),
 					shown(*most, unit)
@@ -480,26 +558,7 @@ pub fn details(
 						(Some(_), Some(_)) if measure == "throughput" && paired.contains_key(name) => {
 							format!("{:+.2}%", paired[name] * 100.0)
 						}
-						(Some(b), Some(a)) => {
-							let change = if b.value != 0.0 {
-								format!("{:+.2}%", (a.value - b.value) / b.value * 100.0)
-							} else {
-								String::new()
-							};
-							// A sampled measure moves within its samples' spread, so a change compares
-							// against it; with one side's spread alone, it has no verdict.
-							match (b.spread, a.spread) {
-								(None, None) => change,
-								(Some((b_least, b_most)), Some((a_least, a_most))) => {
-									if a_least <= b_most && b_least <= a_most {
-										format!("~{change} (within spread)")
-									} else {
-										format!("{change} (beyond spread)")
-									}
-								}
-								_ => format!("~{change}"),
-							}
-						}
+						(Some(b), Some(a)) => change((b.value, b.spread), (a.value, a.spread)),
 						(None, Some(_)) => "added".to_owned(),
 						(Some(_), None) => "removed".to_owned(),
 						(None, None) => unreachable!("every measure comes from one side"),
@@ -758,6 +817,54 @@ mod tests {
 			json!({ "value": 64, "lower_value": 32, "upper_value": 64 })
 		);
 		assert_eq!(json["samples"][0]["metrics"]["b"].as_object().unwrap().len(), 2);
+	}
+
+	#[test]
+	fn marks_a_sampled_value_and_compares_it_by_its_spread() {
+		let mut sampled = counts(&[("a", 10), ("b", 200)]);
+		sampled.spread.insert("b".to_owned(), (190, 210));
+		assert_eq!(table(&sampled), "  10  a\n~200  b  (190 to 210)\n");
+		assert_eq!(change((100.0, None), (150.0, None)), "+50.00%");
+		assert_eq!(change((100.0, Some((90.0, 110.0))), (150.0, None)), "~+50.00%");
+		assert_eq!(
+			change((100.0, Some((90.0, 110.0))), (105.0, Some((95.0, 115.0)))),
+			"~+5.00% (within spread)"
+		);
+		assert_eq!(
+			change((100.0, Some((90.0, 110.0))), (150.0, Some((140.0, 160.0)))),
+			"+50.00% (beyond spread)"
+		);
+		assert_eq!(change((0.0, Some((0.0, 1.0))), (2.0, None)), "~+2 (+1 to +2)");
+		assert_eq!(
+			change((0.0, Some((0.0, 1.0))), (2.0, Some((2.0, 3.0)))),
+			"+2 (+1 to +3) (beyond spread)"
+		);
+		assert_eq!(change((0.0, None), (2.0, None)), "");
+		assert_eq!(
+			change((1.0, Some((0.0, 2.0))), (2.0, Some((1.0, 3.0)))),
+			"~+1 (-1 to +3) (within spread)"
+		);
+		// A report gives each measure's spread, or with none to hold it, the count's.
+		sampled.details.remove("b");
+		let report = report(&sampled, None, &sim(), None);
+		assert_eq!(
+			report.0["benchmarks"]["b"]["head"]["instructions"],
+			json!({ "value": 200, "unit": "instructions", "lower": 190, "upper": 210 })
+		);
+		// Rounded to five digits, by one rule, the bounds still hold the median.
+		for (median, least, most) in [
+			(408_648.5, 408_648.0, 408_649.0),
+			(408_641.5, 408_641.0, 408_642.0),
+			(408_649.0, 408_648.6, 408_649.6),
+		] {
+			let side = side(&[Measure {
+				spread: Some((least, most)),
+				..Measure::new("instructions:u", median, "events")
+			}]);
+			let [value, lower, upper] =
+				["value", "lower", "upper"].map(|key| side["instructions:u"][key].as_f64().unwrap());
+			assert!(lower <= value && value <= upper, "{side}");
+		}
 	}
 
 	#[test]

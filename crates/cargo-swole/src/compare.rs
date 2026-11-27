@@ -691,13 +691,21 @@ fn table(before: &Counts, after: &Counts) -> Result<String, String> {
 	let names: BTreeSet<&String> = before.counts.keys().chain(after.counts.keys()).collect();
 	let mut out = String::from("| benchmark | base | head | change |\n|---|---:|---:|---:|\n");
 	let cell = |counts: &Counts, name: &str| match (counts.counts.get(name), counts.spread.get(name)) {
-		(Some(count), Some((least, most))) => format!("{count} ({least} to {most})"),
+		(Some(count), Some((least, most))) => format!("{}{count} ({least} to {most})", metrics::SAMPLED),
 		(Some(count), None) => count.to_string(),
 		(None, _) => "-".to_owned(),
 	};
+	// A sampled count compares against its spread, never as one exact count.
+	let side = |counts: &Counts, count: u64, name: &str| {
+		let spread = counts
+			.spread
+			.get(name)
+			.map(|&(least, most)| (least as f64, most as f64));
+		(count as f64, spread)
+	};
 	for name in names {
 		let change = match (before.counts.get(name), after.counts.get(name)) {
-			(Some(&b), Some(&a)) => format!("{:+.2}%", (a as f64 - b as f64) / b as f64 * 100.0),
+			(Some(&b), Some(&a)) => metrics::change(side(before, b, name), side(after, a, name)),
 			(None, Some(_)) => "added".to_owned(),
 			(Some(_), None) => "removed".to_owned(),
 			(None, None) => unreachable!("every name comes from one side"),
@@ -812,7 +820,8 @@ mod tests {
 		assert_eq!(
 			table(&before, &after).unwrap(),
 			"| benchmark | base | head | change |\n|---|---:|---:|---:|\n\
-			 | a | 200 | 150 (140 to 160) | -25.00% |\n| gone | 5 | - | removed |\n| new | - | 7 | added |\n"
+			 | a | 200 | ~150 (140 to 160) | ~-25.00% |\n| gone | 5 | - | removed |\n\
+			 | new | - | 7 | added |\n"
 		);
 	}
 

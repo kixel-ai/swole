@@ -124,6 +124,7 @@ fn once(
 	command
 		.env(HEAP, "1")
 		.env_remove(perf::COUNTERS)
+		.env_remove(perf::INHERIT)
 		.env_remove(perf::ITERATIONS);
 	if let Some(cpus) = pass.cpus {
 		perf::pin_command(&mut command, cpus);

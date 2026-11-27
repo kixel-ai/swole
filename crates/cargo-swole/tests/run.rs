@@ -631,15 +631,33 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 
 /// Each count and name of the table `run` prints.
 fn table(stdout: &[u8]) -> std::collections::BTreeMap<String, u64> {
+	rows(stdout).map(|(name, count, _)| (name, count)).collect()
+}
+
+/// Each name of the table `run` prints whose count is sampled (`~`).
+fn sampled(stdout: &[u8]) -> Vec<String> {
+	rows(stdout)
+		.filter(|(_, _, sampled)| *sampled)
+		.map(|(name, _, _)| name)
+		.collect()
+}
+
+/// Each row of the table `run` prints: its name, count, and whether the count is sampled.
+fn rows(stdout: &[u8]) -> impl Iterator<Item = (String, u64, bool)> {
 	String::from_utf8_lossy(stdout)
 		.lines()
 		.map_while(|line| {
 			let (count, rest) = line.trim_start().split_once("  ")?;
 			// A sampled count's least and most follow its name.
 			let name = rest.split("  ").next()?;
-			Some((name.to_owned(), count.parse().ok()?))
+			let (count, sampled) = match count.strip_prefix('~') {
+				Some(count) => (count, true),
+				None => (count, false),
+			};
+			Some((name.to_owned(), count.parse().ok()?, sampled))
 		})
-		.collect()
+		.collect::<Vec<_>>()
+		.into_iter()
 }
 
 /// The fixture's benchmarks that run another thread.
@@ -670,34 +688,21 @@ fn single_threaded(dir: &Path) -> PathBuf {
 	list
 }
 
-/// On a host that exposes perf counters, they count what Valgrind does on the calling thread,
-/// and fail a benchmark that runs another; on one that exposes none, as a hosted CI runner, the
-/// run fails, saying so.
+/// On a host that exposes perf counters, they count what Valgrind does: the calling thread's
+/// exactly, read in user space, for a benchmark that runs no other thread, and every thread's,
+/// sampled, with counters each inherits, for one that does. On one that exposes none, as a hosted
+/// CI runner, the run fails, saying so.
 #[test]
 fn counts_with_perf_counters_what_valgrind_does() {
 	let dir = scratch("quick-single");
 	let file = "crates/swole/benches/fixture.rs::";
-	// Each alone, since a host with one PMU CPU runs one job at a time and stops at a failure.
-	for name in THREADED {
-		let list = dir.join("threaded");
-		std::fs::write(&list, format!("{file}{name}\n")).unwrap();
-		let out = harness(&["quick", "--benchmarks", list.to_str().unwrap()]);
-		let err = String::from_utf8_lossy(&out.stderr);
-		assert!(!out.status.success(), "{err}");
-		if err.contains("quick counts with perf counters, and") {
-			return;
-		}
-		assert!(
-			err.contains(&format!("{file}{name}: another thread ran beside a counted call"))
-				&& err.contains("count it with sim"),
-			"{name}: {err}"
-		);
-	}
-	let list = single_threaded(&dir);
-	let list = list.to_str().unwrap();
 	let report = dir.join("report.json");
-	let out = harness(&["quick", "--benchmarks", list, "--report", report.to_str().unwrap()]);
-	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	let out = harness(&["quick", "--report", report.to_str().unwrap()]);
+	let err = String::from_utf8_lossy(&out.stderr);
+	if !out.status.success() && err.contains("quick counts with perf counters, and") {
+		return;
+	}
+	assert!(out.status.success(), "{err}");
 	// Each counter's share of a byte, of a benchmark that declares its bytes.
 	let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(report).unwrap()).unwrap();
 	let head = &report["benchmarks"][format!("{file}sized[2000]")]["head"];
@@ -705,11 +710,35 @@ fn counts_with_perf_counters_what_valgrind_does() {
 	let per_byte = head["instructions:u/byte"]["value"].as_f64().unwrap();
 	assert!((per_byte * 2000.0 / instructions - 1.0).abs() < 1e-3, "{head}");
 	assert!(head.get("throughput").is_none(), "{head}");
-	let perf = table(&out.stdout);
-	let sim = harness(&["sim", "--benchmarks", list]);
+	let all = table(&out.stdout);
+	let sim = harness(&["sim"]);
 	assert!(sim.status.success(), "{}", String::from_utf8_lossy(&sim.stderr));
 	let valgrind = table(&sim.stdout);
-	assert_eq!(perf.keys().collect::<Vec<_>>(), valgrind.keys().collect::<Vec<_>>());
+	assert_eq!(all.keys().collect::<Vec<_>>(), valgrind.keys().collect::<Vec<_>>());
+	assert_eq!(all.len(), 18);
+	// The threaded ones alone are sampled, each counting the other thread's spins as Valgrind
+	// does, within what the scheduler and the thread's start move.
+	let threaded: Vec<String> = THREADED.iter().map(|name| format!("{file}{name}")).collect();
+	assert_eq!(sampled(&out.stdout), threaded);
+	assert!(
+		out.stdout.windows(b"(~)".len()).any(|window| window == b"(~)"),
+		"{}",
+		String::from_utf8_lossy(&out.stdout)
+	);
+	for name in &threaded {
+		let (count, under) = (all[name], valgrind[name]);
+		let ratio = count as f64 / under as f64;
+		assert!(
+			(0.97..1.03).contains(&ratio),
+			"{name}: {count} natively, {under} under Valgrind"
+		);
+	}
+	assert!(all[&format!("{file}handed")] > 400_000, "{all:?}");
+	assert!(all[&format!("{file}spawned[100000]")] > 400_000, "{all:?}");
+	let list = single_threaded(&dir);
+	let list = list.to_str().unwrap();
+	let perf: std::collections::BTreeMap<String, u64> =
+		all.into_iter().filter(|(name, _)| !threaded.contains(name)).collect();
 	assert_eq!(perf.len(), 15);
 	for (name, &count) in &perf {
 		// The same instructions, but for each bracket's own few dozen.
@@ -839,10 +868,11 @@ fn compares_a_base_with_every_change_in_the_working_tree_from_one_directory() {
 			.unwrap_or_else(|| panic!("no {name} in {table}"));
 		row.rsplit('|').nth(1).unwrap().trim().to_owned()
 	};
-	// Both sides count from one working directory, whose path is in the count.
-	assert_eq!(change("cwd"), "+0.00%");
+	// Both sides count from one working directory, whose path is in the count. A program's
+	// threads swole cannot see, so each count is sampled, and compares by its spread.
+	assert_eq!(change("cwd"), "~+0.00% (within spread)");
 	let a = change("a");
-	assert!(a.starts_with('+') && a != "+0.00%", "{table}");
+	assert!(a.starts_with('+') && a.ends_with("(beyond spread)"), "{table}");
 	assert_eq!(change("b"), "added");
 	assert_eq!(change("c"), "added");
 	assert_eq!(change("d"), "removed");
@@ -1082,14 +1112,12 @@ fn main() { swole::main(); }
 	std::fs::write(&list, "benches/workers.rs::c11_worker\n").unwrap();
 	let out = run_swole(&["quick", "--benchmarks", list.to_str().unwrap()]);
 	let err = String::from_utf8_lossy(&out.stderr);
-	assert!(!out.status.success(), "{err}");
-	if err.contains("quick counts with perf counters, and") {
+	if !out.status.success() && err.contains("quick counts with perf counters, and") {
 		return;
 	}
-	assert!(
-		err.contains("benches/workers.rs::c11_worker: another thread ran beside a counted call"),
-		"{err}"
-	);
+	assert!(out.status.success(), "{err}");
+	// A C11 thread is seen too, so the count is every thread's, sampled.
+	assert_eq!(sampled(&out.stdout), ["benches/workers.rs::c11_worker"]);
 
 	let late = dir.join("late");
 	std::fs::write(&late, "benches/workers.rs::late_worker\n").unwrap();
@@ -1111,7 +1139,12 @@ fn main() { swole::main(); }
 			.is_some_and(|line| line.starts_with("libc: ") && line.contains("build-id "))),
 		"{host:?}"
 	);
+	// Seen only by the timed samples, so every counter pass counts every thread, sampled.
 	let entry = &report["benchmarks"]["benches/workers.rs::late_worker"];
 	assert_eq!(entry["threaded"], true, "{entry}");
-	assert!(entry["head"].get("instructions:u").is_none(), "{entry}");
+	let instructions = &entry["head"]["instructions:u"];
+	assert!(
+		instructions["lower"].is_number() && instructions["upper"].is_number(),
+		"{entry}"
+	);
 }

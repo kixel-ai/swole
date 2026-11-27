@@ -101,7 +101,7 @@ A harness benchmark beside which the process had another thread, one there when 
 started or ended, or one its call started, which the [preload](#randomness-and-the-clock) sees
 even when it is gone by the call's end, counts what that thread ran meanwhile, which the
 scheduler decides. So `sim` counts each such benchmark's job five times in all, and records the
-median of the five, with their least and most beside it: for every measure, its instructions,
+median of the five, with their least and most beside it, marked sampled (`~`): for every measure, its instructions,
 cache misses, branch mispredicts, and estimated cycles alike, in the tables and as `lower` and
 `upper` in `--report`, and for the instructions and estimated cycles, as `lower_value` and
 `upper_value` in `metrics.json`. So does every benchmark whose threads swole cannot see: those of
@@ -243,7 +243,10 @@ version moves too, since a new Valgrind can count differently and starts new ser
 `swole sim <base>` and `swole quick <base>` count `<base>` and the working tree in one worktree kept under
 `~/.cache/swole` (or `$XDG_CACHE_HOME`), each from the directory there that matches where
 it runs, and print a Markdown table of each benchmark's base, head, and change, then one of every
-other measure: for `sim`, each [simulated event](#simulated-cycles) and the estimated cycles. `swole bench <base>` builds both sides in the same worktree and times
+other measure: for `sim`, each [simulated event](#simulated-cycles) and the estimated cycles. A
+sampled (`~`) value compares by its spread, never as one exact count: between two sampled values,
+the change says whether their spreads overlap (`within spread`) or not (`beyond spread`), and with
+one side's spread alone, it is marked `~` and gives no verdict. `swole bench <base>` builds both sides in the same worktree and times
 them [paired](#bench). One directory
 counts both sides, so a path the build compiles in, such as a panic's location, is the same in
 each and moves neither count. The worktree sits outside the repository, so no
@@ -304,9 +307,21 @@ reads them again right after the call, before stopping them, so the system calls
 stop counting stay out of a count, which holds the call and the reads' own few dozen instructions,
 the same for every call. A counter that did not run the whole time it was enabled fails the run
 rather than be scaled up: another user of the host's counters multiplexed it, or the thread left
-the PMU's cores. The kernel maps no page for a counter a process's threads inherit, so a benchmark
-beside which the process had another thread fails `quick`, naming it, since `sim` counts every
-thread, and keeps only its time in `bench`. Run under Valgrind, the same benchmark counts within those few dozen instructions.
+the PMU's cores. Run under Valgrind, the same benchmark counts within those few dozen instructions.
+
+Those counters see the calling thread alone, and the kernel maps no page for a counter a process's
+threads inherit, so once a pass sees another thread beside a call, as the
+[harness](crates/swole/README.md) tells, the benchmark counts again with counters every thread
+inherits: swole opens them with perf's `inherit`, the harness starts and stops them around
+each call with the same `prctl`s, and reads each once after the last call with `read()`, which sums
+every thread's count, a thread gone by then among them. What the other threads run while a call
+does is the scheduler's, so like `sim`, `quick` counts such a job five times, and records the
+median of the five, with their least and most, marked sampled (`~`). Each count also holds the
+`prctl`s' own few dozen user-space instructions, a fixed cost, the same in every pass. A threaded
+benchmark counts within a few percent of Valgrind's every-thread count: the fixture's `handed`, a
+worker its setup started spinning 100,000 times, counts 406,045 natively against Valgrind's
+402,995 on an AMD Ryzen 9 9950X. A benchmark that runs no other thread keeps the exact, calling-thread
+path.
 So `quick` is exact for a call far shorter than the timer's tick, where an interrupt is
 unlikely, and `sim` is the mode that repeats exactly: each hardware interrupt that lands during a
 call, the tick's or a device's, adds an instruction and a branch to its count, as x86's counters
@@ -434,11 +449,19 @@ stratified subset of up to 64 of those calls (the same calls in every pass and o
 counter's share of a call. Both the timing and counter processes run under the preload built to
 count the threads a process starts and nothing else (without 1 MiB stack padding), so their clock
 and randomness stay the host's while detecting even short-lived workers spawned and joined inside a
-timed sample or counter pass: such a benchmark keeps its time but has no counters, which read
-the calling thread alone, and a note under the table names it. A table after the times
+timed sample or counter pass. Such a benchmark counts every thread, [as `quick`](#quick) counts a
+threaded one: its counter passes open counters every thread inherits, when its timed samples saw
+another thread, or once a pass of the calling thread's counters sees one, and run five times, each
+measure the median of the five with their least and most, marked sampled (`~`) in the table, as
+`lower` and `upper` in `--report`, and compared by their spread, and a note under the table names
+it. Each `:k` count of such a benchmark also holds the kernel's own work to start and stop counting,
+which no read in user space keeps out: some 10,000 instructions a call on an AMD Ryzen 9 9950X, 18,000
+on an Intel E-core, and more with each other thread alive. swole leaves it in rather than subtract a
+floor, which would take the other threads' kernel work with it. A table after the times
 prints every measure of each benchmark, beside the base's and its change when paired, and
 `--report` writes them all. A side whose harness predates counters, as a base from before an
-upgrade, says so and has none; one whose harness predates rusage has none of that.
+upgrade, says so and has none, as does a threaded benchmark whose harness predates counting every
+thread; one whose harness predates rusage has none of that.
 
 ### Cores
 
@@ -452,8 +475,8 @@ own work, for last, and when other runs hold them all, waits until any one frees
 takes a performance core, counted by the `cpu_core` PMU, while `quick` counts on the PMU of the
 most CPUs. A benchmark that starts another thread in its first call would have its threads
 serialized on one CPU, so it times on the run's core and every other core no other run leases,
-which it leases until it is counted, and the run says so; a side still running other threads gets
-no perf counters, as above.
+which it leases until it is counted, and the run says so; its counter passes run there too, and
+count every thread, as above.
 
 The lease keeps other `swole bench` runs off the core, not the host's other processes, which
 the run says unless the kernel excludes the CPU from scheduler load balancing (`isolcpus`, listed in

@@ -80,8 +80,8 @@ fn fixture(args: &[&std::ffi::OsStr]) -> Output {
 		.unwrap()
 }
 
-/// The fixture's benchmarks that run another thread, which perf counters read in user space
-/// cannot count.
+/// The fixture's benchmarks that run another thread, which counters every thread inherits count,
+/// sampled, rather than ones read in user space.
 const THREADED: [&str; 3] = ["handed", "spawned[100000]", "spawned[1000]"];
 
 #[test]
@@ -180,17 +180,29 @@ fn times_each_harness_benchmark() {
 		.map(|line| line.as_str().unwrap())
 		.collect();
 	if host.iter().any(|line| line.starts_with("perf: tier")) {
-		// A benchmark beside which another thread ran keeps its time, but no counters, which read
-		// the calling thread alone, and the note under the table names it.
+		// A benchmark beside which another thread ran counts every thread, the other's spins among
+		// them, each counter the median of several counts with their least and most, and the note
+		// under the table names it.
 		for name in THREADED {
 			let head = head(name);
-			assert!(head.get("instructions:u").is_none(), "{name}: {head}");
+			let instructions = &head["instructions:u"];
+			let (value, lower, upper) = (
+				instructions["value"].as_f64().unwrap(),
+				instructions["lower"].as_f64().unwrap(),
+				instructions["upper"].as_f64().unwrap(),
+			);
+			assert!(lower <= value && value <= upper, "{name}: {head}");
 			assert_eq!(report["benchmarks"][format!("{file}{name}")]["threaded"], true);
 		}
+		for name in ["handed", "spawned[100000]"] {
+			let instructions = head(name)["instructions:u"]["value"].as_f64().unwrap();
+			assert!(instructions > 400_000.0, "{name}: {instructions}");
+		}
 		assert!(table.contains(&format!(
-			"\nOther threads ran beside {}, so bench left out their perf counters",
+			"\nOther threads ran beside {}, so bench counted every thread",
 			THREADED.map(|name| format!("{file}{name}")).join(", ")
 		)));
+		assert!(head("alone")["instructions:u"].get("lower").is_none());
 		// A call of `alone` spins a thousand times, some four thousand instructions, as Valgrind
 		// counts it, and as many calls of a counter pass share them.
 		let instructions = head("alone")["instructions:u"]["value"].as_f64().unwrap();

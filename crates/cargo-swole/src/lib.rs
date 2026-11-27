@@ -359,7 +359,7 @@ pub(crate) struct Measure {
 	/// The median of its samples, or its one value.
 	pub value: f64,
 	pub unit: &'static str,
-	/// The least and most of its samples, when it took several.
+	/// The least and most of its samples, when it took several, which marks it sampled.
 	pub spread: Option<(f64, f64)>,
 }
 
@@ -412,7 +412,11 @@ impl Counts {
 		let count = *self.counts.get(name)?;
 		let mut measures = match self.details.get(name) {
 			Some(details) => details.clone(),
-			None => vec![Measure::new("instructions", count as f64, "instructions")],
+			// Valgrind's instructions alone, with the spread of the count.
+			None => vec![Measure {
+				spread: self.spread.get(name).map(|&(least, most)| (least as f64, most as f64)),
+				..Measure::new("instructions", count as f64, "instructions")
+			}],
 		};
 		if let Some(throughput) = self.throughput.get(name) {
 			measures.extend(throughput.measures(&measures));
@@ -429,9 +433,10 @@ impl Counts {
 	}
 }
 
-/// How many times sim counts a benchmark beside which the process had another thread, or might
-/// have, since what the threads run while its call does depends on the scheduler.
-const SAMPLES: usize = 5;
+/// How many times a benchmark beside which the process had another thread counts, or under sim,
+/// might have, since what the threads run while its call does depends on the scheduler: sim's
+/// every count, and every pass of quick's or bench's counters, which every thread inherits.
+pub(crate) const SAMPLES: usize = 5;
 
 /// What counts each job, and the fingerprint its counts carry.
 pub(crate) struct Counter {
@@ -545,11 +550,13 @@ pub(crate) fn threaded(counts: &Counts) -> String {
 	let mut out = String::new();
 	if !counts.threaded.is_empty() {
 		let names: Vec<&str> = counts.threaded.iter().map(String::as_str).collect();
-		// Only sim counts them: quick's and bench's counters fail a benchmark that runs a thread.
+		// Valgrind counts every thread, and quick's counters, once a call runs another thread, are
+		// ones every thread inherits.
 		out += &format!(
-			"\nOther threads ran beside {}, so each count and measure is the median of {SAMPLES}, with their least and \
-			 most, which the scheduler moves.\n",
-			names.join(", ")
+			"\nOther threads ran beside {}, so each count and measure, of every thread, is the median of {SAMPLES}, with \
+			 their least and most ({}), which the scheduler moves.\n",
+			names.join(", "),
+			metrics::SAMPLED
 		);
 	}
 	// Sampled without having been seen to run other threads: swole could not watch them.
@@ -562,8 +569,9 @@ pub(crate) fn threaded(counts: &Counts) -> String {
 	if !unwatched.is_empty() {
 		out += &format!(
 			"\nswole cannot see whether other threads ran beside {}, so each count and measure is the median of \
-			 {SAMPLES}, with their least and most.\n",
-			unwatched.join(", ")
+			 {SAMPLES}, with their least and most ({}).\n",
+			unwatched.join(", "),
+			metrics::SAMPLED
 		);
 	}
 	out
@@ -696,20 +704,15 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 		},
 		parallel,
 		counter,
+		false,
 	)?;
 	let mut counts = Counts::none(counter);
-	if let CounterKind::Perf { native, .. } = &counter.kind
-		&& let Some(bench_libc) = fingerprint::require_single_libc(
-			first
-				.iter()
-				.flatten()
-				.map(|found| (found.name.as_str(), found.libc.as_deref())),
-			true,
-		)? {
-		let resolved = native.with_libc(Some(bench_libc));
-		counts.fingerprint = resolved.label();
-		counts.host = resolved.describe();
-	}
+	// Each count's benchmark and loaded libc, every round's, which one fingerprint must cover.
+	let mut libcs: Vec<(String, Option<String>)> = first
+		.iter()
+		.flatten()
+		.map(|found| (found.name.clone(), found.libc.clone()))
+		.collect();
 	// Each benchmark's samples: its count, and its details.
 	let mut samples: BTreeMap<String, Vec<(u64, Vec<Measure>)>> = BTreeMap::new();
 	for found in first.iter().flatten() {
@@ -726,70 +729,84 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 			return Err(format!("two benchmarks are named {}", found.name));
 		}
 	}
-	if matches!(counter.kind, CounterKind::Valgrind) {
-		// Under Valgrind, a job beside whose benchmarks other threads ran counts again, its
-		// samples' spread standing for what the scheduler moves. So does one whose threads
-		// swole cannot see: CodSpeed's, a program's, whose harness no `SWOLE_BENCH` watches, and
-		// one whose harness is too old to say.
-		// Each job repeated, with the names its first round measured.
-		let again: Vec<(&Job, Vec<&String>)> = jobs
-			.iter()
-			.zip(&first)
-			.filter(|(job, found)| {
-				job.codspeed || job.expect.is_none() || found.iter().any(|found| found.threaded || !found.watched)
-			})
-			.map(|(job, found)| {
-				let mut names: Vec<&String> = found.iter().map(|found| &found.name).collect();
-				names.sort_unstable();
-				(job, names)
-			})
-			.collect();
-		let repeated: Vec<&Job> = again.iter().map(|(job, _)| *job).collect();
-		for round in 1..SAMPLES {
-			if repeated.is_empty() {
-				break;
-			}
-			let more = run(
-				&repeated,
-				&work.join((round + 1).to_string()),
-				Preloads {
-					count: &preload,
-					heap: None,
-				},
-				parallel,
-				counter,
-			)?;
-			// Each job counts again exactly what its first round did, so every median is of
-			// SAMPLES of one job's benchmark.
-			for ((job, expected), found) in again.iter().zip(&more) {
-				let mut names: Vec<&String> = found.iter().map(|found| &found.name).collect();
-				names.sort_unstable();
-				if names != *expected {
-					return Err(format!(
-						"count {} of {} measured {names:?}, not {expected:?}",
-						round + 1,
-						job.label
-					));
-				}
-			}
-			for found in more.iter().flatten() {
-				// Each count divides by what the process that took it declared.
-				if found.throughput != counts.throughput.get(&found.name).copied() {
-					return Err(format!(
-						"count {} of {} declared another throughput than its first",
-						round + 1,
-						found.name
-					));
-				}
-				if found.threaded {
-					counts.threaded.insert(found.name.clone());
-				}
-				samples
-					.entry(found.name.clone())
-					.or_default()
-					.push((found.count, found.details.clone()));
+	// A job beside whose benchmarks other threads ran counts again, its samples' spread
+	// standing for what the scheduler moves: natively, with counters every thread inherits.
+	// Under Valgrind, so does one whose threads swole cannot see: CodSpeed's, a program's,
+	// whose harness no `SWOLE_BENCH` watches, and one whose harness is too old to say.
+	// Each job repeated, with the names its first round measured.
+	let valgrind = matches!(counter.kind, CounterKind::Valgrind);
+	let again: Vec<(&Job, Vec<&String>)> = jobs
+		.iter()
+		.zip(&first)
+		.filter(|(job, found)| {
+			found.iter().any(|found| found.threaded)
+				|| valgrind && (job.codspeed || job.expect.is_none() || found.iter().any(|found| !found.watched))
+		})
+		.map(|(job, found)| {
+			let mut names: Vec<&String> = found.iter().map(|found| &found.name).collect();
+			names.sort_unstable();
+			(job, names)
+		})
+		.collect();
+	let repeated: Vec<&Job> = again.iter().map(|(job, _)| *job).collect();
+	for round in 1..SAMPLES {
+		if repeated.is_empty() {
+			break;
+		}
+		let more = run(
+			&repeated,
+			&work.join((round + 1).to_string()),
+			Preloads {
+				count: &preload,
+				heap: None,
+			},
+			parallel,
+			counter,
+			true,
+		)?;
+		// Each job counts again exactly what its first round did, so every median is of
+		// SAMPLES of one job's benchmark.
+		for ((job, expected), found) in again.iter().zip(&more) {
+			let mut names: Vec<&String> = found.iter().map(|found| &found.name).collect();
+			names.sort_unstable();
+			if names != *expected {
+				return Err(format!(
+					"count {} of {} measured {names:?}, not {expected:?}",
+					round + 1,
+					job.label
+				));
 			}
 		}
+		libcs.extend(
+			more.iter()
+				.flatten()
+				.map(|found| (found.name.clone(), found.libc.clone())),
+		);
+		for found in more.iter().flatten() {
+			// Each count divides by what the process that took it declared.
+			if found.throughput != counts.throughput.get(&found.name).copied() {
+				return Err(format!(
+					"count {} of {} declared another throughput than its first",
+					round + 1,
+					found.name
+				));
+			}
+			if found.threaded {
+				counts.threaded.insert(found.name.clone());
+			}
+			samples
+				.entry(found.name.clone())
+				.or_default()
+				.push((found.count, found.details.clone()));
+		}
+	}
+	if let CounterKind::Perf { native, .. } = &counter.kind
+		&& let Some(bench_libc) =
+			fingerprint::require_single_libc(libcs.iter().map(|(name, libc)| (name.as_str(), libc.as_deref())), true)?
+	{
+		let resolved = native.with_libc(Some(bench_libc));
+		counts.fingerprint = resolved.label();
+		counts.host = resolved.describe();
 	}
 	std::fs::remove_dir_all(&work).map_err(|e| format!("cannot remove {}: {e}", work.display()))?;
 	let mut allocs: BTreeMap<String, Vec<Measure>> = first
@@ -801,7 +818,8 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 		})
 		.collect();
 	for (name, taken) in samples {
-		let mut details = median(&taken).map_err(|err| format!("{name}: {err}"))?;
+		let details: Vec<Vec<Measure>> = taken.iter().map(|(_, details)| details.clone()).collect();
+		let mut details = median(&details).map_err(|err| format!("{name}: {err}"))?;
 		details.extend(allocs.remove(&name).unwrap_or_default());
 		if !details.is_empty() {
 			counts.details.insert(name.clone(), details);
@@ -834,12 +852,14 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 
 /// Each measure of a benchmark's `samples`, the median of its values, with their least and most
 /// when it took more than one, so a measure the scheduler moves reads as its spread, not one draw.
-fn median(samples: &[(u64, Vec<Measure>)]) -> Result<Vec<Measure>, String> {
-	let (first, rest) = samples.split_first().expect("a benchmark counted has a sample");
+pub(crate) fn median(samples: &[Vec<Measure>]) -> Result<Vec<Measure>, String> {
+	let Some((first, rest)) = samples.split_first() else {
+		return Ok(Vec::new());
+	};
 	let mut measures = Vec::new();
-	for measure in &first.1 {
+	for measure in first {
 		let mut values = vec![measure.value];
-		for (_, details) in rest {
+		for details in rest {
 			let other = details
 				.iter()
 				.find(|other| other.name == measure.name)
@@ -930,13 +950,16 @@ struct Preloads<'a> {
 
 /// Runs each job with the libraries `preloads`, counted by `counter`, `parallel` at once, each
 /// in a directory of its own under `work`, and gathers what each measured, in the jobs' order.
-/// Any failure fails the whole and keeps `work` for its output.
+/// Natively, a job counts with counters every thread inherits when `threaded`, as a job seen to
+/// run another thread repeats, and otherwise switches to them once it sees one. Any failure fails
+/// the whole and keeps `work` for its output.
 fn run(
 	jobs: &[&Job],
 	work: &Path,
 	preloads: Preloads,
 	parallel: usize,
 	counter: &Counter,
+	threaded: bool,
 ) -> Result<Vec<Vec<Found>>, String> {
 	let preload = preloads.count;
 	let total = jobs.len();
@@ -958,7 +981,7 @@ fn run(
 						let dir = work.join(index.to_string());
 						let mut result = match &counter.kind {
 							CounterKind::Valgrind => one(job, &dir, preload),
-							CounterKind::Perf { pmu, passes, .. } => native(job, &dir, preload, pmu, passes),
+							CounterKind::Perf { pmu, passes, .. } => native(job, &dir, preload, pmu, passes, threaded),
 						};
 						// A harness job measures its one benchmark, whose allocations its own pass counts.
 						if let (Ok([found]), Some(heap)) = (result.as_deref_mut(), preloads.heap)
@@ -1152,85 +1175,101 @@ pub(crate) fn environment(
 
 /// Runs one job natively, once for each of `passes`, its benchmark counted by that pass's perf
 /// counters of `pmu` on its CPUs, with the library at `preload`, each pass's output under `dir`,
-/// and reads what they counted.
-fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf::Pass]) -> Measured {
+/// and reads what they counted: with counters every thread inherits when `threaded`, or once a
+/// pass sees another thread run beside a call, whose work counters of the calling thread miss.
+fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf::Pass], threaded: bool) -> Measured {
 	let label = &job.label;
-	let mut values = Vec::new();
-	let mut libcs: Vec<(String, Option<String>)> = Vec::new();
-	let mut first: Option<perf::Reading> = None;
-	let mut throughput = None;
-	for (i, pass) in passes.iter().enumerate() {
-		let dir = dir.join(format!("pass-{}", i + 1));
-		std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-		let path = dir.join("stdout");
-		let stdout = std::fs::File::create(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-		let errors = dir.join("stderr");
-		let stderr = std::fs::File::create(&errors).map_err(|e| format!("cannot create {}: {e}", errors.display()))?;
-		let mut command = job.command();
-		perf::launch(&mut command, &pmu.cpus, pass, true);
-		let env = environment(&command, preload, label, true)?;
-		command
-			.env_clear()
-			.envs(env)
-			.stdin(std::process::Stdio::null())
-			.stdout(stdout)
-			.stderr(stderr);
-		let status = command.status().map_err(|e| format!("cannot run {label}: {e}"))?;
-		if !status.success() {
-			return Err(format!(
-				"{label} failed ({status}){}; its output is in {}",
-				reason(&errors),
-				dir.display()
-			));
-		}
-		let text = printed(&path)?;
-		let declared = metrics::Throughput::declared(&text).map_err(|err| format!("{label}: {err}"))?;
-		let declared = job.expect.as_ref().and_then(|name| declared.get(name).copied());
-		match &throughput {
-			None => throughput = Some(declared),
-			Some(first) if *first != declared => {
-				return Err(format!("{label} declared another throughput in each pass"));
-			}
-			Some(_) => {}
-		}
-		let mut readings = perf::readings(&text, pass.len()).map_err(|err| format!("{label}: {err}"))?;
-		let reading = match (&job.expect, readings.len()) {
-			(Some(name), 1) if readings[0].name == *name => readings.remove(0),
-			(_, 0) => {
+	let mut every_thread = threaded;
+	let (values, first, libcs, throughput) = 'count: loop {
+		let mut values = Vec::new();
+		let mut libcs: Vec<(String, Option<String>)> = Vec::new();
+		let mut first: Option<perf::Reading> = None;
+		let mut throughput = None;
+		for (i, pass) in passes.iter().enumerate() {
+			let dir = dir.join(format!("pass-{}", i + 1));
+			std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+			let path = dir.join("stdout");
+			let stdout = std::fs::File::create(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+			let errors = dir.join("stderr");
+			let stderr =
+				std::fs::File::create(&errors).map_err(|e| format!("cannot create {}: {e}", errors.display()))?;
+			let mut command = job.command();
+			perf::launch(
+				&mut command,
+				&pmu.cpus,
+				pass,
+				perf::Launch {
+					fixed: true,
+					every_thread,
+				},
+			);
+			let env = environment(&command, preload, label, true)?;
+			command
+				.env_clear()
+				.envs(env)
+				.stdin(std::process::Stdio::null())
+				.stdout(stdout)
+				.stderr(stderr);
+			let status = command.status().map_err(|e| format!("cannot run {label}: {e}"))?;
+			if !status.success() {
 				return Err(format!(
-					"{label} printed no perf count: its swole harness is older than quick; its output is in {}",
+					"{label} failed ({status}){}; its output is in {}",
+					reason(&errors),
 					dir.display()
 				));
 			}
-			_ => {
-				let found: Vec<&str> = readings.iter().map(|reading| reading.name.as_str()).collect();
+			let text = printed(&path)?;
+			let declared = metrics::Throughput::declared(&text).map_err(|err| format!("{label}: {err}"))?;
+			let declared = job.expect.as_ref().and_then(|name| declared.get(name).copied());
+			match &throughput {
+				None => throughput = Some(declared),
+				Some(first) if *first != declared => {
+					return Err(format!("{label} declared another throughput in each pass"));
+				}
+				Some(_) => {}
+			}
+			let mut readings = perf::readings(&text, pass.len()).map_err(|err| format!("{label}: {err}"))?;
+			let reading = match (&job.expect, readings.len()) {
+				(Some(name), 1) if readings[0].name == *name => readings.remove(0),
+				(_, 0) => {
+					return Err(format!(
+						"{label} printed no perf count: its swole harness is older than quick; its output is in {}",
+						dir.display()
+					));
+				}
+				_ => {
+					let found: Vec<&str> = readings.iter().map(|reading| reading.name.as_str()).collect();
+					return Err(format!(
+						"{label} should count itself alone, but counted [{}]; its output is in {}",
+						found.join(", "),
+						dir.display()
+					));
+				}
+			};
+			// The calling thread's counters missed the other thread, so every pass counts again,
+			// with counters every thread inherits, which a harness too old to says it cannot.
+			if reading.threaded && !every_thread && !reading.inherits {
 				return Err(format!(
-					"{label} should count itself alone, but counted [{}]; its output is in {}",
-					found.join(", "),
-					dir.display()
+					"{}: another thread ran beside a counted call, whose work the calling thread's counters miss, and its \
+					 swole harness is too old to count every thread: upgrade it, or count it with sim",
+					reading.name
 				));
 			}
-		};
-		let verified = reading
-			.libc
-			.as_deref()
-			.map(fingerprint::validate_libc_record)
-			.transpose()?;
-		libcs.push((label.clone(), verified));
-		values.push(reading.values.clone());
-		match &mut first {
-			Some(first) => first.threaded |= reading.threaded,
-			None => first = Some(reading),
+			if reading.threaded && !every_thread {
+				every_thread = true;
+				continue 'count;
+			}
+			let verified = reading
+				.libc
+				.as_deref()
+				.map(fingerprint::validate_libc_record)
+				.transpose()?;
+			libcs.push((label.clone(), verified));
+			values.push(reading.values.clone());
+			first.get_or_insert(reading);
 		}
-	}
-	let first = first.expect("a host that counts has a pass");
-	if first.threaded {
-		return Err(format!(
-			"{}: another thread ran beside a counted call, whose work quick's perf counters, read in user space for \
-			 the calling thread alone, cannot see: count it with sim",
-			first.name
-		));
-	}
+		break (values, first.expect("a host that counts has a pass"), libcs, throughput);
+	};
 	let libc = fingerprint::require_single_libc(
 		libcs.iter().map(|(label, libc)| (label.as_str(), libc.as_deref())),
 		true,
@@ -1248,7 +1287,8 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 	Ok(vec![Found {
 		name: first.name,
 		count,
-		threaded: first.threaded,
+		// Counted by every thread once one ran, so sampled however this run went.
+		threaded: every_thread,
 		watched: true,
 		libc,
 		details,
@@ -1283,6 +1323,7 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 	let mut env = environment(&command, preload, label, true)?;
 	// A `--program`'s shell inherits swole's environment, whose counter settings are a native count's.
 	env.remove(OsStr::new(perf::COUNTERS));
+	env.remove(OsStr::new(perf::INHERIT));
 	env.remove(OsStr::new(perf::ITERATIONS));
 	valgrind.env_clear().envs(env);
 	let status = valgrind.status().map_err(|e| format!("cannot run valgrind: {e}"))?;
