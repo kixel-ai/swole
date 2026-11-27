@@ -170,7 +170,7 @@ fn cli(args: &[String]) -> Result<(), String> {
 				}
 				print!("{}", metrics::table(&counts));
 				print!("{}", threaded(&counts));
-				print!("{}", metrics::details(None, &counts.details));
+				print!("{}", metrics::details(None, &counts.shown(), &BTreeMap::new()));
 				if let Some(out) = &options.out {
 					metrics::File::counts(&counts, &counter)?.write(out)?;
 					eprintln!("swole: wrote {}", out.display());
@@ -388,6 +388,8 @@ pub(crate) struct Counts {
 	/// Every measure of each benchmark, the headline's among them, each the median of its samples
 	/// with their least and most when it took several.
 	pub details: BTreeMap<String, Vec<Measure>>,
+	/// What each call processes, of each benchmark that declares it.
+	pub throughput: BTreeMap<String, metrics::Throughput>,
 }
 
 impl Counts {
@@ -400,7 +402,30 @@ impl Counts {
 			spread: BTreeMap::new(),
 			threaded: BTreeSet::new(),
 			details: BTreeMap::new(),
+			throughput: BTreeMap::new(),
 		}
+	}
+
+	/// Every measure of the benchmark `name`, when counted: its details, or its headline count
+	/// alone, then what derives from them and what each call processes.
+	pub(crate) fn measures(&self, name: &str) -> Option<Vec<Measure>> {
+		let count = *self.counts.get(name)?;
+		let mut measures = match self.details.get(name) {
+			Some(details) => details.clone(),
+			None => vec![Measure::new("instructions", count as f64, "instructions")],
+		};
+		if let Some(throughput) = self.throughput.get(name) {
+			measures.extend(throughput.measures(&measures));
+		}
+		Some(measures)
+	}
+
+	/// Every measure of each counted benchmark, as a table shows them below the headline counts.
+	pub(crate) fn shown(&self) -> BTreeMap<String, Vec<Measure>> {
+		self.counts
+			.keys()
+			.filter_map(|name| Some((name.clone(), self.measures(name)?)))
+			.collect()
 	}
 }
 
@@ -691,6 +716,9 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 		if found.threaded {
 			counts.threaded.insert(found.name.clone());
 		}
+		if let Some(throughput) = found.throughput {
+			counts.throughput.insert(found.name.clone(), throughput);
+		}
 		if samples
 			.insert(found.name.clone(), vec![(found.count, found.details.clone())])
 			.is_some()
@@ -745,6 +773,14 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 				}
 			}
 			for found in more.iter().flatten() {
+				// Each count divides by what the process that took it declared.
+				if found.throughput != counts.throughput.get(&found.name).copied() {
+					return Err(format!(
+						"count {} of {} declared another throughput than its first",
+						round + 1,
+						found.name
+					));
+				}
 				if found.threaded {
 					counts.threaded.insert(found.name.clone());
 				}
@@ -788,6 +824,7 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 		counts.spread.retain(|name, _| wanted.contains(name));
 		counts.threaded.retain(|name| wanted.contains(name));
 		counts.details.retain(|name, _| wanted.contains(name));
+		counts.throughput.retain(|name, _| wanted.contains(name));
 	}
 	if strict && counts.counts.is_empty() {
 		return Err("no benchmark ran".to_owned());
@@ -936,7 +973,7 @@ fn run(
 									CounterKind::Valgrind => None,
 								},
 							};
-							match heap::measure(job, pass, &dir) {
+							match heap::measure(job, pass, found.throughput, &dir) {
 								Ok(allocs) => found.allocs = Some(allocs),
 								Err(err) => result = Err(err),
 							}
@@ -1066,6 +1103,8 @@ struct Found {
 	libc: Option<String>,
 	/// Every measure of it, its count's among them.
 	details: Vec<Measure>,
+	/// What each of its calls processes, as the process that counted it declared.
+	throughput: Option<metrics::Throughput>,
 	/// What its allocation pass found, when the round ran one.
 	allocs: Option<heap::Allocs>,
 }
@@ -1119,6 +1158,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 	let mut values = Vec::new();
 	let mut libcs: Vec<(String, Option<String>)> = Vec::new();
 	let mut first: Option<perf::Reading> = None;
+	let mut throughput = None;
 	for (i, pass) in passes.iter().enumerate() {
 		let dir = dir.join(format!("pass-{}", i + 1));
 		std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -1144,6 +1184,15 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 			));
 		}
 		let text = printed(&path)?;
+		let declared = metrics::Throughput::declared(&text).map_err(|err| format!("{label}: {err}"))?;
+		let declared = job.expect.as_ref().and_then(|name| declared.get(name).copied());
+		match &throughput {
+			None => throughput = Some(declared),
+			Some(first) if *first != declared => {
+				return Err(format!("{label} declared another throughput in each pass"));
+			}
+			Some(_) => {}
+		}
 		let mut readings = perf::readings(&text, pass.len()).map_err(|err| format!("{label}: {err}"))?;
 		let reading = match (&job.expect, readings.len()) {
 			(Some(name), 1) if readings[0].name == *name => readings.remove(0),
@@ -1203,6 +1252,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 		watched: true,
 		libc,
 		details,
+		throughput: throughput.flatten(),
 		allocs: None,
 	}])
 }
@@ -1242,7 +1292,9 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 			dir.display()
 		));
 	}
-	let threads = perf::threads(&printed(&dir.join("stdout"))?);
+	let stdout = printed(&dir.join("stdout"))?;
+	let threads = perf::threads(&stdout);
+	let declared = metrics::Throughput::declared(&stdout).map_err(|err| format!("{label}: {err}"))?;
 	let mut measured = Vec::new();
 	let mut entries: Vec<_> = std::fs::read_dir(dir)
 		.map_err(|e| format!("cannot read {}: {e}", dir.display()))?
@@ -1268,6 +1320,7 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 		measured.extend(found.into_iter().map(|(name, costs)| Found {
 			threaded: threads.get(&name) == Some(&true),
 			watched: threads.contains_key(&name),
+			throughput: declared.get(&name).copied(),
 			name,
 			count: costs.ir(),
 			libc: None,

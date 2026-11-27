@@ -473,8 +473,62 @@ fn counts_allocations_as_a_global_allocator_does() {
 fn counts_each_harness_benchmark_alone_without_its_setup() {
 	let dir = scratch("harness");
 	let metrics = dir.join("metrics.json");
-	let out = harness(&["sim", "--out", metrics.to_str().unwrap()]);
+	let report = dir.join("report.json");
+	let out = harness(&[
+		"sim",
+		"--out",
+		metrics.to_str().unwrap(),
+		"--report",
+		report.to_str().unwrap(),
+	]);
 	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	// A benchmark that declares what each call processes reports its instructions per byte or item,
+	// but no rate, since sim measures no native time; one that declares none, neither.
+	let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(report).unwrap()).unwrap();
+	assert_eq!(report["schema_version"], 1);
+	let head = |name: &str| report["benchmarks"][format!("crates/swole/benches/fixture.rs::{name}")]["head"].clone();
+	for (name, per, amount) in [("sized[2000]", "byte", 2000.0), ("alone", "item", 1000.0)] {
+		let head = head(name);
+		let instructions = head["instructions"]["value"].as_f64().unwrap();
+		let derived = &head[format!("instructions/{per}")];
+		assert_eq!(derived["unit"], format!("instructions/{per}"), "{name}: {head}");
+		let ratio = derived["value"].as_f64().unwrap() * amount / instructions;
+		assert!((ratio - 1.0).abs() < 1e-3, "{name}: {head}");
+		assert!(head.get("throughput").is_none(), "{name}: {head}");
+		// So does every other count and the call's allocations, but not the most it held at once.
+		assert_eq!(
+			head[format!("estimated cycles/{per}")]["unit"],
+			format!("cycles/{per}"),
+			"{name}: {head}"
+		);
+		assert_eq!(
+			head[format!("data reads/{per}")]["unit"],
+			format!("events/{per}"),
+			"{name}: {head}"
+		);
+		if head.get("alloc_count").is_some() {
+			assert_eq!(
+				head[format!("alloc_count/{per}")]["unit"],
+				format!("allocations/{per}"),
+				"{name}: {head}"
+			);
+			assert!(head.get(format!("peak_live_bytes/{per}")).is_none(), "{name}: {head}");
+		}
+	}
+	let borrowed = head("borrowed");
+	assert!(
+		borrowed
+			.as_object()
+			.unwrap()
+			.keys()
+			.all(|key| !key.ends_with("/byte") && !key.ends_with("/item")),
+		"{borrowed}"
+	);
+	let table = String::from_utf8_lossy(&out.stdout);
+	assert!(
+		table.contains("| crates/swole/benches/fixture.rs::sized[2000] | instructions/byte | "),
+		"{table}"
+	);
 	let metrics: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(metrics).unwrap()).unwrap();
 	let metrics = metrics["samples"][0]["metrics"].as_object().unwrap();
 	let file = "crates/swole/benches/fixture.rs::";
@@ -641,8 +695,16 @@ fn counts_with_perf_counters_what_valgrind_does() {
 	}
 	let list = single_threaded(&dir);
 	let list = list.to_str().unwrap();
-	let out = harness(&["quick", "--benchmarks", list]);
+	let report = dir.join("report.json");
+	let out = harness(&["quick", "--benchmarks", list, "--report", report.to_str().unwrap()]);
 	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	// Each counter's share of a byte, of a benchmark that declares its bytes.
+	let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(report).unwrap()).unwrap();
+	let head = &report["benchmarks"][format!("{file}sized[2000]")]["head"];
+	let instructions = head["instructions:u"]["value"].as_f64().unwrap();
+	let per_byte = head["instructions:u/byte"]["value"].as_f64().unwrap();
+	assert!((per_byte * 2000.0 / instructions - 1.0).abs() < 1e-3, "{head}");
+	assert!(head.get("throughput").is_none(), "{head}");
 	let perf = table(&out.stdout);
 	let sim = harness(&["sim", "--benchmarks", list]);
 	assert!(sim.status.success(), "{}", String::from_utf8_lossy(&sim.stderr));

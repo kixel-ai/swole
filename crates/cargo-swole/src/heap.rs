@@ -59,13 +59,20 @@ pub struct Pass<'a> {
 	pub cpus: Option<&'a [usize]>,
 }
 
-/// Counts `job`'s benchmark's allocations as `pass` launches, each run's output under `dir`.
-pub fn measure(job: &Job, pass: Pass, dir: &Path) -> Result<Allocs, String> {
+/// Counts `job`'s benchmark's allocations as `pass` launches, each run's output under `dir`. Each
+/// run must declare `throughput` as the process that timed or counted the benchmark did, since
+/// the allocations are divided by what that one declared.
+pub fn measure(
+	job: &Job,
+	pass: Pass,
+	throughput: Option<crate::metrics::Throughput>,
+	dir: &Path,
+) -> Result<Allocs, String> {
 	let name = job.expect.as_deref().expect("a harness job names its benchmark");
 	let mut runs = Vec::new();
 	for run in 1..=SAMPLES {
 		let dir = dir.join(format!("heap-{run}"));
-		let (counted, threaded) = match once(job, pass, &dir, name)? {
+		let (counted, threaded) = match once(job, pass, throughput, &dir, name)? {
 			Some(Record::Counted(counted, threaded)) => (counted, threaded),
 			Some(Record::Bypassed) => {
 				eprintln!(
@@ -102,7 +109,13 @@ enum Record {
 }
 
 /// One run of the pass, or `None` from a harness too old to count allocations.
-fn once(job: &Job, pass: Pass, dir: &Path, name: &str) -> Result<Option<Record>, String> {
+fn once(
+	job: &Job,
+	pass: Pass,
+	throughput: Option<crate::metrics::Throughput>,
+	dir: &Path,
+	name: &str,
+) -> Result<Option<Record>, String> {
 	std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 	let file = |name: &str| {
 		std::fs::File::create(dir.join(name)).map_err(|e| format!("cannot create {}: {e}", dir.join(name).display()))
@@ -133,6 +146,14 @@ fn once(job: &Job, pass: Pass, dir: &Path, name: &str) -> Result<Option<Record>,
 		));
 	}
 	let stdout = crate::printed(&dir.join("stdout"))?;
+	let declared = crate::metrics::Throughput::declared(&stdout).map_err(|err| format!("{}: {err}", job.label))?;
+	if declared.get(name).copied() != throughput {
+		return Err(format!(
+			"{} declared another throughput (or none) counting allocations than measuring; its output is in {}",
+			job.label,
+			dir.display()
+		));
+	}
 	let record =
 		parse(&stdout, name).map_err(|err| format!("{}: {err}; its output is in {}", job.label, dir.display()))?;
 	let Some(Record::Counted(counted, _)) = record else {

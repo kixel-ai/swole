@@ -20,7 +20,3 @@ Recommendations for the implementer:
 
 - Maintainer: run the first `cargo publish --locked` for `swole-macros`, `swole`, and `cargo-swole` from `kixel-ai/swole` once the crates exist there and this quest's `Required` items clear (crates.io requires the initial publish from a human token before Trusted Publishing can be enabled; an agent cannot access the maintainer's crates.io token). Check `https://crates.io/crates/swole` and `https://crates.io/crates/cargo-swole`.
 - Maintainer: on crates.io, enable Trusted Publishing for `swole-macros`, `swole`, and `cargo-swole` pointing at `kixel-ai/swole`'s `release.yml` workflow and `crates-io` environment, then turn on "Require trusted publishing" after the first automated release (requires the crate owner's crates.io web session).
-
-## Required
-
-- [Optional #[bench] throughput and --report schema version](/quest/m0/throughput-and-schema.md) - locks the harness attribute and JSON report schema before publishing 0.1.0

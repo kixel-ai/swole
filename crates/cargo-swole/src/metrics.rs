@@ -15,6 +15,129 @@ const NAME_LIMIT: usize = 1024;
 /// The longest measure name Kixel Quest takes, in characters.
 const MEASURE_LIMIT: usize = 64;
 
+/// The version of `--report`'s JSON, which changes only when a field changes meaning or goes;
+/// a new field keeps it.
+const SCHEMA_VERSION: u64 = 1;
+
+/// What a harness target prints before what each call of a benchmark processes.
+pub const THROUGHPUT: &str = "swole throughput ";
+
+/// What each call of a benchmark processes, as its `#[bench(bytes = ..)]` or `items` declares.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Throughput {
+	Bytes(u64),
+	Items(u64),
+}
+
+impl Throughput {
+	/// What the harness prints after `swole throughput `: `bytes` or `items`, then how many.
+	fn parse(unit: &str, amount: &str) -> Option<Self> {
+		let amount = amount.parse().ok().filter(|&n| n > 0)?;
+		match unit {
+			"bytes" => Some(Self::Bytes(amount)),
+			"items" => Some(Self::Items(amount)),
+			_ => None,
+		}
+	}
+
+	/// Each benchmark's throughput as a harness target's `stdout` declares it, a
+	/// `swole throughput <bytes|items> <n> <name>` line each, failing on one no harness prints,
+	/// or two that disagree.
+	pub fn declared(stdout: &str) -> Result<BTreeMap<String, Self>, String> {
+		let mut declared = BTreeMap::new();
+		for rest in stdout.lines().filter_map(|line| line.strip_prefix(THROUGHPUT)) {
+			let (name, throughput) = Self::record(rest)?;
+			Self::agree(&mut declared, name, throughput)?;
+		}
+		Ok(declared)
+	}
+
+	/// The benchmark and throughput a `swole throughput ` line declares after its prefix.
+	pub fn record(rest: &str) -> Result<(&str, Self), String> {
+		let malformed = || format!("a harness target printed {THROUGHPUT}{rest}, which no harness prints");
+		let mut fields = rest.splitn(3, ' ');
+		let (Some(unit), Some(amount), Some(name)) = (fields.next(), fields.next(), fields.next()) else {
+			return Err(malformed());
+		};
+		if name.is_empty() {
+			return Err(malformed());
+		}
+		Ok((name, Self::parse(unit, amount).ok_or_else(malformed)?))
+	}
+
+	/// Records `throughput` as `name`'s in `declared`, failing if it already holds another.
+	pub fn agree(declared: &mut BTreeMap<String, Self>, name: &str, throughput: Self) -> Result<(), String> {
+		match declared.insert(name.to_owned(), throughput) {
+			Some(other) if other != throughput => {
+				Err(format!("{name} declared two throughputs, {other:?} and {throughput:?}"))
+			}
+			_ => Ok(()),
+		}
+	}
+
+	/// How many times what `base`'s calls each process this one's do, when both count the same
+	/// unit.
+	pub fn scale(self, base: Self) -> Option<f64> {
+		match (self, base) {
+			(Self::Bytes(_), Self::Bytes(_)) | (Self::Items(_), Self::Items(_)) => Some(self.amount() / base.amount()),
+			_ => None,
+		}
+	}
+
+	/// How many bytes or items each call processes.
+	fn amount(self) -> f64 {
+		match self {
+			Self::Bytes(n) | Self::Items(n) => n as f64,
+		}
+	}
+
+	/// What derives from a call's `measures`: each count's share of a byte or an item, its
+	/// allocations' too, and from its native wall-clock `time`, how many it processes a second,
+	/// each with the spread of what it derives from. A count or time the run did not measure
+	/// derives nothing.
+	pub fn measures(self, measures: &[Measure]) -> Vec<Measure> {
+		let bytes = matches!(self, Self::Bytes(_));
+		let (per, of) = if bytes {
+			("byte", "bytes/s")
+		} else {
+			("item", "items/s")
+		};
+		let amount = self.amount();
+		let mut out = Vec::new();
+		for measure in measures {
+			let unit = match (measure.name.as_str(), measure.unit, bytes) {
+				("time", "ns", _) => {
+					if measure.value > 0.0 && measure.spread.is_none_or(|(least, _)| least > 0.0) {
+						let mut rate = Measure::new("throughput", amount * 1e9 / measure.value, of);
+						rate.spread = measure
+							.spread
+							.map(|(least, most)| (amount * 1e9 / most, amount * 1e9 / least));
+						out.push(rate);
+					}
+					continue;
+				}
+				// A call's allocations sum over it as a count does; the most it held at once does not.
+				(_, "instructions", true) => "instructions/byte",
+				(_, "instructions", false) => "instructions/item",
+				(_, "cycles", true) => "cycles/byte",
+				(_, "cycles", false) => "cycles/item",
+				(_, "events", true) => "events/byte",
+				(_, "events", false) => "events/item",
+				// A call's allocations sum over it as a count does; the most it held at once does not.
+				("alloc_count", "allocations", true) => "allocations/byte",
+				("alloc_count", "allocations", false) => "allocations/item",
+				("alloc_bytes", "bytes", true) => "bytes/byte",
+				("alloc_bytes", "bytes", false) => "bytes/item",
+				_ => continue,
+			};
+			let mut derived = Measure::new(&format!("{}/{per}", measure.name), measure.value / amount, unit);
+			derived.spread = measure.spread.map(|(least, most)| (least / amount, most / amount));
+			out.push(derived);
+		}
+		out
+	}
+}
+
 /// A `metrics.json`: a few measures, each in its unit, of each sample's benchmarks.
 pub struct File {
 	/// Each measure's unit, by its name.
@@ -173,6 +296,7 @@ impl Report {
 		benchmarks: BTreeMap<String, Map<String, Value>>,
 	) -> Self {
 		let mut report = json!({
+			"schema_version": SCHEMA_VERSION,
 			"mode": mode.name(),
 			"fingerprint": fingerprint,
 			"host": host.lines().collect::<Vec<_>>(),
@@ -209,7 +333,7 @@ pub fn side(measures: &[Measure]) -> Value {
 /// The report of a count, quick's or sim's, of the working tree, against `base`'s counts, from the
 /// commit `sha`, when given.
 pub fn report(counts: &Counts, base: Option<&Counts>, counter: &Counter, sha: Option<&str>) -> Report {
-	let point = |counts: &Counts, name: &str| -> Option<Value> { Some(side(counts.details.get(name)?)) };
+	let point = |counts: &Counts, name: &str| -> Option<Value> { Some(side(&counts.measures(name)?)) };
 	let names: BTreeSet<&String> = counts
 		.counts
 		.keys()
@@ -267,18 +391,44 @@ pub fn shown(value: f64, unit: &str) -> String {
 		format!("{value}")
 	} else if value.abs() >= 100.0 {
 		format!("{value:.1}")
+	} else if value != 0.0 && value.abs() < 0.001 {
+		// A per-byte count of a large input, which fixed decimals would show as zero.
+		format!("{value:.2e}")
 	} else {
 		format!("{value:.3}")
 	};
 	match unit {
 		"events" | "instructions" | "cycles" | "instructions/cycle" => number,
+		"bytes/s" => rate(value, 1024.0, &["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"]),
+		"items/s" => rate(
+			value,
+			1000.0,
+			&["items/s", "K items/s", "M items/s", "G items/s", "T items/s"],
+		),
 		unit => format!("{number} {unit}"),
 	}
 }
 
+/// A rate `value` in the largest of `units`, each `step` times the last, it reaches.
+fn rate(mut value: f64, step: f64, units: &[&str]) -> String {
+	let mut unit = 0;
+	while value >= step && unit + 1 < units.len() {
+		value /= step;
+		unit += 1;
+	}
+	format!("{value:.2} {}", units[unit])
+}
+
 /// Every measure of each benchmark beyond its headline, a row each, as a Markdown table: with
-/// `before`, the base's beside the head's, and the change; empty when no benchmark has any.
-pub fn details(before: Option<&BTreeMap<String, Vec<Measure>>>, after: &BTreeMap<String, Vec<Measure>>) -> String {
+/// `before`, the base's beside the head's, and the change, which for a benchmark `paired` names
+/// is its `throughput`'s from its paired timing, rather than from its sides' medians; empty when
+/// no benchmark has any. A measure whose unit differs by side, as a rate in bytes on one and
+/// items on the other, takes a row a side.
+pub fn details(
+	before: Option<&BTreeMap<String, Vec<Measure>>>,
+	after: &BTreeMap<String, Vec<Measure>>,
+	paired: &BTreeMap<String, f64>,
+) -> String {
 	if after.is_empty() && before.is_none_or(BTreeMap::is_empty) {
 		return String::new();
 	}
@@ -297,13 +447,16 @@ pub fn details(before: Option<&BTreeMap<String, Vec<Measure>>>, after: &BTreeMap
 		let base = before.and_then(|before| before.get(name)).map(Vec::as_slice);
 		let mut measures: Vec<(&str, &'static str)> = Vec::new();
 		for measure in head.iter().chain(base.unwrap_or_default()) {
-			if !measures.iter().any(|(name, _)| *name == measure.name) {
+			if !measures
+				.iter()
+				.any(|&(name, unit)| name == measure.name && unit == measure.unit)
+			{
 				measures.push((&measure.name, measure.unit));
 			}
 		}
 		for (measure, unit) in measures {
-			fn find<'a>(side: &'a [Measure], name: &str) -> Option<&'a Measure> {
-				side.iter().find(|m| m.name == name)
+			fn find<'a>(side: &'a [Measure], name: &str, unit: &str) -> Option<&'a Measure> {
+				side.iter().find(|m| m.name == name && m.unit == unit)
 			}
 			// A sampled measure, the median of its samples, is marked as one.
 			let cell = |found: Option<&Measure>| match found {
@@ -322,7 +475,11 @@ pub fn details(before: Option<&BTreeMap<String, Vec<Measure>>>, after: &BTreeMap
 			};
 			match base {
 				Some(base) => {
-					let change = match (find(base, measure), find(head, measure)) {
+					let change = match (find(base, measure, unit), find(head, measure, unit)) {
+						// A paired rate's change is the one its pairing gives.
+						(Some(_), Some(_)) if measure == "throughput" && paired.contains_key(name) => {
+							format!("{:+.2}%", paired[name] * 100.0)
+						}
 						(Some(b), Some(a)) => {
 							let change = if b.value != 0.0 {
 								format!("{:+.2}%", (a.value - b.value) / b.value * 100.0)
@@ -350,18 +507,22 @@ pub fn details(before: Option<&BTreeMap<String, Vec<Measure>>>, after: &BTreeMap
 					writeln!(
 						out,
 						"| {shown_name} | {measure} | {} | {} | {change} |",
-						cell(find(base, measure)),
-						cell(find(head, measure))
+						cell(find(base, measure, unit)),
+						cell(find(head, measure, unit))
 					)
 				}
 				None if before.is_some() => {
 					writeln!(
 						out,
 						"| {shown_name} | {measure} | - | {} | added |",
-						cell(find(head, measure))
+						cell(find(head, measure, unit))
 					)
 				}
-				None => writeln!(out, "| {shown_name} | {measure} | {} |", cell(find(head, measure))),
+				None => writeln!(
+					out,
+					"| {shown_name} | {measure} | {} |",
+					cell(find(head, measure, unit))
+				),
 			}
 			.expect("a String takes every write");
 		}
@@ -392,6 +553,7 @@ mod tests {
 				.iter()
 				.map(|(name, ir)| ((*name).to_owned(), details(*ir)))
 				.collect(),
+			throughput: Default::default(),
 		}
 	}
 
@@ -426,7 +588,7 @@ mod tests {
 		let mut counts = counts(&[("a", 10)]);
 		counts.details.get_mut("a").unwrap()[1].spread = Some((27.0, 33.0));
 		assert_eq!(
-			details(None, &counts.details),
+			details(None, &counts.details, &BTreeMap::new()),
 			"\n| benchmark | measure | value |\n|---|---|---:|\n| a | instructions | 10 |\n\
 			 | a | estimated cycles | ~30 (27 to 33) |\n| a | data reads | 1 |\n"
 		);
@@ -452,12 +614,23 @@ mod tests {
 		let base = BTreeMap::from([("a".to_owned(), side(100.0)), ("gone".to_owned(), side(1.0))]);
 		let head = BTreeMap::from([("a".to_owned(), side(150.0))]);
 		assert_eq!(
-			details(Some(&base), &head),
+			details(Some(&base), &head, &BTreeMap::new()),
 			"\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n\
 			 | a | cycles:u | 100 | 150 | +50.00% |\n| a | user time | 1.500 ns | 1.500 ns | +0.00% |\n\
 			 | gone | cycles:u | 1 | - | removed |\n| gone | user time | 1.500 ns | - | removed |\n"
 		);
-		assert_eq!(details(None, &BTreeMap::new()), "");
+		assert_eq!(details(None, &BTreeMap::new(), &BTreeMap::new()), "");
+		// A rate in bytes on one side and items on the other takes a row each, with no change; a
+		// paired rate's change is the one its pairing gives.
+		let rate = |unit| vec![Measure::new("throughput", 10.0, unit)];
+		let base = BTreeMap::from([("a".to_owned(), rate("items/s")), ("b".to_owned(), rate("bytes/s"))]);
+		let head = BTreeMap::from([("a".to_owned(), rate("bytes/s")), ("b".to_owned(), rate("bytes/s"))]);
+		assert_eq!(
+			details(Some(&base), &head, &BTreeMap::from([("b".to_owned(), 0.25)])),
+			"\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n\
+			 | a | throughput | - | 10.00 B/s | added |\n| a | throughput | 10.00 items/s | - | removed |\n\
+			 | b | throughput | 10.00 B/s | 10.00 B/s | +25.00% |\n"
+		);
 
 		// A sampled measure's change compares against both sides' spreads, and with one side's
 		// alone, has no verdict.
@@ -466,7 +639,13 @@ mod tests {
 			measure.spread = spread;
 			BTreeMap::from([("a".to_owned(), vec![measure])])
 		};
-		let change = |base, head| details(Some(&base), &head).lines().last().unwrap().to_owned();
+		let change = |base, head| {
+			details(Some(&base), &head, &BTreeMap::new())
+				.lines()
+				.last()
+				.unwrap()
+				.to_owned()
+		};
 		assert_eq!(
 			change(sampled(10.0, Some((8.0, 12.0))), sampled(11.0, Some((11.0, 13.0)))),
 			"| a | alloc_count | ~10 allocations (8 allocations to 12 allocations) | ~11 allocations (11 allocations to \
@@ -478,6 +657,83 @@ mod tests {
 		);
 		assert!(change(sampled(10.0, None), sampled(20.0, Some((19.0, 21.0)))).ends_with("| ~+100.00% |"));
 		assert!(change(sampled(10.0, None), sampled(20.0, None)).ends_with("| +100.00% |"));
+	}
+
+	#[test]
+	fn derives_each_measured_count_per_byte_and_the_rate_from_native_time() {
+		let measures = [
+			Measure::new("time", 500.0, "ns"),
+			Measure::new("user time", 400.0, "ns"),
+			Measure::new("instructions:u", 4096.0, "events"),
+			Measure::new("IPC:u", 2.0, "instructions/cycle"),
+			Measure::new("max RSS", 1.0, "bytes"),
+		];
+		assert_eq!(
+			Throughput::Bytes(1024).measures(&measures),
+			[
+				Measure::new("throughput", 2048e6, "bytes/s"),
+				Measure::new("instructions:u/byte", 4.0, "events/byte"),
+			]
+		);
+		// sim's counts have no time, so no rate.
+		let counted = [
+			Measure::new("instructions", 300.0, "instructions"),
+			Measure::new("estimated cycles", 600.0, "cycles"),
+		];
+		assert_eq!(
+			Throughput::Items(3).measures(&counted),
+			[
+				Measure::new("instructions/item", 100.0, "instructions/item"),
+				Measure::new("estimated cycles/item", 200.0, "cycles/item"),
+			]
+		);
+		// A call's allocations derive as its counts do, each with its samples' spread; the most it
+		// held at once derives nothing.
+		let mut allocs = Measure::new("alloc_count", 8.0, "allocations");
+		allocs.spread = Some((4.0, 12.0));
+		let mut expected = Measure::new("alloc_count/item", 2.0, "allocations/item");
+		expected.spread = Some((1.0, 3.0));
+		assert_eq!(
+			Throughput::Items(4).measures(&[allocs, Measure::new("peak_live_bytes", 64.0, "bytes")]),
+			[expected]
+		);
+		let declared =
+			Throughput::declared("own\nswole throughput bytes 8 a[1 2]\nswole throughput bytes 8 a[1 2]\n").unwrap();
+		assert_eq!(declared, BTreeMap::from([("a[1 2]".to_owned(), Throughput::Bytes(8))]));
+		let two = Throughput::declared("swole throughput bytes 8 a\nswole throughput items 8 a\n");
+		assert!(two.unwrap_err().contains("two throughputs"));
+		for bad in ["bytes 0 a", "bits 8 a", "bytes -1 a", "bytes 8", "bytes 8 "] {
+			let err = Throughput::declared(&format!("swole throughput {bad}\n")).unwrap_err();
+			assert!(err.contains("which no harness prints"), "{bad}: {err}");
+		}
+		assert_eq!(Throughput::parse("bytes", "0"), None);
+		assert_eq!(Throughput::parse("items", "7"), Some(Throughput::Items(7)));
+		assert_eq!(shown(2048e6, "bytes/s"), "1.91 GiB/s");
+		assert_eq!(shown(12.0, "bytes/s"), "12.00 B/s");
+		assert_eq!(shown(1.5e6, "items/s"), "1.50 M items/s");
+		assert_eq!(shown(4.0, "events/byte"), "4 events/byte");
+		assert_eq!(shown(1.0 / 16384.0, "allocations/byte"), "6.10e-5 allocations/byte");
+		assert_eq!(shown(0.0, "allocations/byte"), "0 allocations/byte");
+	}
+
+	#[test]
+	fn reports_its_schema_version_and_each_derived_measure() {
+		let mut counts = counts(&[("a", 300), ("b", 10)]);
+		counts.throughput.insert("a".to_owned(), Throughput::Bytes(3));
+		let counter = Counter {
+			kind: crate::CounterKind::Valgrind,
+			fingerprint: counts.fingerprint.clone(),
+			host: String::new(),
+		};
+		let Report(report) = report(&counts, None, &counter, None);
+		assert_eq!(report["schema_version"], 1);
+		assert_eq!(
+			report["benchmarks"]["a"]["head"]["instructions/byte"],
+			json!({ "value": 100, "unit": "instructions/byte" })
+		);
+		assert!(report["benchmarks"]["b"]["head"].get("instructions/byte").is_none());
+		assert!(report["benchmarks"]["a"]["head"]["estimated cycles/byte"].is_object());
+		assert!(report["benchmarks"]["a"]["head"]["data reads/byte"].is_object());
 	}
 
 	#[test]
