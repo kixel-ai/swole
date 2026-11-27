@@ -389,9 +389,9 @@ fn count(
 		let text = crate::printed(&path)?;
 		let declared = metrics::Throughput::declared(&text).map_err(|err| format!("{}: {err}", job.label))?;
 		let declared = job.expect.as_ref().and_then(|name| declared.get(name).copied());
-		if declared.is_some() && declared != throughput {
+		if declared != throughput {
 			return Err(format!(
-				"{} declared another throughput counting than timing; its output is in {}",
+				"{} declared another throughput (or none) counting than timing; its output is in {}",
 				job.label,
 				dir.display()
 			));
