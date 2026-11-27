@@ -137,6 +137,21 @@ fn times_each_harness_benchmark() {
 		assert!(head["max RSS"]["value"].as_f64().unwrap() > 0.0, "{name}: {head}");
 		assert!(head["user time"].is_object(), "{name}: {head}");
 	}
+	assert_eq!(report["schema_version"], 1);
+	// A benchmark that declares what each call processes reports how many it processes a second,
+	// from its time.
+	for (name, unit, amount) in [("sized[2000]", "bytes/s", 2000.0), ("alone", "items/s", 1000.0)] {
+		let head = head(name);
+		assert_eq!(head["throughput"]["unit"], unit, "{name}: {head}");
+		let rate = head["throughput"]["value"].as_f64().unwrap();
+		let time = head["time"]["value"].as_f64().unwrap();
+		assert!((rate * time / (amount * 1e9) - 1.0).abs() < 1e-3, "{name}: {head}");
+	}
+	assert!(head("borrowed").get("throughput").is_none());
+	assert!(
+		table.contains("| crates/swole/benches/fixture.rs::sized[2000] | throughput | "),
+		"{table}"
+	);
 	let host: Vec<&str> = report["host"]
 		.as_array()
 		.unwrap()
@@ -165,6 +180,15 @@ fn times_each_harness_benchmark() {
 			"{unstable} {instructions}"
 		);
 		assert!(head("alone")["IPC:u"]["value"].as_f64().unwrap() > 0.0);
+		// And each counter per byte, cycles among them where the host counts them.
+		let sized = head("sized[2000]");
+		let per_byte = sized["instructions:u/byte"]["value"].as_f64().unwrap();
+		let instructions = sized["instructions:u"]["value"].as_f64().unwrap();
+		assert!((per_byte * 2000.0 / instructions - 1.0).abs() < 1e-3, "{sized}");
+		if let Some(cycles) = sized["cycles:u"]["value"].as_f64() {
+			let per_byte = sized["cycles:u/byte"]["value"].as_f64().unwrap();
+			assert!((per_byte * 2000.0 / cycles - 1.0).abs() < 1e-3, "{sized}");
+		}
 		// A drop to run after each call changes nothing counted: each count, of each side,
 		// starts and stops around every call alike.
 		let alone = head("alone")["instructions:u"]["value"].as_f64().unwrap();

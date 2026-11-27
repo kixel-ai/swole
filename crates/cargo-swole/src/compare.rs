@@ -84,7 +84,7 @@ pub fn compare(base: &str, options: &Options, mode: Mode) -> Result<(), String> 
 	threaded.threaded = before.threaded.union(&after.threaded).cloned().collect();
 	threaded.spread = before.spread.clone().into_iter().chain(after.spread.clone()).collect();
 	print!("{}", crate::threaded(&threaded));
-	print!("{}", metrics::details(Some(&before.details), &after.details));
+	print!("{}", metrics::details(Some(&before.shown()), &after.shown()));
 	if let Some(report) = &options.report {
 		metrics::report(&after, Some(&before), &counter, Some(&sha)).write(report)?;
 		eprintln!("swole: wrote {}", report.display());
@@ -793,6 +793,7 @@ mod tests {
 			spread: BTreeMap::new(),
 			threaded: BTreeSet::new(),
 			details: BTreeMap::new(),
+			throughput: BTreeMap::new(),
 		}
 	}
 

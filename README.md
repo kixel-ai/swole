@@ -417,18 +417,26 @@ base's as a sample naming its commit:
  "units":{"time (x86_64-1a2b3c4d5e6f)":"ns"}}
 ```
 
-`--report <file>` writes every measure of every benchmark, by side, as JSON: the mode, the
+`--report <file>` writes every measure of every benchmark, by side, as JSON: its
+`schema_version`, the mode, the
 fingerprint and its inputs, the base's commit when there is one, and for each benchmark, each
 side's measures by name, each a `value` and a `unit` (a call's share, for `bench`), whether
-another thread ran beside it, and for a paired `bench`, the change and its interval:
+another thread ran beside it, and for a paired `bench`, the change and its interval. A benchmark
+that declares its [throughput](crates/swole/README.md#throughput) has each count per byte or
+item beside it, such as `instructions:u/byte`, and under `bench` a `throughput` in `bytes/s` or
+`items/s`:
 
 ```json
-{"mode":"bench","fingerprint":"x86_64-1a2b3c4d5e6f","host":["arch: x86_64","..."],"base":"<the base's full commit ID>",
+{"schema_version":1,"mode":"bench","fingerprint":"x86_64-1a2b3c4d5e6f","host":["arch: x86_64","..."],"base":"<the base's full commit ID>",
  "benchmarks":{"benches/varint.rs::encode[300]":{
    "base":{"time":{"value":20.3,"unit":"ns"},"instructions:u":{"value":81.0,"unit":"events"},"user time":{"value":20.1,"unit":"ns"}},
    "head":{"time":{"value":19.2,"unit":"ns"},"instructions:u":{"value":77.0,"unit":"events"},"user time":{"value":19.0,"unit":"ns"}},
    "change":{"value":0.9458,"lower":0.9412,"upper":0.9501,"unit":"head/base"}}}}
 ```
+
+`schema_version` is 1, and moves only when a field it holds changes meaning or goes away: a
+reader that knows its version reads every field it knows the same way, and ignores one it does
+not, which a new measure or field may add without moving it.
 
 A benchmark's name is the one its hooks dump, which for CodSpeed's crates is the file
 relative to the repository, then its group, function, and parameter: the same name CodSpeed

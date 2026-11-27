@@ -1,7 +1,7 @@
 //! The benchmarks swole's tests count and time: a loop of known length alone, by argument, with
 //! an output to drop, in a module, in an order that changes, behind a setup and between steps
 //! whose own work must go uncounted, across a sleep, on another thread, which must count, and
-//! timing itself.
+//! timing itself, some declaring what each call processes.
 
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +18,8 @@ fn spin(n: u64) -> u64 {
 	sum
 }
 
-#[bench]
+/// A thousand spins, each an item.
+#[bench(items = 1000)]
 fn alone() -> u64 {
 	spin(1000)
 }
@@ -47,7 +48,8 @@ fn slept() -> u64 {
 }
 
 /// Its literals are `u64`s, as `sized` takes them, which the first would overflow as an `i32`.
-#[bench(args = [1000, 2000, 4_294_967_296_000 >> 30])]
+/// Each spin stands for a byte, so every case processes as fast as the others.
+#[bench(args = [1000, 2000, 4_294_967_296_000 >> 30], bytes = |n| n)]
 fn sized(n: u64) -> u64 {
 	spin(n)
 }

@@ -33,7 +33,7 @@ fn frames(size: usize) -> Vec<Frame> {
 	(0..100).map(|_| Frame::zeroed(size)).collect()
 }
 
-#[bench(args = [100, 16384], setup = frames)]
+#[bench(args = [100, 16384], setup = frames, bytes = |size| 100 * size)]
 fn write(frames: Vec<Frame>) {
 	for frame in frames {
 		sink(frame);
@@ -92,6 +92,18 @@ many times, in samples of as many calls as fill a millisecond. It takes one inpu
   moved in, each call gets one of its own, built just before it outside the clock, and drops
   it where the benchmark does, so only one is live at a time.
 
+## Throughput
+
+A benchmark may declare what each call processes, for swole to divide its measures by:
+`bytes = <expr>` or `items = <expr>`, one of them, once. Without args it is the count, any
+integer; with args, a function of the case's argument, such as a closure `|n| n` or a path,
+called with a clone of it as `setup` is, so each case scales by its own. A count that is zero,
+negative, or over a `u64` fails the run, since such a call processes nothing to divide by.
+swole then reports each count its mode measured per byte or item, such as `instructions/byte`
+under `sim` and each perf counter's under `quick` and `bench`, and under `bench`, which alone
+times natively, a `throughput` in `bytes/s` or `items/s`. A benchmark that declares neither
+reports as it would without.
+
 A borrowed input may take steps between calls that neither the count nor the clock sees:
 `before = <path>` names a function run on it before each call, and `after = <path>` one run
 after each, such as a step that undoes what the call did. Each takes the input as the benchmark
@@ -130,7 +142,8 @@ does.
 
 `swole::main()` runs every benchmark once, sorted by name, setting up each case
 and bracketing its call with Callgrind's client requests, then prints `swole ran <name>`
-after it, starting its records on a fresh line, as the benchmark's own output may not have ended one. Natively the requests are instructions that do nothing, so `cargo bench` and
+after it, starting its records on a fresh line, as the benchmark's own output may not have ended one,
+and before that `swole throughput <bytes|items> <n> <name>` for one that declares it. Natively the requests are instructions that do nothing, so `cargo bench` and
 `cargo test --benches` run each case once as a check. With `SWOLE_BENCH` set to a name, it
 runs that benchmark alone, which swole sets on each job. It takes no arguments but
 Cargo's own `--bench` and `--quiet`; swole's `--benchmarks` chooses benchmarks.

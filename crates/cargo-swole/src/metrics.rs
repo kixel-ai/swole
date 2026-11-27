@@ -15,6 +15,65 @@ const NAME_LIMIT: usize = 1024;
 /// The longest measure name Kixel Quest takes, in characters.
 const MEASURE_LIMIT: usize = 64;
 
+/// The version of `--report`'s JSON, which changes only when a field changes meaning or goes;
+/// a new field keeps it.
+const SCHEMA_VERSION: u64 = 1;
+
+/// What each call of a benchmark processes, as its `#[bench(bytes = ..)]` or `items` declares.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Throughput {
+	Bytes(u64),
+	Items(u64),
+}
+
+impl Throughput {
+	/// What the harness prints after `swole throughput `: `bytes` or `items`, then how many.
+	pub fn parse(unit: &str, amount: &str) -> Option<Self> {
+		let amount = amount.parse().ok().filter(|&n| n > 0)?;
+		match unit {
+			"bytes" => Some(Self::Bytes(amount)),
+			"items" => Some(Self::Items(amount)),
+			_ => None,
+		}
+	}
+
+	/// How many bytes or items each call processes.
+	fn amount(self) -> f64 {
+		match self {
+			Self::Bytes(n) | Self::Items(n) => n as f64,
+		}
+	}
+
+	/// What derives from a call's `measures`: each count's share of a byte or an item, and from
+	/// its native wall-clock `time`, how many it processes a second. A count or time the run did
+	/// not measure derives nothing.
+	pub fn measures(self, measures: &[Measure]) -> Vec<Measure> {
+		let bytes = matches!(self, Self::Bytes(_));
+		let mut out = Vec::new();
+		for measure in measures {
+			let per = match (measure.unit, bytes) {
+				("instructions", true) => "instructions/byte",
+				("instructions", false) => "instructions/item",
+				("cycles", true) => "cycles/byte",
+				("cycles", false) => "cycles/item",
+				("events", true) => "events/byte",
+				("events", false) => "events/item",
+				("ns", _) if measure.name == "time" => {
+					if measure.value > 0.0 {
+						let rate = if bytes { "bytes/s" } else { "items/s" };
+						out.push(Measure::new("throughput", self.amount() * 1e9 / measure.value, rate));
+					}
+					continue;
+				}
+				_ => continue,
+			};
+			let name = format!("{}/{}", measure.name, if bytes { "byte" } else { "item" });
+			out.push(Measure::new(&name, measure.value / self.amount(), per));
+		}
+		out
+	}
+}
+
 /// A `metrics.json`: one measure, in one unit, of each sample's benchmarks.
 pub struct File {
 	pub measure: String,
@@ -141,6 +200,7 @@ impl Report {
 		benchmarks: BTreeMap<String, Map<String, Value>>,
 	) -> Self {
 		let mut report = json!({
+			"schema_version": SCHEMA_VERSION,
 			"mode": mode.name(),
 			"fingerprint": fingerprint,
 			"host": host.lines().collect::<Vec<_>>(),
@@ -173,15 +233,8 @@ pub fn side(measures: &[Measure]) -> Value {
 /// The report of a count, quick's or sim's, of the working tree, against `base`'s counts, from the
 /// commit `sha`, when given.
 pub fn report(counts: &Counts, base: Option<&Counts>, counter: &Counter, sha: Option<&str>) -> Report {
-	let headline = |counts: &Counts, name: &str| -> Option<Vec<Measure>> {
-		let count = *counts.counts.get(name)?;
-		Some(match counts.details.get(name) {
-			Some(details) => details.clone(),
-			None => vec![Measure::new("instructions", count as f64, "instructions")],
-		})
-	};
 	let point = |counts: &Counts, name: &str| -> Option<Value> {
-		let mut side = side(&headline(counts, name)?);
+		let mut side = side(&counts.measures(name)?);
 		if let Some(&(least, most)) = counts.spread.get(name) {
 			side["instructions"]["lower"] = least.into();
 			side["instructions"]["upper"] = most.into();
@@ -250,8 +303,24 @@ pub fn shown(value: f64, unit: &str) -> String {
 	};
 	match unit {
 		"events" | "instructions" | "instructions/cycle" => number,
+		"bytes/s" => rate(value, 1024.0, &["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"]),
+		"items/s" => rate(
+			value,
+			1000.0,
+			&["items/s", "K items/s", "M items/s", "G items/s", "T items/s"],
+		),
 		unit => format!("{number} {unit}"),
 	}
+}
+
+/// A rate `value` in the largest of `units`, each `step` times the last, it reaches.
+fn rate(mut value: f64, step: f64, units: &[&str]) -> String {
+	let mut unit = 0;
+	while value >= step && unit + 1 < units.len() {
+		value /= step;
+		unit += 1;
+	}
+	format!("{value:.2} {}", units[unit])
 }
 
 /// Every measure of each benchmark beyond its headline, a row each, as a Markdown table: with
@@ -321,6 +390,7 @@ mod tests {
 			spread: Default::default(),
 			threaded: Default::default(),
 			details: Default::default(),
+			throughput: Default::default(),
 		}
 	}
 
@@ -358,6 +428,65 @@ mod tests {
 			 | gone | cycles:u | 1 | - | removed |\n| gone | user time | 1.500 ns | - | removed |\n"
 		);
 		assert_eq!(details(None, &BTreeMap::new()), "");
+	}
+
+	#[test]
+	fn derives_each_measured_count_per_byte_and_the_rate_from_native_time() {
+		let measures = [
+			Measure::new("time", 500.0, "ns"),
+			Measure::new("user time", 400.0, "ns"),
+			Measure::new("instructions:u", 4096.0, "events"),
+			Measure::new("IPC:u", 2.0, "instructions/cycle"),
+			Measure::new("max RSS", 1.0, "bytes"),
+		];
+		assert_eq!(
+			Throughput::Bytes(1024).measures(&measures),
+			[
+				Measure::new("throughput", 2048e6, "bytes/s"),
+				Measure::new("instructions:u/byte", 4.0, "events/byte"),
+			]
+		);
+		// sim's counts have no time, so no rate.
+		let counted = [
+			Measure::new("instructions", 300.0, "instructions"),
+			Measure::new("estimated cycles", 600.0, "cycles"),
+		];
+		assert_eq!(
+			Throughput::Items(3).measures(&counted),
+			[
+				Measure::new("instructions/item", 100.0, "instructions/item"),
+				Measure::new("estimated cycles/item", 200.0, "cycles/item"),
+			]
+		);
+		assert_eq!(Throughput::parse("bytes", "0"), None);
+		assert_eq!(Throughput::parse("items", "7"), Some(Throughput::Items(7)));
+		assert_eq!(shown(2048e6, "bytes/s"), "1.91 GiB/s");
+		assert_eq!(shown(12.0, "bytes/s"), "12.00 B/s");
+		assert_eq!(shown(1.5e6, "items/s"), "1.50 M items/s");
+		assert_eq!(shown(4.0, "events/byte"), "4 events/byte");
+	}
+
+	#[test]
+	fn reports_its_schema_version_and_each_derived_measure() {
+		let mut counts = counts(&[("a", 300), ("b", 10)]);
+		counts.throughput.insert("a".to_owned(), Throughput::Bytes(3));
+		let counter = Counter {
+			kind: crate::CounterKind::Valgrind,
+			fingerprint: counts.fingerprint.clone(),
+			host: String::new(),
+		};
+		let Report(report) = report(&counts, None, &counter, None);
+		assert_eq!(report["schema_version"], 1);
+		assert_eq!(
+			report["benchmarks"]["a"]["head"]["instructions/byte"],
+			json!({ "value": 100, "unit": "instructions/byte" })
+		);
+		assert!(report["benchmarks"]["b"]["head"].get("instructions/byte").is_none());
+		assert_eq!(
+			counts.shown().keys().collect::<Vec<_>>(),
+			["a"],
+			"only a benchmark with details or a throughput has a row below the counts"
+		);
 	}
 
 	#[test]

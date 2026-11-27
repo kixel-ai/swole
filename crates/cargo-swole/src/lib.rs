@@ -135,7 +135,7 @@ fn cli(args: &[String]) -> Result<(), String> {
 				}
 				print!("{}", metrics::table(&counts));
 				print!("{}", threaded(&counts));
-				print!("{}", metrics::details(None, &counts.details));
+				print!("{}", metrics::details(None, &counts.shown()));
 				if let Some(out) = &options.out {
 					metrics::File::counts(&counts, counter.measure(&counts.fingerprint)).write(out)?;
 					eprintln!("swole: wrote {}", out.display());
@@ -297,6 +297,8 @@ pub(crate) struct Job {
 	expect: Option<String>,
 	/// Whether it runs a benchmark of CodSpeed's crates, which only Valgrind counts.
 	codspeed: bool,
+	/// What each call of its benchmark processes, when the benchmark declares it.
+	throughput: Option<metrics::Throughput>,
 }
 
 impl Job {
@@ -348,6 +350,8 @@ pub(crate) struct Counts {
 	pub threaded: BTreeSet<String>,
 	/// Every measure of each benchmark, the headline's among them, when a count takes more.
 	pub details: BTreeMap<String, Vec<Measure>>,
+	/// What each call processes, of each benchmark that declares it.
+	pub throughput: BTreeMap<String, metrics::Throughput>,
 }
 
 impl Counts {
@@ -360,7 +364,32 @@ impl Counts {
 			spread: BTreeMap::new(),
 			threaded: BTreeSet::new(),
 			details: BTreeMap::new(),
+			throughput: BTreeMap::new(),
 		}
+	}
+
+	/// Every measure of the benchmark `name`, when counted: its details, or its headline count
+	/// alone, then what derives from them and what each call processes.
+	pub(crate) fn measures(&self, name: &str) -> Option<Vec<Measure>> {
+		let count = *self.counts.get(name)?;
+		let mut measures = match self.details.get(name) {
+			Some(details) => details.clone(),
+			None => vec![Measure::new("instructions", count as f64, "instructions")],
+		};
+		if let Some(throughput) = self.throughput.get(name) {
+			measures.extend(throughput.measures(&measures));
+		}
+		Some(measures)
+	}
+
+	/// Every measure of each benchmark a table shows below the headline counts: of each with
+	/// details or a throughput.
+	pub(crate) fn shown(&self) -> BTreeMap<String, Vec<Measure>> {
+		self.counts
+			.keys()
+			.filter(|name| self.details.contains_key(*name) || self.throughput.contains_key(*name))
+			.filter_map(|name| Some((name.clone(), self.measures(name)?)))
+			.collect()
 	}
 }
 
@@ -579,6 +608,7 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 				command: shell(program, dir),
 				expect: None,
 				codspeed: false,
+				throughput: None,
 			})
 			.collect()
 	};
@@ -606,6 +636,10 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 	let all: Vec<&Job> = jobs.iter().collect();
 	let first = run(&all, &work.join("1"), &preload, parallel, counter)?;
 	let mut counts = Counts::none(counter);
+	counts.throughput = jobs
+		.iter()
+		.filter_map(|job| Some((job.expect.clone()?, job.throughput?)))
+		.collect();
 	if let CounterKind::Perf { native, .. } = &counter.kind
 		&& let Some(bench_libc) = fingerprint::require_single_libc(
 			first
@@ -701,6 +735,7 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 		counts.spread.retain(|name, _| wanted.contains(name));
 		counts.threaded.retain(|name| wanted.contains(name));
 		counts.details.retain(|name, _| wanted.contains(name));
+		counts.throughput.retain(|name, _| wanted.contains(name));
 	}
 	if strict && counts.counts.is_empty() {
 		return Err("no benchmark ran".to_owned());

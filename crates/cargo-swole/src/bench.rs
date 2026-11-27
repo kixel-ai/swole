@@ -241,6 +241,12 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 			if let Some((used, calls)) = &used[i] {
 				measures.extend(used.measures(*calls * iterations));
 			}
+			// What derives from the side's time and counts, per what each of its calls processes.
+			if let (Some(throughput), Some(time)) = (job.throughput, [timed.base(), timed.head()][i]) {
+				let mut all = vec![Measure::new("time", time, UNIT)];
+				all.extend(measures.iter().cloned());
+				measures.extend(throughput.measures(&all));
+			}
 			if !measures.is_empty() {
 				details[i].insert(name.clone(), measures);
 			}
@@ -1005,6 +1011,7 @@ mod tests {
 			command,
 			expect: None,
 			codspeed: false,
+			throughput: None,
 		};
 		let mut process = Process::spawn(&job, None, None, &dir).unwrap();
 		assert_eq!(process.sample(7).unwrap().nanos, 7);

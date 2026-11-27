@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 
 /// Marks a function as a benchmark: `#[bench]`, `#[bench(args = [..])]`, `#[bench(setup = f)]`,
-/// with `before = g` or `after = h` steps on setup's output. See the README for what each
-/// passes the function.
+/// with `before = g` or `after = h` steps on setup's output, and `bytes = n` or `items = n` for
+/// what each call processes. See the README for what each passes the function.
 pub use swole_macros::bench;
 
 /// The variable naming the one benchmark a run counts or times, which swole sets on each job.
@@ -20,6 +20,10 @@ const TIME: &str = "SWOLE_TIME";
 
 /// What a run prints after each benchmark, before its name, which swole lists them by.
 const RAN: &str = "swole ran ";
+
+/// What a run prints before `swole ran` for a benchmark that declares what each call processes,
+/// before `bytes` or `items`, how many, and its name.
+const THROUGHPUT: &str = "swole throughput ";
 
 /// What a timed run prints, alone on a line, before each sample's nanoseconds.
 const SAMPLE: &str = "swole sample ";
@@ -206,6 +210,10 @@ fn run() -> Result<(), String> {
 			record(format_args!("{COUNTED}{} {name}", values.join(" ")))?;
 		}
 		if !quiet {
+			// `cases` refused any amount but a positive one.
+			if let Some(__private::Throughput { unit, amount: Some(n) }) = &case.throughput {
+				record(format_args!("{THROUGHPUT}{unit} {n} {name}"))?;
+			}
 			record(format_args!("{RAN}{name}"))?;
 		}
 	}
@@ -380,6 +388,15 @@ fn cases<'a>(
 			if cases.contains_key(&name) {
 				return Err(format!("two benchmarks are named {name}"));
 			}
+			// A call that processes nothing has no rate, and its measures none to divide by.
+			if let Some(throughput) = &case.throughput
+				&& !throughput.amount.is_some_and(|n| n > 0)
+			{
+				return Err(format!(
+					"{name}: its {} is not a positive count, which each call must process",
+					throughput.unit
+				));
+			}
 			cases.insert(name, case);
 		}
 	}
@@ -421,7 +438,33 @@ pub mod __private {
 	pub struct Case {
 		/// Its argument, shown, when the benchmark declares args.
 		pub(crate) arg: Option<String>,
+		/// What each call processes, when the benchmark declares it.
+		pub(crate) throughput: Option<Throughput>,
 		pub(crate) build: Build,
+	}
+
+	/// What each call of a case processes: `bytes` or `items`, and how many, which swole divides
+	/// its measures by.
+	pub struct Throughput {
+		pub(crate) unit: &'static str,
+		/// How many, or `None` for a number no `u64` holds, such as a negative one.
+		pub(crate) amount: Option<u64>,
+	}
+
+	/// Each call processes `n` bytes.
+	pub fn bytes<N: TryInto<u64>>(n: N) -> Throughput {
+		Throughput {
+			unit: "bytes",
+			amount: n.try_into().ok(),
+		}
+	}
+
+	/// Each call processes `n` items.
+	pub fn items<N: TryInto<u64>>(n: N) -> Throughput {
+		Throughput {
+			unit: "items",
+			amount: n.try_into().ok(),
+		}
 	}
 
 	inventory::collect!(Bench);
@@ -966,24 +1009,32 @@ pub mod __private {
 		}
 	}
 
-	/// The one case of a benchmark without args, which `build` sets up.
-	pub fn single(build: impl FnOnce() -> Box<dyn Sampler> + 'static) -> Vec<Case> {
+	/// The one case of a benchmark without args, which `build` sets up, each call processing
+	/// `throughput`.
+	pub fn single(throughput: Option<Throughput>, build: impl FnOnce() -> Box<dyn Sampler> + 'static) -> Vec<Case> {
 		vec![Case {
 			arg: None,
+			throughput,
 			build: Box::new(build),
 		}]
 	}
 
 	/// A case per argument among `args`, shown, each moving its argument into the setup `make`
-	/// builds from it. `make`'s body gives the argument the type it runs with.
+	/// builds from it, beside what each of its calls processes. `make`'s body gives the argument
+	/// the type it runs with.
 	pub fn each<A: Display, B: FnOnce() -> Box<dyn Sampler> + 'static>(
 		args: impl IntoIterator<Item = A>,
-		make: impl Fn(A) -> B,
+		make: impl Fn(A) -> (Option<Throughput>, B),
 	) -> Vec<Case> {
 		args.into_iter()
-			.map(|arg| Case {
-				arg: Some(arg.to_string()),
-				build: Box::new(make(arg)),
+			.map(|arg| {
+				let shown = arg.to_string();
+				let (throughput, build) = make(arg);
+				Case {
+					arg: Some(shown),
+					throughput,
+					build: Box::new(build),
+				}
 			})
 			.collect()
 	}
@@ -1051,7 +1102,7 @@ mod tests {
 			file: "benches/a.rs",
 			module,
 			name,
-			cases: || single(nothing),
+			cases: || single(None, nothing),
 		}
 	}
 
@@ -1064,7 +1115,7 @@ mod tests {
 				file: "benches/a.rs",
 				module: "a",
 				name: "sized",
-				cases: || each(["16", "1024"], |_| nothing),
+				cases: || each(["16", "1024"], |_| (None, nothing)),
 			},
 		];
 		let cases = cases(&benches).unwrap();
@@ -1086,7 +1137,7 @@ mod tests {
 			file: "benches/a.rs",
 			module: "a",
 			name: "f",
-			cases: || each([1, 1], |_| nothing),
+			cases: || each([1, 1], |_| (None, nothing)),
 		}];
 		assert_eq!(
 			cases(&twice).err().unwrap(),
@@ -1096,16 +1147,27 @@ mod tests {
 			file: "benches/a.rs",
 			module: "a",
 			name: "f",
-			cases: || each(["a\nb"], |_| nothing),
+			cases: || each(["a\nb"], |_| (None, nothing)),
 		}];
 		assert!(cases(&lines).err().unwrap().contains("control character"));
 		let empty = [Bench {
 			file: "benches/a.rs",
 			module: "a",
 			name: "f",
-			cases: || each(Vec::<u8>::new(), |_| nothing),
+			cases: || each(Vec::<u8>::new(), |_| (None, nothing)),
 		}];
 		assert_eq!(cases(&empty).err().unwrap(), "benches/a.rs::f has no args");
+		// A count each call processes must be positive and fit a u64.
+		let nothing_processed = [Bench {
+			file: "benches/a.rs",
+			module: "a",
+			name: "f",
+			cases: || each([0, -1, 2], |n| (Some(__private::bytes(n)), nothing)),
+		}];
+		assert_eq!(
+			cases(&nothing_processed).err().unwrap(),
+			"benches/a.rs::f[0]: its bytes is not a positive count, which each call must process"
+		);
 		assert_eq!(cases(&[]).err().unwrap(), "no function is marked #[bench]");
 	}
 
