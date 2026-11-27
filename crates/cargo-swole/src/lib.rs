@@ -866,22 +866,27 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 
 /// Each measure of a benchmark's `samples`, the median of its values, with their least and most
 /// when it took more than one, so a measure the scheduler moves reads as its spread, not one draw.
+/// A ratio of counters a sample may leave undefined, as a top-down split when neither of its pair
+/// counted, is kept only when every sample defines it; any other measure every sample must have.
 pub(crate) fn median(samples: &[Vec<Measure>]) -> Result<Vec<Measure>, String> {
-	let Some((first, rest)) = samples.split_first() else {
-		return Ok(Vec::new());
-	};
+	let mut names: Vec<(&str, &'static str)> = Vec::new();
+	for measure in samples.iter().flatten() {
+		if !names.iter().any(|(name, _)| *name == measure.name) {
+			names.push((&measure.name, measure.unit));
+		}
+	}
 	let mut measures = Vec::new();
-	for measure in first {
-		let mut values = vec![measure.value];
-		for details in rest {
-			let other = details
-				.iter()
-				.find(|other| other.name == measure.name)
-				.ok_or_else(|| format!("a sample lacks its {}", measure.name))?;
-			values.push(other.value);
+	'measure: for (name, unit) in names {
+		let mut values = Vec::with_capacity(samples.len());
+		for details in samples {
+			match details.iter().find(|other| other.name == name) {
+				Some(other) => values.push(other.value),
+				None if perf::derived(name) => continue 'measure,
+				None => return Err(format!("a sample lacks its {name}")),
+			}
 		}
 		values.sort_by(f64::total_cmp);
-		let mut median = Measure::new(&measure.name, values[values.len() / 2], measure.unit);
+		let mut median = Measure::new(name, values[values.len() / 2], unit);
 		if values.len() > 1 {
 			median.spread = Some((values[0], values[values.len() - 1]));
 		}
@@ -1403,6 +1408,31 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_ratio_some_sample_leaves_undefined_drops_but_a_counter_fails() {
+		let split = |value| Measure::new("topdown branch mispredicts", value, "%");
+		let counter = |value| Measure::new("cycles:u", value, "events");
+		// Whichever round counted no mispredict or restart, the split goes and the counter stays.
+		for samples in [
+			vec![
+				vec![counter(1.0)],
+				vec![counter(2.0), split(5.0)],
+				vec![counter(3.0), split(6.0)],
+			],
+			vec![
+				vec![counter(1.0), split(5.0)],
+				vec![counter(2.0)],
+				vec![counter(3.0), split(6.0)],
+			],
+		] {
+			let measures = median(&samples).unwrap();
+			assert_eq!(measures.len(), 1);
+			assert_eq!(measures[0].name, "cycles:u");
+			assert_eq!(measures[0].spread, Some((1.0, 3.0)));
+		}
+		assert!(median(&[vec![counter(1.0), split(5.0)], vec![split(6.0)]]).is_err());
+	}
 
 	#[test]
 	fn a_list_holds_one_name_a_line() {

@@ -507,8 +507,12 @@ pub const RETIRED: &str = "ex_ret_ops:u";
 /// The slots the SMT sibling took, the first level's last event, which a PMU a counter short
 /// leaves out.
 pub const SMT: &str = "de_no_dispatch_per_slot.smt_contention:u";
-/// AMD's events of its breakdown's second level, a pair each: cycles and those no op came from the
-/// frontend at all, mispredicted branches and resyncs, and stalls on loads and on anything.
+/// AMD's events of its breakdown's second level, a pair each: ops retired from microcode and all
+/// of them, cycles and those no op came from the frontend at all, mispredicted branches and
+/// resyncs, and stalls on loads and on anything.
+pub const MICROCODE: &str = "ex_ret_ucode_ops:u";
+/// `ex_ret_ops` again, counted beside the microcode's ops rather than the first level.
+pub const RETIRED_BESIDE: &str = "ex_ret_ops,microcode:u";
 pub const CYCLES: &str = "ls_not_halted_cyc:u";
 pub const FRONTEND_IDLE: &str = "de_no_dispatch_per_slot.no_ops_from_frontend,cmask:u";
 pub const MISPREDICTS: &str = "ex_ret_brn_misp:u";
@@ -572,6 +576,10 @@ fn topdown(pmu: &Pmu) -> Result<Option<Topdown>, String> {
 			event(SMT, "event=0x1a0,umask=0x60", 1)?,
 		];
 		let second = [
+			vec![
+				event(MICROCODE, "event=0x1c1", 1)?,
+				event(RETIRED_BESIDE, "event=0xc1", 1)?,
+			],
 			vec![
 				event(CYCLES, "event=0x76", 1)?,
 				event(FRONTEND_IDLE, &format!("event=0x1a0,umask=0x01,cmask={width}"), 1)?,
@@ -1076,6 +1084,14 @@ pub fn measures(passes: &[Pass], values: &[(Vec<u64>, u64)]) -> Vec<crate::Measu
 	out
 }
 
+/// Whether `name` is a ratio `measures` derives, which a count leaves out where its denominator
+/// counted nothing, unlike a counter, which every count of a pass reads.
+pub fn derived(name: &str) -> bool {
+	["IPC:", "cycles/ref-cycles:", "topdown "]
+		.iter()
+		.any(|prefix| name.starts_with(prefix))
+}
+
 /// Counters by group, which find the values of events counted together.
 struct Together<'a>(&'a [Vec<(&'a str, f64)>]);
 
@@ -1167,6 +1183,11 @@ fn breakdown(together: &Together) -> Vec<crate::Measure> {
 		first([r, b, f, e], &mut out);
 		if let Some([slots, smt]) = together.find([SLOTS, SMT]) {
 			out.push(percent("topdown SMT contention", smt / slots));
+		}
+		if let Some([microcode, retired]) = together.find([MICROCODE, RETIRED_BESIDE])
+			&& retired > 0.0
+		{
+			split(&mut out, LEVEL_TWO[0], r, r * microcode / retired);
 		}
 		// Cycles no op came from the frontend at all, every slot of each, are its latency.
 		if let Some([cycles, idle]) = together.find([CYCLES, FRONTEND_IDLE])
@@ -1796,6 +1817,7 @@ mod tests {
 		};
 		let second = Pass {
 			groups: vec![
+				vec![own(MICROCODE, 1), own(RETIRED_BESIDE, 1)],
 				vec![own(CYCLES, 1), own(FRONTEND_IDLE, 1)],
 				vec![own(MISPREDICTS, 1), own(RESYNCS, 1)],
 				vec![own(LOAD_STALLS, 1), own(STALLS, 1)],
@@ -1805,7 +1827,10 @@ mod tests {
 		assert_eq!(
 			percentages(
 				&[first, second],
-				&[(vec![100, 240, 160, 400, 320, 80], 2), (vec![100, 10, 3, 1, 30, 40], 2)]
+				&[
+					(vec![100, 240, 160, 400, 320, 80], 2),
+					(vec![1, 4, 100, 10, 3, 1, 30, 40], 2)
+				]
 			),
 			named(&[
 				("topdown retiring", 40.0),
@@ -1813,6 +1838,8 @@ mod tests {
 				("topdown frontend bound", 30.0),
 				("topdown backend bound", 20.0),
 				("topdown SMT contention", 10.0),
+				("topdown heavy operations", 10.0),
+				("topdown light operations", 30.0),
 				("topdown fetch latency", 10.0),
 				("topdown fetch bandwidth", 20.0),
 				("topdown branch mispredicts", 7.5),

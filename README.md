@@ -577,11 +577,12 @@ compare's, a headline count, or `sim`'s estimated cycles, grown past its spread,
 first two of these its measures show, each citing the measure on both sides: `throttled`
 (`cycles/ref-cycles:u` fell 2%, or the estimated clock 5%), `off-CPU` (`CPUs busy` lost 0.1 and
 ended under 0.9), `more instructions` (1% more), `memory-bound` (the last-level, L1 data, or data
-TLB MPKI grew by a quarter and 0.1, or the breakdown's memory or backend bound gained 3 points),
-`branch mispredicts`, `frontend-bound`, `kernel` (its share gained 5 points), and for a time that
+TLB MPKI grew by a quarter and 0.1, or the breakdown's memory bound gained 3 points), else
+`backend-bound` (its backend bound did), `branch mispredicts` (its miss rate, MPKI, or share),
+else `bad speculation`, `frontend-bound`, `kernel` (its share gained 5 points), and for a time that
 moved 1 to 3% with its instructions, branches, and MPKI the same, the frontend bound no lower,
 `likely code alignment`: the same code at other addresses, as an unrelated change can shift it.
-A sampled measure counts only past its spread.
+A sampled measure counts only past its spread, a side counted once past its one value.
 
 ## Output
 

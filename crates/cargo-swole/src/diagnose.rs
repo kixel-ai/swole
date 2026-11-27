@@ -211,11 +211,10 @@ struct Moved {
 }
 
 impl Moved {
-	/// Whether the head is past the base, when both are sampled, rather than within their spreads.
+	/// Whether the head is past the base rather than within their spreads, an unsampled side's
+	/// spread its one value.
 	fn beyond(&self) -> bool {
-		!(self.base.sampled && self.head.sampled)
-			|| self.head.least > self.base.most
-			|| self.head.most < self.base.least
+		self.head.least > self.base.most || self.head.most < self.base.least
 	}
 
 	fn delta(&self) -> f64 {
@@ -315,28 +314,30 @@ pub fn cause(base: &[Measure], head: &[Measure], timed: Option<f64>) -> Option<S
 		);
 	}
 	// Misses first, which say where the time went, then the breakdown's share, which says only how
-	// much of it.
-	add(
-		"memory-bound",
-		sides
-			.grew(
-				&["LLC MPKI:u", "LL MPKI", "L1d MPKI:u", "L1d MPKI", "dTLB MPKI:u"],
-				moved::MPKI,
-			)
-			.or_else(|| sides.gained(&["topdown memory bound", "topdown backend bound"], moved::TOPDOWN)),
-	);
-	add(
-		"branch mispredicts",
-		sides
-			.gained(&["branch miss rate:u", "branch miss rate"], moved::MISS_RATE)
-			.or_else(|| sides.grew(&["branch MPKI:u", "branch MPKI"], moved::MPKI))
-			.or_else(|| {
-				sides.gained(
-					&["topdown branch mispredicts", "topdown bad speculation"],
-					moved::TOPDOWN,
-				)
-			}),
-	);
+	// much of it. A parent share names only its broad category: backend bound rises with core-bound
+	// arithmetic too, and bad speculation with machine clears.
+	let memory = sides
+		.grew(
+			&["LLC MPKI:u", "LL MPKI", "L1d MPKI:u", "L1d MPKI", "dTLB MPKI:u"],
+			moved::MPKI,
+		)
+		.or_else(|| sides.gained(&["topdown memory bound"], moved::TOPDOWN));
+	let backend = memory
+		.is_none()
+		.then(|| sides.gained(&["topdown backend bound"], moved::TOPDOWN))
+		.flatten();
+	add("memory-bound", memory);
+	add("backend-bound", backend);
+	let mispredicts = sides
+		.gained(&["branch miss rate:u", "branch miss rate"], moved::MISS_RATE)
+		.or_else(|| sides.grew(&["branch MPKI:u", "branch MPKI"], moved::MPKI))
+		.or_else(|| sides.gained(&["topdown branch mispredicts"], moved::TOPDOWN));
+	let speculation = mispredicts
+		.is_none()
+		.then(|| sides.gained(&["topdown bad speculation"], moved::TOPDOWN))
+		.flatten();
+	add("branch mispredicts", mispredicts);
+	add("bad speculation", speculation);
 	add(
 		"frontend-bound",
 		sides
@@ -583,5 +584,34 @@ mod tests {
 		assert_eq!(cause(&base, &within, Some(0.1)), None);
 		assert!(cause(&base, &beyond, Some(0.1)).unwrap().starts_with("memory-bound"));
 		assert!(cause(&base, &beyond, None).unwrap().starts_with("memory-bound"));
+		// A side counted once, as before a benchmark gained a thread, is its one value.
+		let once = vec![Measure::new("LLC MPKI:u", 1.0, "MPKI")];
+		let wide = vec![sampled("LLC MPKI:u", 2.0, (0.8, 3.0), "MPKI")];
+		assert_eq!(cause(&once, &wide, None), None);
+		assert!(cause(&once, &beyond, None).unwrap().starts_with("memory-bound"));
+	}
+
+	#[test]
+	fn a_parent_share_names_only_its_broad_category() {
+		let side = |backend, memory, bad, mispredicts| {
+			vec![
+				Measure::new("topdown backend bound", backend, "%"),
+				Measure::new("topdown memory bound", memory, "%"),
+				Measure::new("topdown bad speculation", bad, "%"),
+				Measure::new("topdown branch mispredicts", mispredicts, "%"),
+			]
+		};
+		let base = side(30.0, 20.0, 5.0, 4.0);
+		// Core-bound arithmetic and machine clears, the children that would be specific held.
+		assert_eq!(
+			cause(&base, &side(40.0, 20.0, 10.0, 4.0), None).unwrap(),
+			"backend-bound (topdown backend bound 30.00% → 40.00%); \
+			 bad speculation (topdown bad speculation 5.00% → 10.00%)"
+		);
+		assert_eq!(
+			cause(&base, &side(40.0, 30.0, 10.0, 9.0), None).unwrap(),
+			"memory-bound (topdown memory bound 20.00% → 30.00%); \
+			 branch mispredicts (topdown branch mispredicts 4.00% → 9.00%)"
+		);
 	}
 }
