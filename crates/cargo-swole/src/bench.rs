@@ -182,185 +182,206 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	let total = names.len();
 	for (index, name) in names.into_iter().enumerate() {
 		let started = Instant::now();
-		let dir = work.join(index.to_string());
 		let base = before.as_mut().and_then(|jobs| jobs.remove(&name));
 		let head = after.remove(&name);
-		// The other cores a threaded benchmark spreads over, leased until it is timed and counted.
-		let spreading;
-		let (timed, iterations, used, timed_threaded, declared, own, cpus, inherits) = match (&base, &head) {
-			(Some(base), Some(head)) => {
-				let spawn = |cpus: Option<&[usize]>| -> Result<(Process, Process), String> {
-					Ok((
-						Process::spawn(base, cpus, preload.as_deref(), &dir.join("base"))?,
-						Process::spawn(head, cpus, preload.as_deref(), &dir.join("head"))?,
-					))
-				};
-				let mut cpus = exclusive.clone();
-				let (mut base, mut head) = spawn(cpus.as_deref())?;
-				spreading = spread(reservation.as_ref(), &name, base.threaded || head.threaded)?;
-				if let Some(spread) = &spreading {
+		// Whether another thread first ran after the first call, which picks the CPUs, so both
+		// sides time and count again over the wider ones rather than serialized on one.
+		let mut widen = false;
+		let libcs_before = libcs.len();
+		let (timed, declared, own, watched) = loop {
+			let dir = work.join(if widen {
+				format!("{index}-spread")
+			} else {
+				index.to_string()
+			});
+			// The other cores a threaded benchmark spreads over, leased until it is timed and counted.
+			let spreading;
+			let (timed, iterations, used, timed_threaded, declared, own, cpus, inherits) = match (&base, &head) {
+				(Some(base), Some(head)) => {
+					let spawn = |cpus: Option<&[usize]>| -> Result<(Process, Process), String> {
+						Ok((
+							Process::spawn(base, cpus, preload.as_deref(), &dir.join("base"))?,
+							Process::spawn(head, cpus, preload.as_deref(), &dir.join("head"))?,
+						))
+					};
+					let mut cpus = exclusive.clone();
+					let (mut base, mut head) = spawn(cpus.as_deref())?;
+					spreading = spread(reservation.as_ref(), &name, widen || base.threaded || head.threaded)?;
+					if let Some(spread) = &spreading {
+						base.finish()?;
+						head.finish()?;
+						cpus = Some(spread.cpus.clone());
+						(base, head) = spawn(cpus.as_deref())?;
+					}
+					let (iterations, pairs) = paired(&mut base, &mut head, &mut coin)?;
+					let base_threaded = base.threaded || pairs.iter().any(|(b, _)| b.threaded);
+					let head_threaded = head.threaded || pairs.iter().any(|(_, h)| h.threaded);
+					libcs.push((format!("{name} (base)"), base.libc.take()));
+					libcs.push((format!("{name} (head)"), head.libc.take()));
+					let declared = [base.throughput, head.throughput];
+					let own = [base.own_timer, head.own_timer];
+					let inherits = [base.inherits, head.inherits];
 					base.finish()?;
 					head.finish()?;
-					cpus = Some(spread.cpus.clone());
-					(base, head) = spawn(cpus.as_deref())?;
+					let nanos: Vec<(u64, u64)> = pairs.iter().map(|(b, h)| (b.nanos, h.nanos)).collect();
+					let base_used = usage(pairs.iter().map(|(b, _)| b));
+					let head_used = usage(pairs.iter().map(|(_, h)| h));
+					let timed = Times::pairs(iterations, &nanos).map_err(|err| format!("{name}: {err}"))?;
+					(
+						timed,
+						iterations,
+						[base_used, head_used],
+						[base_threaded, head_threaded],
+						declared,
+						own,
+						cpus,
+						inherits,
+					)
 				}
-				let (iterations, pairs) = paired(&mut base, &mut head, &mut coin)?;
-				let base_threaded = base.threaded || pairs.iter().any(|(b, _)| b.threaded);
-				let head_threaded = head.threaded || pairs.iter().any(|(_, h)| h.threaded);
-				libcs.push((format!("{name} (base)"), base.libc.take()));
-				libcs.push((format!("{name} (head)"), head.libc.take()));
-				let declared = [base.throughput, head.throughput];
-				let own = [base.own_timer, head.own_timer];
-				let inherits = [base.inherits, head.inherits];
-				base.finish()?;
-				head.finish()?;
-				let nanos: Vec<(u64, u64)> = pairs.iter().map(|(b, h)| (b.nanos, h.nanos)).collect();
-				let base_used = usage(pairs.iter().map(|(b, _)| b));
-				let head_used = usage(pairs.iter().map(|(_, h)| h));
-				let timed = Times::pairs(iterations, &nanos).map_err(|err| format!("{name}: {err}"))?;
-				(
-					timed,
-					iterations,
-					[base_used, head_used],
-					[base_threaded, head_threaded],
-					declared,
-					own,
-					cpus,
-					inherits,
-				)
-			}
-			(base, head) => {
-				let (side, job) = match (base, head) {
-					(Some(base), None) => (Which::Base, base),
-					(None, Some(head)) => (Which::Head, head),
-					_ => unreachable!("every name is one side's"),
-				};
-				let mut cpus = exclusive.clone();
-				let mut process = Process::spawn(job, cpus.as_deref(), preload.as_deref(), &dir.join(side.name()))?;
-				spreading = spread(reservation.as_ref(), &name, process.threaded)?;
-				if let Some(spread) = &spreading {
-					process.finish()?;
-					cpus = Some(spread.cpus.clone());
-					process = Process::spawn(job, cpus.as_deref(), preload.as_deref(), &dir.join(side.name()))?;
-				}
-				let (iterations, samples) = alone(&mut process)?;
-				let side_threaded = process.threaded || samples.iter().any(|sample| sample.threaded);
-				libcs.push((name.clone(), process.libc.take()));
-				let declared = process.throughput;
-				let own_timer = process.own_timer;
-				let inherits = process.inherits;
-				process.finish()?;
-				let nanos: Vec<u64> = samples.iter().map(|sample| sample.nanos).collect();
-				let timed = Times::alone(side, iterations, &nanos).map_err(|err| format!("{name}: {err}"))?;
-				let used = usage(samples.iter());
-				(
-					timed,
-					iterations,
-					if side == Which::Base {
-						[used, None]
-					} else {
-						[None, used]
-					},
-					if side == Which::Base {
-						[side_threaded, false]
-					} else {
-						[false, side_threaded]
-					},
-					if side == Which::Base {
-						[declared, None]
-					} else {
-						[None, declared]
-					},
-					if side == Which::Base {
-						[own_timer, false]
-					} else {
-						[false, own_timer]
-					},
-					cpus,
-					[inherits; 2],
-				)
-			}
-		};
-		let mut watched = true;
-		for (i, (side, job)) in [(Which::Base, &base), (Which::Head, &head)].into_iter().enumerate() {
-			let Some(job) = job else { continue };
-			if timed_threaded[i] {
-				threaded.insert(name.clone());
-			}
-			let mut measures = match (perf, &preload) {
-				(Some(_), Some(_)) if timed_threaded[i] && !inherits[i] => {
-					eprintln!("{}", too_old(&job.label));
-					watched = false;
-					Vec::new()
-				}
-				(Some(perf), Some(preload)) => {
-					let (counted, count_libc) = count(
-						job,
-						perf,
-						Counting {
-							cpus: cpus.as_deref().unwrap_or(&perf.pmu.cpus),
-							preload,
-							iterations,
-							throughput: declared[i],
-							threaded: timed_threaded[i],
-						},
-						&dir.join(side.name()),
-					)?;
-					libcs.push((format!("{name} ({} counters)", side.name()), count_libc));
-					match counted {
-						Counted::Measures { measures, every_thread } => {
-							if every_thread {
-								threaded.insert(name.clone());
-								every.insert(name.clone());
-							}
-							measures
-						}
-						Counted::Unwatched => {
-							watched = false;
-							Vec::new()
-						}
-						Counted::TooOld => {
-							threaded.insert(name.clone());
-							watched = false;
-							Vec::new()
-						}
+				(base, head) => {
+					let (side, job) = match (base, head) {
+						(Some(base), None) => (Which::Base, base),
+						(None, Some(head)) => (Which::Head, head),
+						_ => unreachable!("every name is one side's"),
+					};
+					let mut cpus = exclusive.clone();
+					let mut process = Process::spawn(job, cpus.as_deref(), preload.as_deref(), &dir.join(side.name()))?;
+					spreading = spread(reservation.as_ref(), &name, widen || process.threaded)?;
+					if let Some(spread) = &spreading {
+						process.finish()?;
+						cpus = Some(spread.cpus.clone());
+						process = Process::spawn(job, cpus.as_deref(), preload.as_deref(), &dir.join(side.name()))?;
 					}
-				}
-				_ => {
-					watched = false;
-					Vec::new()
+					let (iterations, samples) = alone(&mut process)?;
+					let side_threaded = process.threaded || samples.iter().any(|sample| sample.threaded);
+					libcs.push((name.clone(), process.libc.take()));
+					let declared = process.throughput;
+					let own_timer = process.own_timer;
+					let inherits = process.inherits;
+					process.finish()?;
+					let nanos: Vec<u64> = samples.iter().map(|sample| sample.nanos).collect();
+					let timed = Times::alone(side, iterations, &nanos).map_err(|err| format!("{name}: {err}"))?;
+					let used = usage(samples.iter());
+					(
+						timed,
+						iterations,
+						if side == Which::Base {
+							[used, None]
+						} else {
+							[None, used]
+						},
+						if side == Which::Base {
+							[side_threaded, false]
+						} else {
+							[false, side_threaded]
+						},
+						if side == Which::Base {
+							[declared, None]
+						} else {
+							[None, declared]
+						},
+						if side == Which::Base {
+							[own_timer, false]
+						} else {
+							[false, own_timer]
+						},
+						cpus,
+						[inherits; 2],
+					)
 				}
 			};
-			if let Some(heap) = &heap
-				&& let crate::heap::Allocs::Counted(allocs) = crate::heap::measure(
-					job,
-					crate::heap::Pass {
-						library: heap,
-						padded: false,
-						cpus: cpus.as_deref().or(perf.map(|perf| &perf.pmu.cpus[..])),
-					},
-					declared[i],
-					&dir.join(side.name()),
-				)? {
-				measures.extend(allocs);
-			}
-			if let Some((used, calls)) = &used[i] {
-				measures.extend(used.measures(*calls * iterations));
-			}
-			// What derives from the side's time and counts, per what each of its calls processes.
-			if let (Some(throughput), Some(time)) = (declared[i], [timed.base(), timed.head()][i]) {
-				// A benchmark that returns its own time has counts per byte, but no wall-clock rate.
-				let mut all = Vec::new();
-				if !own[i] {
-					all.push(Measure::new("time", time, UNIT));
+			let mut watched = true;
+			for (i, (side, job)) in [(Which::Base, &base), (Which::Head, &head)].into_iter().enumerate() {
+				let Some(job) = job else { continue };
+				if timed_threaded[i] {
+					threaded.insert(name.clone());
 				}
-				all.extend(measures.iter().cloned());
-				measures.extend(throughput.measures(&all));
+				let mut measures = match (perf, &preload) {
+					(Some(_), Some(_)) if timed_threaded[i] && !inherits[i] => {
+						eprintln!("{}", too_old(&job.label));
+						watched = false;
+						Vec::new()
+					}
+					(Some(perf), Some(preload)) => {
+						let (counted, count_libc) = count(
+							job,
+							perf,
+							Counting {
+								cpus: cpus.as_deref().unwrap_or(&perf.pmu.cpus),
+								preload,
+								iterations,
+								throughput: declared[i],
+								threaded: timed_threaded[i],
+							},
+							&dir.join(side.name()),
+						)?;
+						libcs.push((format!("{name} ({} counters)", side.name()), count_libc));
+						match counted {
+							Counted::Measures { measures, every_thread } => {
+								if every_thread {
+									threaded.insert(name.clone());
+									every.insert(name.clone());
+								}
+								measures
+							}
+							Counted::Unwatched => {
+								watched = false;
+								Vec::new()
+							}
+							Counted::TooOld => {
+								threaded.insert(name.clone());
+								watched = false;
+								Vec::new()
+							}
+						}
+					}
+					_ => {
+						watched = false;
+						Vec::new()
+					}
+				};
+				if let Some(heap) = &heap
+					&& let crate::heap::Allocs::Counted(allocs) = crate::heap::measure(
+						job,
+						crate::heap::Pass {
+							library: heap,
+							padded: false,
+							cpus: cpus.as_deref().or(perf.map(|perf| &perf.pmu.cpus[..])),
+						},
+						declared[i],
+						&dir.join(side.name()),
+					)? {
+					measures.extend(allocs);
+				}
+				if let Some((used, calls)) = &used[i] {
+					measures.extend(used.measures(*calls * iterations));
+				}
+				// What derives from the side's time and counts, per what each of its calls processes.
+				if let (Some(throughput), Some(time)) = (declared[i], [timed.base(), timed.head()][i]) {
+					// A benchmark that returns its own time has counts per byte, but no wall-clock rate.
+					let mut all = Vec::new();
+					if !own[i] {
+						all.push(Measure::new("time", time, UNIT));
+					}
+					all.extend(measures.iter().cloned());
+					measures.extend(throughput.measures(&all));
+				}
+				if !measures.is_empty() {
+					details[i].insert(name.clone(), measures);
+				}
 			}
-			if !measures.is_empty() {
-				details[i].insert(name.clone(), measures);
+			if !widen && spreading.is_none() && reservation.is_some() && threaded.contains(&name) {
+				widen = true;
+				threaded.remove(&name);
+				every.remove(&name);
+				for side in &mut details {
+					side.remove(&name);
+				}
+				libcs.truncate(libcs_before);
+				continue;
 			}
-		}
+			break (timed, declared, own, watched);
+		};
 		// A paired rate changes as the work each call does over the paired time ratio, which the
 		// time's own change is, rather than as its sides' medians do.
 		if let (Times::Both { ratio, .. }, [Some(base), Some(head)]) = (&timed, declared)
