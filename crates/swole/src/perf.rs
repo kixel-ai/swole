@@ -5,6 +5,8 @@
 //! A hardware counter is read with `rdpmc` through the page the kernel keeps for it, so the
 //! system calls that start and stop counting fall outside what a count holds. Such counters
 //! count the calling thread alone: the kernel maps no page for a counter its threads inherit.
+//! A threaded benchmark's counters are inherited instead, by every thread the process starts,
+//! and each is read once with `read()`, every thread's count summed, after the last call.
 
 use std::cell::Cell;
 use std::io::Read;
@@ -17,8 +19,11 @@ use std::sync::atomic::{Ordering, compiler_fence};
 /// descriptors: each takes the lowest free one. The hardware ones come first.
 pub struct Counters {
 	fds: Vec<OwnedFd>,
-	/// Each hardware counter, read in user space.
+	/// Each hardware counter, read in user space, or none when the counters count every thread.
 	slots: Vec<Slot>,
+	/// Whether every thread of the process inherits the counters, rather than only the calling
+	/// thread counting.
+	every_thread: bool,
 	/// Why a call's reads cannot be trusted, once one's cannot.
 	failed: Cell<Option<&'static str>>,
 }
@@ -39,9 +44,10 @@ struct Slot {
 
 impl Counters {
 	/// The `hardware` then `software` counters swole left open on this process, each counting
-	/// only the thread that runs the benchmark. Fails unless there are exactly that many, or a
-	/// hardware one cannot be read in user space.
-	pub fn inherited(hardware: usize, software: usize) -> Result<Self, String> {
+	/// only the thread that runs the benchmark, or with `every_thread`, every thread the process
+	/// starts too. Fails unless there are exactly that many, or a hardware one counting the calling
+	/// thread alone cannot be read in user space.
+	pub fn inherited(hardware: usize, software: usize, every_thread: bool) -> Result<Self, String> {
 		let entries = std::fs::read_dir("/proc/self/fd").map_err(|e| format!("cannot list /proc/self/fd: {e}"))?;
 		let mut found = Vec::new();
 		for entry in entries {
@@ -74,7 +80,9 @@ impl Counters {
 			.into_iter()
 			.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
 			.collect();
-		let slots = fds[..hardware]
+		// The kernel maps no page for a counter threads inherit, which `read()` alone reads.
+		let read_in_user_space = if every_thread { 0 } else { hardware };
+		let slots = fds[..read_in_user_space]
 			.iter()
 			.map(|fd| {
 				Ok(Slot {
@@ -90,14 +98,22 @@ impl Counters {
 		Ok(Self {
 			fds,
 			slots,
+			every_thread,
 			failed: Cell::new(None),
 		})
 	}
 
-	/// Starts every counter, then reads each hardware one, so the `prctl` that starts them all
-	/// (the thread that opened them owns them) comes before the count. The pages are read
-	/// first and the counters back to back, so what each counter counts of the reads' own is the
-	/// same few instructions for every counter and every call.
+	/// Whether the counters count every thread of the process.
+	pub fn every_thread(&self) -> bool {
+		self.every_thread
+	}
+
+	/// Starts every counter, then reads each hardware one in user space, so the `prctl` that
+	/// starts them all (the thread that opened them owns them, and each copy a thread inherited)
+	/// comes before the count. Counting every thread, nothing is read in user space, so the count
+	/// holds the two `prctl`s' own work. The pages are read first and the counters back to back,
+	/// so what each counter counts of the reads' own is the same few instructions for every
+	/// counter and every call.
 	#[inline(never)]
 	pub fn start(&self) {
 		prctl(PR_TASK_PERF_EVENTS_ENABLE);
@@ -189,7 +205,8 @@ impl Counters {
 	}
 
 	/// Each counter's value, refusing one that did not count the whole time it was enabled: a
-	/// hardware one's over the calls, a software one's from each start to its stop.
+	/// hardware one read in user space over the calls, any other from each start to its stop, every
+	/// thread's summed when they inherit it.
 	pub fn read(&self) -> Result<Vec<u64>, String> {
 		if let Some(why) = self.failed.get() {
 			return Err(why.to_owned());

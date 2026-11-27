@@ -158,14 +158,17 @@ impl Report {
 	}
 }
 
-/// Each measure of `measures` as a report holds it: its value and unit by name.
+/// Each measure of `measures` as a report holds it: its value and unit by name, and the least and
+/// most of its samples when it took several.
 pub fn side(measures: &[Measure]) -> Value {
 	let mut side = Map::new();
 	for measure in measures {
-		side.insert(
-			measure.name.clone(),
-			json!({ "value": number(measure.value), "unit": measure.unit }),
-		);
+		let mut value = json!({ "value": number(measure.value), "unit": measure.unit });
+		if let Some((least, most)) = measure.spread {
+			value["lower"] = number(least);
+			value["upper"] = number(most);
+		}
+		side.insert(measure.name.clone(), value);
 	}
 	Value::Object(side)
 }
@@ -173,20 +176,20 @@ pub fn side(measures: &[Measure]) -> Value {
 /// The report of a count, quick's or sim's, of the working tree, against `base`'s counts, from the
 /// commit `sha`, when given.
 pub fn report(counts: &Counts, base: Option<&Counts>, counter: &Counter, sha: Option<&str>) -> Report {
-	let headline = |counts: &Counts, name: &str| -> Option<Vec<Measure>> {
-		let count = *counts.counts.get(name)?;
-		Some(match counts.details.get(name) {
-			Some(details) => details.clone(),
-			None => vec![Measure::new("instructions", count as f64, "instructions")],
-		})
-	};
+	// Every measure, each with its own spread, or Valgrind's instructions alone, with the spread of
+	// the count.
 	let point = |counts: &Counts, name: &str| -> Option<Value> {
-		let mut side = side(&headline(counts, name)?);
-		if let Some(&(least, most)) = counts.spread.get(name) {
-			side["instructions"]["lower"] = least.into();
-			side["instructions"]["upper"] = most.into();
-		}
-		Some(side)
+		let count = *counts.counts.get(name)?;
+		Some(side(&match counts.details.get(name) {
+			Some(details) => details.clone(),
+			None => vec![Measure {
+				spread: counts
+					.spread
+					.get(name)
+					.map(|&(least, most)| (least as f64, most as f64)),
+				..Measure::new("instructions", count as f64, "instructions")
+			}],
+		}))
 	};
 	let names: BTreeSet<&String> = counts
 		.counts
@@ -225,11 +228,21 @@ pub fn number(value: f64) -> Value {
 }
 
 /// Each benchmark's count, a line each, with the least and most of its samples when it took more
-/// than one.
+/// than one, marked sampled (`~`).
 pub fn table(counts: &Counts) -> String {
-	let width = counts.counts.values().map(|n| n.to_string().len()).max().unwrap_or(0);
+	let shown = |name: &String, count: &u64| match counts.spread.get(name) {
+		Some(_) => format!("{SAMPLED}{count}"),
+		None => count.to_string(),
+	};
+	let width = counts
+		.counts
+		.iter()
+		.map(|(name, count)| shown(name, count).chars().count())
+		.max()
+		.unwrap_or(0);
 	let mut out = String::new();
 	for (name, count) in &counts.counts {
+		let count = shown(name, count);
 		match counts.spread.get(name) {
 			Some((least, most)) => writeln!(out, "{count:>width$}  {name}  ({least} to {most})"),
 			None => writeln!(out, "{count:>width$}  {name}"),
@@ -237,6 +250,33 @@ pub fn table(counts: &Counts) -> String {
 		.expect("a String takes every write");
 	}
 	out
+}
+
+/// What marks a value sampled, the median of counts another thread or the scheduler moves, rather
+/// than one exact count.
+pub const SAMPLED: &str = "~";
+
+/// A change from `base` to `head` as a table shows it: exact, or between two sampled values, the
+/// change from their median to median, and the least and most their spreads allow, marked sampled.
+pub fn change(
+	(base, base_spread): (f64, Option<(f64, f64)>),
+	(head, head_spread): (f64, Option<(f64, f64)>),
+) -> String {
+	let percent = |base: f64, head: f64| format!("{:+.2}%", (head - base) / base * 100.0);
+	if base_spread.is_none() && head_spread.is_none() {
+		return percent(base, head);
+	}
+	let (base_least, base_most) = base_spread.unwrap_or((base, base));
+	let (head_least, head_most) = head_spread.unwrap_or((head, head));
+	if base_least <= 0.0 {
+		return format!("{SAMPLED}{}", percent(base, head));
+	}
+	format!(
+		"{SAMPLED}{} ({} to {})",
+		percent(base, head),
+		percent(base_most, head_least),
+		percent(base_least, head_most)
+	)
 }
 
 /// A measure's value as a table shows it, in its unit.
@@ -280,12 +320,21 @@ pub fn details(before: Option<&BTreeMap<String, Vec<Measure>>>, after: &BTreeMap
 			}
 		}
 		for (measure, unit) in measures {
-			let find = |side: &[Measure]| side.iter().find(|m| m.name == measure).map(|m| m.value);
-			let cell = |value: Option<f64>| value.map_or("-".to_owned(), |value| shown(value, unit));
+			let find = |side: &[Measure]| side.iter().find(|m| m.name == measure).map(|m| (m.value, m.spread));
+			let cell = |found: Option<(f64, Option<(f64, f64)>)>| match found {
+				Some((value, Some((least, most)))) => format!(
+					"{SAMPLED}{} ({} to {})",
+					shown(value, unit),
+					shown(least, unit),
+					shown(most, unit)
+				),
+				Some((value, None)) => shown(value, unit),
+				None => "-".to_owned(),
+			};
 			match base {
 				Some(base) => {
 					let change = match (find(base), find(head)) {
-						(Some(b), Some(a)) if b != 0.0 => format!("{:+.2}%", (a - b) / b * 100.0),
+						(Some(b), Some(a)) if b.0 != 0.0 => change(b, a),
 						(Some(_), Some(_)) => String::new(),
 						(None, Some(_)) => "added".to_owned(),
 						(Some(_), None) => "removed".to_owned(),
@@ -358,6 +407,49 @@ mod tests {
 			 | gone | cycles:u | 1 | - | removed |\n| gone | user time | 1.500 ns | - | removed |\n"
 		);
 		assert_eq!(details(None, &BTreeMap::new()), "");
+	}
+
+	#[test]
+	fn marks_a_sampled_value_and_compares_it_by_its_spread() {
+		let mut sampled = counts(&[("a", 10), ("b", 200)]);
+		sampled.spread.insert("b".to_owned(), (190, 210));
+		assert_eq!(table(&sampled), "  10  a\n~200  b  (190 to 210)\n");
+		assert_eq!(change((100.0, None), (150.0, None)), "+50.00%");
+		// From the base's most to the head's least, and its least to the head's most.
+		assert_eq!(
+			change((100.0, Some((90.0, 110.0))), (150.0, None)),
+			"~+50.00% (+36.36% to +66.67%)"
+		);
+		let base = BTreeMap::from([(
+			"a".to_owned(),
+			vec![Measure {
+				spread: Some((90.0, 110.0)),
+				..Measure::new("cycles:u", 100.0, "events")
+			}],
+		)]);
+		let head = BTreeMap::from([("a".to_owned(), vec![Measure::new("cycles:u", 150.0, "events")])]);
+		assert_eq!(
+			details(Some(&base), &head),
+			"\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n\
+			 | a | cycles:u | ~100 (90 to 110) | 150 | ~+50.00% (+36.36% to +66.67%) |\n"
+		);
+		// A report gives each measure's spread, or with none to hold it, the count's.
+		let counter = Counter {
+			kind: crate::CounterKind::Valgrind,
+			fingerprint: String::new(),
+			host: String::new(),
+		};
+		let report = report(&sampled, None, &counter, None);
+		assert_eq!(
+			report.0["benchmarks"]["b"]["head"]["instructions"],
+			json!({ "value": 200, "unit": "instructions", "lower": 190, "upper": 210 })
+		);
+		sampled.details.insert("b".to_owned(), base["a"].clone());
+		let report = super::report(&sampled, None, &counter, None);
+		assert_eq!(
+			report.0["benchmarks"]["b"]["head"],
+			json!({ "cycles:u": { "value": 100, "unit": "events", "lower": 90, "upper": 110 } })
+		);
 	}
 
 	#[test]

@@ -160,11 +160,15 @@ With `SWOLE_COUNTERS` set to how many Linux perf counters swole opened on the pr
 ran the target, as `<hardware>+<software>`, it starts them all after the case's setup and reads
 each hardware one in user space with `rdpmc`, then reads them again after its call and stops
 them, so a count holds no system call. It counts only under swole's preload, or its build that counts threads alone, whose thread count
-tells swole whether another thread, whose work the counters cannot see, ran beside a call. It
+tells swole whether another thread, whose work the counters cannot see, ran beside a call. For
+such a case, which it reads no counters of, swole counts again with `SWOLE_INHERIT=1` beside
+`SWOLE_COUNTERS`: counters every thread inherits, which the kernel maps no page for, so the harness
+starts and stops them around each call with the same `prctl`s, reads none in user space, and
+reads each once after the last call with `read()`, every thread's count summed. It
 then prints a `swole rusage` line of what the process used over the call and
 `swole counted <value>... <name>`, each counter's value in the order swole opened them, before
 `swole ran <name>`. The benchmark itself needs no privilege: swole opens the counters with its
-own. `swole quick` sets `SWOLE_COUNTERS` alone (counting one call without warm-up). `swole bench` sets
+own. `swole quick` sets no `SWOLE_ITERATIONS` (counting one call without warm-up). `swole bench` sets
 both `SWOLE_COUNTERS` and `SWOLE_ITERATIONS`: the harness first replays the uncounted calls `bench`
 warms it up with before timing, one call and then batches doubled from one up to that many, then
 calls it that many times, counting a deterministic stratified subset of up to 64 of those calls

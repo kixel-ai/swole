@@ -50,6 +50,10 @@ impl IntoIterator for Iterations {
 /// its calls with them, and print what they counted.
 const COUNTERS: &str = "SWOLE_COUNTERS";
 
+/// The variable that, set to `1` beside `SWOLE_COUNTERS`, says every thread of the process
+/// inherits the counters swole opened, which `read()` alone then reads: a threaded benchmark's.
+const INHERIT: &str = "SWOLE_INHERIT";
+
 /// The variable that, beside `SWOLE_COUNTERS`, has the benchmark called this many times, each
 /// call counted, after the uncounted calls bench warms it up with, rather than once.
 const ITERATIONS: &str = "SWOLE_ITERATIONS";
@@ -137,17 +141,27 @@ fn run() -> Result<(), String> {
 		return serve(&name, (case.build)(), std::io::stdin().lock(), std::io::stdout(), true);
 	}
 	let counters = split(COUNTERS)?;
+	let every_thread = match std::env::var_os(INHERIT) {
+		None => false,
+		Some(value) if value == "1" => true,
+		Some(value) => return Err(format!("{INHERIT} is {}, not 1", value.to_string_lossy())),
+	};
 	let warm = number(ITERATIONS)?;
 	let iterations = warm.unwrap_or(1);
 	if counters.is_some() && !watched {
 		return Err(format!("{COUNTERS} counts one benchmark, which {ONLY} names"));
+	}
+	if every_thread && counters.is_none() {
+		return Err(format!(
+			"{INHERIT} says how {COUNTERS}'s counters count, which it does not set"
+		));
 	}
 	if warm.is_some() && counters.is_none() {
 		return Err(format!(
 			"{ITERATIONS} counts with perf counters, which {COUNTERS} has swole open"
 		));
 	}
-	let mut counters = counters.map(open).transpose()?;
+	let mut counters = counters.map(|counters| open(counters, every_thread)).transpose()?;
 	for (name, case) in cases {
 		// `bench` collects rusage from its timed samples and discards counter-pass rusage, so skip
 		// per-call getrusage syscalls when `SWOLE_ITERATIONS` is set.
@@ -212,24 +226,26 @@ fn run() -> Result<(), String> {
 	Ok(())
 }
 
-/// The `hardware` and `software` perf counters swole opened on this process.
+/// The `hardware` and `software` perf counters swole opened on this process, which with
+/// `every_thread` every thread inherits.
 #[cfg(target_os = "linux")]
-fn open((hardware, software): (usize, usize)) -> Result<Counters, String> {
+fn open((hardware, software): (usize, usize), every_thread: bool) -> Result<Counters, String> {
 	perf::preloaded()?;
-	// The counters see the calling thread alone, so swole must learn of every other thread a
-	// call starts, even one gone by its end, which only the preload's count tells.
+	// Counters of the calling thread alone miss another thread, so swole must learn of every
+	// other thread a call starts, even one gone by its end, which only the preload's count tells;
+	// counters every thread inherits count it, and the record that one ran marks the count sampled.
 	if perf::started().is_none() {
 		return Err(format!(
 			"{COUNTERS} counts only under swole's preload, whose thread count tells whether another thread ran beside \
 			 a call"
 		));
 	}
-	Counters::inherited(hardware, software)
+	Counters::inherited(hardware, software, every_thread)
 }
 
 /// Elsewhere swole opens none.
 #[cfg(not(target_os = "linux"))]
-fn open(_: (usize, usize)) -> Result<Counters, String> {
+fn open(_: (usize, usize), _: bool) -> Result<Counters, String> {
 	Err(format!("{COUNTERS}: perf counters are Linux's"))
 }
 
@@ -621,13 +637,15 @@ pub mod __private {
 			let usage = watch.usage.map(|(_, used)| used.fields());
 			#[cfg(not(all(unix, target_pointer_width = "64")))]
 			let usage = None;
-			// A threaded case's counters missed the other threads, so swole discards them, and a
-			// failed read of them must not cost the case its times.
+			// A threaded case's counters of the calling thread alone missed the other threads, so
+			// swole discards them, and a failed read of them must not cost the case its times;
+			// counters every thread inherited counted them.
 			#[cfg(target_os = "linux")]
-			let counted = match watch.threaded {
-				true => None,
-				false => self.counters.map(|counters| counters.read()).transpose()?,
-			};
+			let counted = self
+				.counters
+				.filter(|counters| counters.every_thread() || !watch.threaded)
+				.map(|counters| counters.read())
+				.transpose()?;
 			#[cfg(not(target_os = "linux"))]
 			let counted = self.counters.map(|counters| match counters {});
 			Ok(Watched {
