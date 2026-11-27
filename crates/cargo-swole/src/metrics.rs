@@ -19,6 +19,9 @@ const MEASURE_LIMIT: usize = 64;
 /// a new field keeps it.
 const SCHEMA_VERSION: u64 = 1;
 
+/// What a harness target prints before what each call of a benchmark processes.
+const THROUGHPUT: &str = "swole throughput ";
+
 /// What each call of a benchmark processes, as its `#[bench(bytes = ..)]` or `items` declares.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Throughput {
@@ -28,11 +31,42 @@ pub enum Throughput {
 
 impl Throughput {
 	/// What the harness prints after `swole throughput `: `bytes` or `items`, then how many.
-	pub fn parse(unit: &str, amount: &str) -> Option<Self> {
+	fn parse(unit: &str, amount: &str) -> Option<Self> {
 		let amount = amount.parse().ok().filter(|&n| n > 0)?;
 		match unit {
 			"bytes" => Some(Self::Bytes(amount)),
 			"items" => Some(Self::Items(amount)),
+			_ => None,
+		}
+	}
+
+	/// Each benchmark's throughput as a harness target's `stdout` declares it, a
+	/// `swole throughput <bytes|items> <n> <name>` line each, failing on one no harness prints,
+	/// or two that disagree.
+	pub fn declared(stdout: &str) -> Result<BTreeMap<String, Self>, String> {
+		let mut declared = BTreeMap::new();
+		for rest in stdout.lines().filter_map(|line| line.strip_prefix(THROUGHPUT)) {
+			let malformed = || format!("a harness target printed {THROUGHPUT}{rest}, which no harness prints");
+			let mut fields = rest.splitn(3, ' ');
+			let (Some(unit), Some(amount), Some(name)) = (fields.next(), fields.next(), fields.next()) else {
+				return Err(malformed());
+			};
+			let throughput = Self::parse(unit, amount).ok_or_else(malformed)?;
+			if declared
+				.insert(name.to_owned(), throughput)
+				.is_some_and(|other| other != throughput)
+			{
+				return Err(format!("a harness target declared two throughputs of {name}"));
+			}
+		}
+		Ok(declared)
+	}
+
+	/// How many times what `base`'s calls each process this one's do, when both count the same
+	/// unit.
+	pub fn scale(self, base: Self) -> Option<f64> {
+		match (self, base) {
+			(Self::Bytes(_), Self::Bytes(_)) | (Self::Items(_), Self::Items(_)) => Some(self.amount() / base.amount()),
 			_ => None,
 		}
 	}
@@ -324,8 +358,15 @@ fn rate(mut value: f64, step: f64, units: &[&str]) -> String {
 }
 
 /// Every measure of each benchmark beyond its headline, a row each, as a Markdown table: with
-/// `before`, the base's beside the head's, and the change; empty when no benchmark has any.
-pub fn details(before: Option<&BTreeMap<String, Vec<Measure>>>, after: &BTreeMap<String, Vec<Measure>>) -> String {
+/// `before`, the base's beside the head's, and the change, which for a benchmark `paired` names
+/// is its `throughput`'s from its paired timing, rather than from its sides' medians; empty when
+/// no benchmark has any. A measure whose unit differs by side, as a rate in bytes on one and
+/// items on the other, takes a row a side.
+pub fn details(
+	before: Option<&BTreeMap<String, Vec<Measure>>>,
+	after: &BTreeMap<String, Vec<Measure>>,
+	paired: &BTreeMap<String, f64>,
+) -> String {
 	if after.is_empty() && before.is_none_or(BTreeMap::is_empty) {
 		return String::new();
 	}
@@ -344,16 +385,26 @@ pub fn details(before: Option<&BTreeMap<String, Vec<Measure>>>, after: &BTreeMap
 		let base = before.and_then(|before| before.get(name)).map(Vec::as_slice);
 		let mut measures: Vec<(&str, &'static str)> = Vec::new();
 		for measure in head.iter().chain(base.unwrap_or_default()) {
-			if !measures.iter().any(|(name, _)| *name == measure.name) {
+			if !measures
+				.iter()
+				.any(|&(name, unit)| name == measure.name && unit == measure.unit)
+			{
 				measures.push((&measure.name, measure.unit));
 			}
 		}
 		for (measure, unit) in measures {
-			let find = |side: &[Measure]| side.iter().find(|m| m.name == measure).map(|m| m.value);
+			let find = |side: &[Measure]| {
+				side.iter()
+					.find(|m| m.name == measure && m.unit == unit)
+					.map(|m| m.value)
+			};
 			let cell = |value: Option<f64>| value.map_or("-".to_owned(), |value| shown(value, unit));
 			match base {
 				Some(base) => {
 					let change = match (find(base), find(head)) {
+						(Some(_), Some(_)) if measure == "throughput" && paired.contains_key(name) => {
+							format!("{:+.2}%", paired[name] * 100.0)
+						}
 						(Some(b), Some(a)) if b != 0.0 => format!("{:+.2}%", (a - b) / b * 100.0),
 						(Some(_), Some(_)) => String::new(),
 						(None, Some(_)) => "added".to_owned(),
@@ -422,12 +473,23 @@ mod tests {
 		let base = BTreeMap::from([("a".to_owned(), side(100.0)), ("gone".to_owned(), side(1.0))]);
 		let head = BTreeMap::from([("a".to_owned(), side(150.0))]);
 		assert_eq!(
-			details(Some(&base), &head),
+			details(Some(&base), &head, &BTreeMap::new()),
 			"\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n\
 			 | a | cycles:u | 100 | 150 | +50.00% |\n| a | user time | 1.500 ns | 1.500 ns | +0.00% |\n\
 			 | gone | cycles:u | 1 | - | removed |\n| gone | user time | 1.500 ns | - | removed |\n"
 		);
-		assert_eq!(details(None, &BTreeMap::new()), "");
+		assert_eq!(details(None, &BTreeMap::new(), &BTreeMap::new()), "");
+		// A rate in bytes on one side and items on the other takes a row each, with no change; a
+		// paired rate's change is the one its pairing gives.
+		let rate = |unit| vec![Measure::new("throughput", 10.0, unit)];
+		let base = BTreeMap::from([("a".to_owned(), rate("items/s")), ("b".to_owned(), rate("bytes/s"))]);
+		let head = BTreeMap::from([("a".to_owned(), rate("bytes/s")), ("b".to_owned(), rate("bytes/s"))]);
+		assert_eq!(
+			details(Some(&base), &head, &BTreeMap::from([("b".to_owned(), 0.25)])),
+			"\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n\
+			 | a | throughput | - | 10.00 B/s | added |\n| a | throughput | 10.00 items/s | - | removed |\n\
+			 | b | throughput | 10.00 B/s | 10.00 B/s | +25.00% |\n"
+		);
 	}
 
 	#[test]

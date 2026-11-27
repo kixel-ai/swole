@@ -34,10 +34,6 @@ const CAPTURE_DIR: &str = "SWOLE_CAPTURE";
 /// What a harness target prints after each benchmark it ran, before the benchmark's name.
 const HARNESS_RAN: &str = "swole ran ";
 
-/// What a harness target prints before `swole ran` for a benchmark that declares what each call
-/// processes, before `bytes` or `items`, how many, and its name.
-const HARNESS_THROUGHPUT: &str = "swole throughput ";
-
 /// The variable naming the one benchmark a harness target runs.
 const HARNESS_ONLY: &str = "SWOLE_BENCH";
 
@@ -865,17 +861,9 @@ fn ran(stdout: &str) -> Result<Option<Listed>, String> {
 		}
 		(false, true) => return Err("it ran benchmarks through both swole and CodSpeed's crates".to_owned()),
 	};
-	let mut throughput = BTreeMap::new();
-	for rest in stdout.lines().filter_map(|line| line.strip_prefix(HARNESS_THROUGHPUT)) {
-		let malformed = || format!("it printed {HARNESS_THROUGHPUT}{rest}, which no harness prints");
-		let mut fields = rest.splitn(3, ' ');
-		let (Some(unit), Some(amount), Some(name)) = (fields.next(), fields.next(), fields.next()) else {
-			return Err(malformed());
-		};
-		let declared = Throughput::parse(unit, amount).ok_or_else(malformed)?;
-		if !names.iter().any(|ran| ran == name) || throughput.insert(name.to_owned(), declared).is_some() {
-			return Err(malformed());
-		}
+	let throughput = Throughput::declared(stdout)?;
+	if let Some(name) = throughput.keys().find(|name| !names.contains(name)) {
+		return Err(format!("it declared a throughput of {name}, which it did not run"));
 	}
 	Ok(Some(Listed {
 		harness,
@@ -925,12 +913,14 @@ mod tests {
 			"swole throughput bits 8 benches/a.rs::f\n",
 			"swole throughput bytes -1 benches/a.rs::f\n",
 			"swole throughput bytes 8\n",
-			"swole throughput bytes 8 benches/a.rs::other\n",
-			"swole throughput bytes 8 benches/a.rs::f\nswole throughput items 8 benches/a.rs::f\n",
 		] {
 			let out = format!("{bad}swole ran benches/a.rs::f\n");
 			assert!(ran(&out).unwrap_err().contains("which no harness prints"), "{bad}");
 		}
+		let other = "swole throughput bytes 8 benches/a.rs::other\nswole ran benches/a.rs::f\n";
+		assert!(ran(other).unwrap_err().contains("which it did not run"));
+		let two = "swole throughput bytes 8 benches/a.rs::f\nswole throughput items 8 benches/a.rs::f\nswole ran benches/a.rs::f\n";
+		assert!(ran(two).unwrap_err().contains("two throughputs"));
 	}
 
 	#[test]

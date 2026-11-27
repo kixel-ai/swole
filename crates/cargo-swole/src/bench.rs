@@ -142,6 +142,8 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	let mut times = BTreeMap::new();
 	// Each benchmark's other measures, by side: the base's, then the head's.
 	let mut details: [BTreeMap<String, Vec<Measure>>; 2] = Default::default();
+	// Each paired benchmark's throughput change, from its paired timing.
+	let mut rates = BTreeMap::new();
 	// The benchmarks beside which another thread ran, on either side, which have no counters.
 	let mut threaded = std::collections::BTreeSet::new();
 	// Whether another thread ran beside each benchmark, where every side was watched or one
@@ -251,6 +253,16 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				details[i].insert(name.clone(), measures);
 			}
 		}
+		// A paired rate changes as the work each call does over the paired time ratio, which the
+		// time's own change is, rather than as its sides' medians do.
+		if let (Times::Both { ratio, .. }, Some(base), Some(head)) = (
+			&timed,
+			base.as_ref().and_then(|job| job.throughput),
+			head.as_ref().and_then(|job| job.throughput),
+		) && let Some(scale) = head.scale(base)
+		{
+			rates.insert(name.clone(), scale / ratio.value - 1.0);
+		}
 		if threaded.contains(&name) {
 			seen.insert(name.clone(), true);
 		} else if watched {
@@ -286,7 +298,10 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 		);
 	}
 	let [base_details, head_details] = &details;
-	print!("{}", metrics::details(paired.then_some(base_details), head_details));
+	print!(
+		"{}",
+		metrics::details(paired.then_some(base_details), head_details, &rates)
+	);
 	let sha = checkout.as_ref().map(|checkout| checkout.sha.as_str());
 	if let Some(out) = &options.out {
 		file(&times, &host, sha).write(out)?;

@@ -135,7 +135,7 @@ fn cli(args: &[String]) -> Result<(), String> {
 				}
 				print!("{}", metrics::table(&counts));
 				print!("{}", threaded(&counts));
-				print!("{}", metrics::details(None, &counts.shown()));
+				print!("{}", metrics::details(None, &counts.shown(), &BTreeMap::new()));
 				if let Some(out) = &options.out {
 					metrics::File::counts(&counts, counter.measure(&counts.fingerprint)).write(out)?;
 					eprintln!("swole: wrote {}", out.display());
@@ -297,7 +297,8 @@ pub(crate) struct Job {
 	expect: Option<String>,
 	/// Whether it runs a benchmark of CodSpeed's crates, which only Valgrind counts.
 	codspeed: bool,
-	/// What each call of its benchmark processes, when the benchmark declares it.
+	/// What each call of its benchmark processes, as its target's listing declared it, which
+	/// bench, timing natively as the listing runs, divides by.
 	throughput: Option<metrics::Throughput>,
 }
 
@@ -636,10 +637,6 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 	let all: Vec<&Job> = jobs.iter().collect();
 	let first = run(&all, &work.join("1"), &preload, parallel, counter)?;
 	let mut counts = Counts::none(counter);
-	counts.throughput = jobs
-		.iter()
-		.filter_map(|job| Some((job.expect.clone()?, job.throughput?)))
-		.collect();
 	if let CounterKind::Perf { native, .. } = &counter.kind
 		&& let Some(bench_libc) = fingerprint::require_single_libc(
 			first
@@ -657,6 +654,9 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 	for found in first.iter().flatten() {
 		if found.threaded {
 			counts.threaded.insert(found.name.clone());
+		}
+		if let Some(throughput) = found.throughput {
+			counts.throughput.insert(found.name.clone(), throughput);
 		}
 		if !found.details.is_empty() {
 			counts.details.insert(found.name.clone(), found.details.clone());
@@ -709,6 +709,14 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 				}
 			}
 			for found in more.iter().flatten() {
+				// Each count divides by what the process that took it declared.
+				if found.throughput != counts.throughput.get(&found.name).copied() {
+					return Err(format!(
+						"count {} of {} declared another throughput than its first",
+						round + 1,
+						found.name
+					));
+				}
 				if found.threaded {
 					counts.threaded.insert(found.name.clone());
 				}
@@ -963,6 +971,8 @@ struct Found {
 	libc: Option<String>,
 	/// Every measure of it, when its count took more than instructions.
 	details: Vec<Measure>,
+	/// What each of its calls processes, as the process that counted it declared.
+	throughput: Option<metrics::Throughput>,
 }
 
 /// What one job measured, or why it failed.
@@ -1007,6 +1017,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 	let mut values = Vec::new();
 	let mut libcs: Vec<(String, Option<String>)> = Vec::new();
 	let mut first: Option<perf::Reading> = None;
+	let mut throughput = None;
 	for (i, pass) in passes.iter().enumerate() {
 		let dir = dir.join(format!("pass-{}", i + 1));
 		std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -1032,6 +1043,15 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 			));
 		}
 		let text = printed(&path)?;
+		let declared = metrics::Throughput::declared(&text).map_err(|err| format!("{label}: {err}"))?;
+		let declared = job.expect.as_ref().and_then(|name| declared.get(name).copied());
+		match &throughput {
+			None => throughput = Some(declared),
+			Some(first) if *first != declared => {
+				return Err(format!("{label} declared another throughput in each pass"));
+			}
+			Some(_) => {}
+		}
 		let mut readings = perf::readings(&text, pass.len()).map_err(|err| format!("{label}: {err}"))?;
 		let reading = match (&job.expect, readings.len()) {
 			(Some(name), 1) if readings[0].name == *name => readings.remove(0),
@@ -1091,6 +1111,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 		watched: true,
 		libc,
 		details,
+		throughput: throughput.flatten(),
 	}])
 }
 
@@ -1129,7 +1150,9 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 			dir.display()
 		));
 	}
-	let threads = perf::threads(&printed(&dir.join("stdout"))?);
+	let stdout = printed(&dir.join("stdout"))?;
+	let threads = perf::threads(&stdout);
+	let declared = metrics::Throughput::declared(&stdout).map_err(|err| format!("{label}: {err}"))?;
 	let mut measured = Vec::new();
 	let mut entries: Vec<_> = std::fs::read_dir(dir)
 		.map_err(|e| format!("cannot read {}: {e}", dir.display()))?
@@ -1155,6 +1178,7 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 		measured.extend(found.into_iter().map(|(name, count)| Found {
 			threaded: threads.get(&name) == Some(&true),
 			watched: threads.contains_key(&name),
+			throughput: declared.get(&name).copied(),
 			name,
 			count,
 			libc: None,
