@@ -466,7 +466,8 @@ thread; one whose harness predates rusage has none of that.
 ### Functions
 
 When a paired benchmark's time changes, its interval leaving out no change, `swole bench <base>`
-says which functions changed it. On the CPUs its times took, it runs each side once more, in a
+compares each side's sampled CPU cycles by function: a threaded benchmark can finish sooner on
+more cycles, so the functions it names are where its cycles moved, not always its time. On the CPUs its times took, it runs each side once more, in a
 timed process of its own, over a quarter second of calls, sampling `cycles:pp`: precise cycles,
 which the kernel takes with AMD's IBS op or Intel's PEBS, every 250,007 cycles, some 20,000
 times a second, each sample at the instruction its cycles end on. It samples each of those CPUs
@@ -476,8 +477,8 @@ the sampling as its clock starts and stops it as the clock stops, so setup, step
 built between calls stay out of a profile as they stay out of a time, and neither the times nor
 the counters share a process with it. swole resolves each sample's instruction pointer against
 the executable or library mapped there, by the symbols and line tables `bench` builds every
-benchmark with (`profile.bench.debug = "limited"` and `profile.bench.strip = "none"`, which leave
-the code it times as it is), and names the
+benchmark with (`debug = "limited"` and `strip = "none"` in `profile.bench`, or the profile
+`--profile` picks, which leave the code it times as it is), and names the
 innermost function inlined there that is not Rust's standard library's, whose generic helpers
 count as the code that called them; a sample in the kernel counts as `[kernel]`. A table under
 the measures prints the three to five functions whose sampled self cycles a call (`~`), on every

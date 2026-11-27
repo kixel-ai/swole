@@ -841,8 +841,9 @@ mod linux {
 			let head = self.word(DATA_HEAD).load(Ordering::Acquire);
 			let mut tail = self.word(DATA_TAIL).load(Ordering::Relaxed);
 			// Without room for another record, the kernel dropped what came next, and says so only
-			// in a record it writes once there is room again, which may never come.
-			if head - tail > (self.size - MOST_RECORD) as u64 {
+			// in a record it writes once there is room again, which may never come. It keeps a
+			// byte of the ring free, so a record fits only in less than the rest.
+			if head - tail >= (self.size - MOST_RECORD) as u64 {
 				samples.filled += 1;
 			}
 			while tail < head {

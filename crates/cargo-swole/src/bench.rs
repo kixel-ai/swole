@@ -525,17 +525,29 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 }
 
 /// `cargo`'s args, having Cargo build each benchmark with the symbols and line tables a profile
-/// names inlined functions by, which leave the code it times as it is, kept whatever a profile it
-/// inherits strips.
+/// names inlined functions by, which leave the code it times as it is, kept whatever the profile
+/// it builds with, `bench` unless `--profile` picks another, or one it inherits strips.
 fn symbols(cargo: &[String]) -> Vec<String> {
+	let mut profile = "bench";
+	let mut args = cargo.iter();
+	while let Some(arg) = args.next() {
+		// Cargo's own args end where the benchmark's begin.
+		if arg == "--" {
+			break;
+		}
+		if arg == "--profile" {
+			profile = args.next().map_or(profile, String::as_str);
+		} else if let Some(name) = arg.strip_prefix("--profile=") {
+			profile = name;
+		}
+	}
 	[
-		"--config",
-		"profile.bench.debug=\"limited\"",
-		"--config",
-		"profile.bench.strip=\"none\"",
+		"--config".to_owned(),
+		format!("profile.{profile}.debug=\"limited\""),
+		"--config".to_owned(),
+		format!("profile.{profile}.strip=\"none\""),
 	]
 	.into_iter()
-	.map(str::to_owned)
 	.chain(cargo.iter().cloned())
 	.collect()
 }
@@ -1528,6 +1540,22 @@ impl Side for Process {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn keeps_symbols_in_the_profile_cargo_builds_with() {
+		let args = |args: &[&str]| symbols(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
+		assert_eq!(args(&[])[1], "profile.bench.debug=\"limited\"");
+		assert_eq!(args(&["--profile", "release"])[3], "profile.release.strip=\"none\"");
+		assert_eq!(
+			args(&["--profile=fast", "-p", "x"])[1],
+			"profile.fast.debug=\"limited\""
+		);
+		// What follows `--` is the benchmark's, not Cargo's.
+		assert_eq!(
+			args(&["--", "--profile", "release"])[1],
+			"profile.bench.debug=\"limited\""
+		);
+	}
 
 	/// A side whose samples take what `nanos` says an iteration takes, given the sample's index,
 	/// and `step` nanoseconds more an iteration untimed, recording each request in a log shared
