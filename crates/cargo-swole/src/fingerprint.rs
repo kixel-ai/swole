@@ -4,7 +4,8 @@
 //! feature, such as glibc's string functions or Rust's runtime detection, counts
 //! differently on another. So does another Valgrind, and glibc's tunables, which can mask
 //! features under the same CPU, and the preload every count runs with, whose code runs inside
-//! what is counted. Each count names the fingerprint of all of them, so counts from two
+//! what is counted, and the cache and branch simulation and the cycle model its estimated
+//! cycles come from. Each count names the fingerprint of all of them, so counts from two
 //! environments never share a series.
 
 use std::process::Command;
@@ -20,6 +21,8 @@ pub struct Fingerprint {
 	pub cpu: String,
 	/// The hash of the library every count preloads, its seed and clock compiled in.
 	pub preload: String,
+	/// The simulated caches and branch predictor, and the cycles estimated from them.
+	pub simulation: String,
 }
 
 impl Fingerprint {
@@ -46,17 +49,19 @@ impl Fingerprint {
 			tunables: std::env::var("GLIBC_TUNABLES").ok(),
 			cpu,
 			preload: crate::preload::hash(),
+			simulation: simulation(),
 		})
 	}
 
 	/// Every input, a line each, but the CPU's, a line a leaf.
 	pub fn describe(&self) -> String {
 		format!(
-			"arch: {}\nvalgrind: {}\nGLIBC_TUNABLES: {}\npreload: {}\ncpu:\n{}",
+			"arch: {}\nvalgrind: {}\nGLIBC_TUNABLES: {}\npreload: {}\nsimulation: {}\ncpu:\n{}",
 			self.arch,
 			self.valgrind,
 			self.tunables.as_deref().unwrap_or("(unset)"),
 			self.preload,
+			self.simulation,
 			self.cpu
 		)
 	}
@@ -72,15 +77,27 @@ impl Fingerprint {
 		}
 		hash.write(&self.cpu);
 		hash.write(&self.preload);
+		hash.write(&self.simulation);
 		format!("{}-{:012x}", self.arch, hash.0 >> 16)
 	}
+}
+
+/// The simulation every count runs under, as one line: Callgrind's options for it, then the
+/// estimated cycles' model.
+fn simulation() -> String {
+	format!(
+		"{}; cycles = {}",
+		crate::callgrind::SIMULATION.join(" "),
+		crate::callgrind::CYCLES
+	)
 }
 
 /// The environment a native measure, quick's count or bench's time, is comparable within: the
 /// CPU's model, how many CPUs swole may run on, and what the host lets swole count, the perf
 /// tier, PMU, and counters its probe found, so a series never mixes two kinds of host or two
 /// sets of counters; the loaded libc and glibc tunables every benchmark inherits, which pick its
-/// string and memory routines; and for quick, the preload, whose code runs inside each count.
+/// string and memory routines; for quick, the preload, whose code runs inside each count; and
+/// for bench, the cpufreq governor it times under.
 #[derive(Clone)]
 pub struct Native {
 	pub arch: &'static str,
@@ -95,6 +112,8 @@ pub struct Native {
 	pub tunables: Option<String>,
 	/// The preload's hash, for a count that runs with it.
 	pub preload: Option<String>,
+	/// The cpufreq governor of the core a bench times on, once it holds one.
+	pub governor: Option<String>,
 }
 
 impl Native {
@@ -110,6 +129,7 @@ impl Native {
 			libc: libc()?,
 			tunables: std::env::var("GLIBC_TUNABLES").ok(),
 			preload: (mode == crate::Mode::Quick).then(crate::preload::hash),
+			governor: None,
 		})
 	}
 
@@ -135,6 +155,9 @@ GLIBC_TUNABLES: {}
 			out.push_str(&format!("libc: {libc}\n"));
 		}
 		out.push_str(&self.host.describe());
+		if let Some(governor) = &self.governor {
+			out.push_str(&format!("governor: {governor}\n"));
+		}
 		if let Some(preload) = &self.preload {
 			out.push_str(&format!(
 				"preload: {preload}
@@ -543,6 +566,7 @@ mod tests {
 			tunables: None,
 			cpu: "00000000.0 0000000d 756e6547 6c65746e 49656e69\n".to_owned(),
 			preload: "0123456789ab".to_owned(),
+			simulation: simulation(),
 		}
 	}
 
@@ -567,7 +591,9 @@ mod tests {
 		cpu.cpu.push('\n');
 		let mut preload = fingerprint();
 		preload.preload = "ba9876543210".to_owned();
-		for changed in [tuned, other, cpu, preload] {
+		let mut simulated = fingerprint();
+		simulated.simulation = simulation().replace("--LL=8388608", "--LL=16777216");
+		for changed in [tuned, other, cpu, preload, simulated] {
 			assert_ne!(changed.label(), base);
 		}
 	}

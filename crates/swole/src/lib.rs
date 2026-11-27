@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 
 /// Marks a function as a benchmark: `#[bench]`, `#[bench(args = [..])]`, `#[bench(setup = f)]`,
-/// with `before = g` or `after = h` steps on setup's output. See the README for what each
-/// passes the function.
+/// with `before = g` or `after = h` steps on setup's output, and `bytes = n` or `items = n` for
+/// what each call processes. See the README for what each passes the function.
 pub use swole_macros::bench;
 
 /// The variable naming the one benchmark a run counts or times, which swole sets on each job.
@@ -20,6 +20,14 @@ const TIME: &str = "SWOLE_TIME";
 
 /// What a run prints after each benchmark, before its name, which swole lists them by.
 const RAN: &str = "swole ran ";
+
+/// What a run prints before `swole ran` for a benchmark that declares what each call processes,
+/// before `bytes` or `items`, how many, and its name.
+const THROUGHPUT: &str = "swole throughput ";
+
+/// What a timed run of a benchmark that times itself prints, with its name, after its throughput,
+/// since a rate over the time it returns is not its calls' wall clock.
+const OWN_TIMER: &str = "swole timer own ";
 
 /// What a timed run prints, alone on a line, before each sample's nanoseconds.
 const SAMPLE: &str = "swole sample ";
@@ -87,12 +95,26 @@ const LIBC: &str = "swole libc ";
 /// What a run swole measures natively prints, alone on a line, to say it counts with counters
 /// every thread inherits when `SWOLE_INHERIT` asks, so swole never asks a harness too old to.
 const INHERITS: &str = "swole inherits";
+/// The variable that, set to `1`, has the one benchmark `SWOLE_BENCH` names call once with swole's
+/// allocation interposer counting over the call, and print what it counted.
+const HEAP: &str = "SWOLE_HEAP";
+
+/// What a count of heap allocations prints before the allocations, their bytes, the most bytes
+/// live at once, and the benchmark's name; or before `bypassed` and the name, when the program's
+/// global allocator never reaches the interposer.
+const ALLOCS: &str = "swole allocs ";
 
 #[cfg(target_os = "linux")]
 mod perf;
 
 #[cfg(all(unix, target_pointer_width = "64"))]
 mod rusage;
+
+#[cfg(unix)]
+mod heap;
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 /// Runs every benchmark the program's `#[bench]` functions declare, or only the one
 /// `SWOLE_BENCH` names, each counted alone under Valgrind and once natively, or timed when
@@ -142,7 +164,24 @@ fn run() -> Result<(), String> {
 	}
 	if timed {
 		let (name, case) = cases.pop_first().expect("one case is left");
-		return serve(&name, (case.build)(), std::io::stdin().lock(), std::io::stdout(), true);
+		let sampler = (case.build)();
+		let throughput = case.throughput.as_ref().and_then(|throughput| {
+			let n = throughput.amount?;
+			let own = if sampler.self_timed() {
+				format!("\n{OWN_TIMER}{name}")
+			} else {
+				String::new()
+			};
+			Some(format!("\n{THROUGHPUT}{} {n} {name}{own}", throughput.unit))
+		});
+		return serve(
+			&name,
+			sampler,
+			throughput.unwrap_or_default(),
+			std::io::stdin().lock(),
+			std::io::stdout(),
+			true,
+		);
 	}
 	let counters = split(COUNTERS)?;
 	let every_thread = match std::env::var_os(INHERIT) {
@@ -160,6 +199,19 @@ fn run() -> Result<(), String> {
 			"{INHERIT} says how {COUNTERS}'s counters count, which it does not set"
 		));
 	}
+	let heap = match std::env::var_os(HEAP) {
+		None => None,
+		Some(value) if value == "1" => Some(hooks()?),
+		Some(value) => return Err(format!("{HEAP} is {}, not 1", value.to_string_lossy())),
+	};
+	if heap.is_some() && (!watched || counters.is_some()) {
+		return Err(format!(
+			"{HEAP} counts the allocations of one benchmark, which {ONLY} names, in a pass of its own, without \
+			 {COUNTERS}"
+		));
+	}
+	// Whether the program's allocations reach the interposer, found once, before any case.
+	let reaches = heap.as_ref().map(Hooks::reaches);
 	if warm.is_some() && counters.is_none() {
 		return Err(format!(
 			"{ITERATIONS} counts with perf counters, which {COUNTERS} has swole open"
@@ -171,7 +223,10 @@ fn run() -> Result<(), String> {
 		// per-call getrusage syscalls when `SWOLE_ITERATIONS` is set.
 		let counting = counters.is_some();
 		let record_usage = counting && warm.is_none();
-		let meter = __private::Meter::new(&name, counters.take(), watched, record_usage)?;
+		let mut meter = __private::Meter::new(&name, counters.take(), watched, record_usage)?;
+		if reaches == Some(true) {
+			meter.heap = heap;
+		}
 		let mut sampler = (case.build)();
 		if warm.is_some() {
 			// Counted as bench times it: after the samples that warm it up, uncounted, one call
@@ -217,12 +272,26 @@ fn run() -> Result<(), String> {
 		if let Some(usage) = watch.usage {
 			record(format_args!("{RUSAGE}{usage}"))?;
 		}
+		if reaches == Some(false) {
+			record(format_args!("{ALLOCS}bypassed {name}"))?;
+		}
+		if let Some(allocs) = watch.allocs {
+			record(format_args!(
+				"{ALLOCS}{} {} {} {name}",
+				allocs.count, allocs.bytes, allocs.peak
+			))?;
+		}
 		if let Some(values) = watch.counted {
 			let values: Vec<String> = values.iter().map(u64::to_string).collect();
 			if warm.is_some() {
 				record(format_args!("{CALLS}{calls} {name}"))?;
 			}
 			record(format_args!("{COUNTED}{} {name}", values.join(" ")))?;
+		}
+		// What each call processes is a measurement's input, not listing noise, so `--quiet` keeps
+		// it. `cases` refused any amount but a positive one.
+		if let Some(__private::Throughput { unit, amount: Some(n) }) = &case.throughput {
+			record(format_args!("{THROUGHPUT}{unit} {n} {name}"))?;
 		}
 		if !quiet {
 			record(format_args!("{RAN}{name}"))?;
@@ -248,6 +317,33 @@ fn open((hardware, software): (usize, usize), every_thread: bool) -> Result<Coun
 	Counters::inherited(hardware, software, every_thread)
 }
 
+/// The allocation interposer's controls, which swole preloaded.
+#[cfg(unix)]
+fn hooks() -> Result<Hooks, String> {
+	Hooks::find()
+}
+
+/// Elsewhere swole preloads no interposer.
+#[cfg(not(unix))]
+fn hooks() -> Result<Hooks, String> {
+	Err(format!("{HEAP}: swole's allocation interposer is Unix's"))
+}
+
+#[cfg(unix)]
+use heap::Hooks;
+
+/// Elsewhere there is no interposer to count with.
+#[cfg(not(unix))]
+#[derive(Clone, Copy)]
+enum Hooks {}
+
+#[cfg(not(unix))]
+impl Hooks {
+	fn reaches(&self) -> bool {
+		match *self {}
+	}
+}
+
 /// Elsewhere swole opens none.
 #[cfg(not(target_os = "linux"))]
 fn open(_: (usize, usize), _: bool) -> Result<Counters, String> {
@@ -261,7 +357,9 @@ use perf::Counters;
 fn started() -> Option<u64> {
 	#[cfg(target_os = "linux")]
 	return perf::started();
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(target_os = "macos")]
+	return macos::started();
+	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 	None
 }
 
@@ -269,7 +367,9 @@ fn started() -> Option<u64> {
 fn threads() -> Result<usize, String> {
 	#[cfg(target_os = "linux")]
 	return perf::threads();
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(target_os = "macos")]
+	return macos::threads();
+	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 	Ok(1)
 }
 
@@ -305,6 +405,8 @@ fn number(key: &str) -> Result<Option<u64>, String> {
 fn serve(
 	name: &str,
 	mut sampler: Box<dyn __private::Sampler>,
+	// What each call processes, a line before the first sample's, or nothing.
+	mut throughput: String,
 	commands: impl BufRead,
 	mut out: impl Write,
 	watch_threads: bool,
@@ -333,6 +435,7 @@ fn serve(
 		};
 		#[cfg(not(all(unix, target_pointer_width = "64")))]
 		let used = "";
+		let throughput = std::mem::take(&mut throughput);
 		let libc_line = if watch_threads && !reported_libc {
 			reported_libc = true;
 			libc()?.map_or_else(String::new, |libc| format!("\n{LIBC}{libc}\n{INHERITS}"))
@@ -352,7 +455,7 @@ fn serve(
 		};
 		// One write, which takes stdout's lock once, so a thread the benchmark left printing
 		// cannot write between the records.
-		write!(out, "{libc_line}{threaded_line}{used}\n{SAMPLE}{nanos}\n")
+		write!(out, "{throughput}{libc_line}{threaded_line}{used}\n{SAMPLE}{nanos}\n")
 			.and_then(|()| out.flush())
 			.map_err(|e| format!("cannot write a sample: {e}"))?;
 	}
@@ -401,6 +504,15 @@ fn cases<'a>(
 			if cases.contains_key(&name) {
 				return Err(format!("two benchmarks are named {name}"));
 			}
+			// A call that processes nothing has no rate, and its measures none to divide by.
+			if let Some(throughput) = &case.throughput
+				&& !throughput.amount.is_some_and(|n| n > 0)
+			{
+				return Err(format!(
+					"{name}: its {} is not a positive count, which each call must process",
+					throughput.unit
+				));
+			}
 			cases.insert(name, case);
 		}
 	}
@@ -442,7 +554,33 @@ pub mod __private {
 	pub struct Case {
 		/// Its argument, shown, when the benchmark declares args.
 		pub(crate) arg: Option<String>,
+		/// What each call processes, when the benchmark declares it.
+		pub(crate) throughput: Option<Throughput>,
 		pub(crate) build: Build,
+	}
+
+	/// What each call of a case processes: `bytes` or `items`, and how many, which swole divides
+	/// its measures by.
+	pub struct Throughput {
+		pub(crate) unit: &'static str,
+		/// How many, or `None` for a number no `u64` holds, such as a negative one.
+		pub(crate) amount: Option<u64>,
+	}
+
+	/// Each call processes `n` bytes.
+	pub fn bytes<N: TryInto<u64>>(n: N) -> Throughput {
+		Throughput {
+			unit: "bytes",
+			amount: n.try_into().ok(),
+		}
+	}
+
+	/// Each call processes `n` items.
+	pub fn items<N: TryInto<u64>>(n: N) -> Throughput {
+		Throughput {
+			unit: "items",
+			amount: n.try_into().ok(),
+		}
 	}
 
 	inventory::collect!(Bench);
@@ -466,6 +604,10 @@ pub mod __private {
 		fn count(&mut self, meter: &Meter, iterations: u64) -> u64;
 		/// Calls the benchmark `iterations` times, returning the nanoseconds its timed part took.
 		fn time(&mut self, iterations: u64) -> u64;
+		/// Whether the benchmark returns its own time, rather than its calls' wall clock.
+		fn self_timed(&self) -> bool {
+			false
+		}
 	}
 
 	/// A deterministic, phase-free subset of `iterations` calls: every call when `iterations <=
@@ -527,6 +669,8 @@ pub mod __private {
 	pub struct Meter {
 		name: CString,
 		counters: Option<crate::Counters>,
+		/// The allocation interposer, when the meter has it count over each call.
+		pub(crate) heap: Option<crate::Hooks>,
 		/// What the case's calls used and whether other threads ran, when swole runs it.
 		watch: Option<RefCell<Watching>>,
 	}
@@ -539,6 +683,11 @@ pub mod __private {
 		pub usage: Option<String>,
 		/// Each perf counter's value, when they count.
 		pub counted: Option<Vec<u64>>,
+		/// What the allocation interposer counted, when it counts.
+		#[cfg(unix)]
+		pub allocs: Option<crate::heap::Counted>,
+		#[cfg(not(unix))]
+		pub allocs: Option<std::convert::Infallible>,
 	}
 
 	/// What a meter has seen so far.
@@ -580,7 +729,12 @@ pub mod __private {
 					error: None,
 				})
 			});
-			Ok(Self { name, counters, watch })
+			Ok(Self {
+				name,
+				counters,
+				heap: None,
+				watch,
+			})
 		}
 
 		/// Zeroes the counts and starts counting.
@@ -595,11 +749,21 @@ pub mod __private {
 			if let Some(counters) = &self.counters {
 				counters.start();
 			}
+			// Last, so nothing the meter does itself, such as listing the process's threads,
+			// counts as the call's.
+			#[cfg(unix)]
+			if let Some(heap) = &self.heap {
+				heap.start();
+			}
 		}
 
 		/// Stops counting and dumps the count under the case's name.
 		#[inline(always)]
 		pub fn stop(&self) {
+			#[cfg(unix)]
+			if let Some(heap) = &self.heap {
+				heap.stop();
+			}
 			#[cfg(target_os = "linux")]
 			if let Some(counters) = &self.counters {
 				counters.stop();
@@ -631,6 +795,7 @@ pub mod __private {
 					threaded: None,
 					usage: None,
 					counted: None,
+					allocs: None,
 				});
 			};
 			let mut watch = watch.into_inner();
@@ -653,10 +818,15 @@ pub mod __private {
 				.transpose()?;
 			#[cfg(not(target_os = "linux"))]
 			let counted = self.counters.map(|counters| match counters {});
+			#[cfg(unix)]
+			let allocs = self.heap.map(|heap| heap.read());
+			#[cfg(not(unix))]
+			let allocs = self.heap.map(|heap| match heap {});
 			Ok(Watched {
 				threaded: Some(watch.threaded),
 				usage,
 				counted,
+				allocs,
 			})
 		}
 	}
@@ -896,6 +1066,10 @@ pub mod __private {
 			let input = (self.make)();
 			nanos((self.call)(input, Iterations(iterations)))
 		}
+
+		fn self_timed(&self) -> bool {
+			true
+		}
 	}
 
 	/// A benchmark that times itself, given the iterations to run, borrowing one input
@@ -916,6 +1090,10 @@ pub mod __private {
 
 		fn time(&mut self, iterations: u64) -> u64 {
 			nanos((self.call)(&mut self.input, Iterations(iterations)))
+		}
+
+		fn self_timed(&self) -> bool {
+			true
 		}
 	}
 
@@ -989,24 +1167,32 @@ pub mod __private {
 		}
 	}
 
-	/// The one case of a benchmark without args, which `build` sets up.
-	pub fn single(build: impl FnOnce() -> Box<dyn Sampler> + 'static) -> Vec<Case> {
+	/// The one case of a benchmark without args, which `build` sets up, each call processing
+	/// `throughput`.
+	pub fn single(throughput: Option<Throughput>, build: impl FnOnce() -> Box<dyn Sampler> + 'static) -> Vec<Case> {
 		vec![Case {
 			arg: None,
+			throughput,
 			build: Box::new(build),
 		}]
 	}
 
 	/// A case per argument among `args`, shown, each moving its argument into the setup `make`
-	/// builds from it. `make`'s body gives the argument the type it runs with.
+	/// builds from it, beside what each of its calls processes. `make`'s body gives the argument
+	/// the type it runs with.
 	pub fn each<A: Display, B: FnOnce() -> Box<dyn Sampler> + 'static>(
 		args: impl IntoIterator<Item = A>,
-		make: impl Fn(A) -> B,
+		make: impl Fn(A) -> (Option<Throughput>, B),
 	) -> Vec<Case> {
 		args.into_iter()
-			.map(|arg| Case {
-				arg: Some(arg.to_string()),
-				build: Box::new(make(arg)),
+			.map(|arg| {
+				let shown = arg.to_string();
+				let (throughput, build) = make(arg);
+				Case {
+					arg: Some(shown),
+					throughput,
+					build: Box::new(build),
+				}
 			})
 			.collect()
 	}
@@ -1074,7 +1260,7 @@ mod tests {
 			file: "benches/a.rs",
 			module,
 			name,
-			cases: || single(nothing),
+			cases: || single(None, nothing),
 		}
 	}
 
@@ -1087,7 +1273,7 @@ mod tests {
 				file: "benches/a.rs",
 				module: "a",
 				name: "sized",
-				cases: || each(["16", "1024"], |_| nothing),
+				cases: || each(["16", "1024"], |_| (None, nothing)),
 			},
 		];
 		let cases = cases(&benches).unwrap();
@@ -1109,7 +1295,7 @@ mod tests {
 			file: "benches/a.rs",
 			module: "a",
 			name: "f",
-			cases: || each([1, 1], |_| nothing),
+			cases: || each([1, 1], |_| (None, nothing)),
 		}];
 		assert_eq!(
 			cases(&twice).err().unwrap(),
@@ -1119,16 +1305,27 @@ mod tests {
 			file: "benches/a.rs",
 			module: "a",
 			name: "f",
-			cases: || each(["a\nb"], |_| nothing),
+			cases: || each(["a\nb"], |_| (None, nothing)),
 		}];
 		assert!(cases(&lines).err().unwrap().contains("control character"));
 		let empty = [Bench {
 			file: "benches/a.rs",
 			module: "a",
 			name: "f",
-			cases: || each(Vec::<u8>::new(), |_| nothing),
+			cases: || each(Vec::<u8>::new(), |_| (None, nothing)),
 		}];
 		assert_eq!(cases(&empty).err().unwrap(), "benches/a.rs::f has no args");
+		// A count each call processes must be positive and fit a u64.
+		let nothing_processed = [Bench {
+			file: "benches/a.rs",
+			module: "a",
+			name: "f",
+			cases: || each([0, -1, 2], |n| (Some(__private::bytes(n)), nothing)),
+		}];
+		assert_eq!(
+			cases(&nothing_processed).err().unwrap(),
+			"benches/a.rs::f[0]: its bytes is not a positive count, which each call must process"
+		);
 		assert_eq!(cases(&[]).err().unwrap(), "no function is marked #[bench]");
 	}
 
@@ -1287,14 +1484,24 @@ mod tests {
 	}
 
 	#[test]
+	fn only_a_benchmark_that_times_itself_says_so() {
+		assert!(!nothing().self_timed());
+		assert!(kept_timed((), |_: &mut (), _: Iterations| Duration::ZERO).self_timed());
+	}
+
+	#[test]
 	fn serves_a_sample_for_each_line() {
 		let mut out = Vec::new();
 		let sampler = kept_timed((), |_: &mut (), iterations: Iterations| {
 			Duration::from_nanos(10 * iterations.get())
 		});
-		serve("a", sampler, "1\n4\n".as_bytes(), &mut out, false).unwrap();
+		let throughput = format!("\n{THROUGHPUT}bytes 8 a");
+		serve("a", sampler, throughput, "1\n4\n".as_bytes(), &mut out, false).unwrap();
 		let out = String::from_utf8(out).unwrap();
-		let lines: Vec<&str> = out.lines().filter(|line| !line.is_empty()).collect();
+		// What each call processes comes once, before the first sample.
+		let rest = out.strip_prefix("\nswole throughput bytes 8 a\n").unwrap();
+		assert!(!rest.contains(THROUGHPUT), "{out}");
+		let lines: Vec<&str> = rest.lines().filter(|line| !line.is_empty()).collect();
 		#[cfg(all(unix, target_pointer_width = "64"))]
 		{
 			assert_eq!(lines.len(), 4, "{out}");
@@ -1310,7 +1517,7 @@ mod tests {
 		#[cfg(not(all(unix, target_pointer_width = "64")))]
 		assert_eq!(lines, ["swole sample 10", "swole sample 40"]);
 		for bad in ["0\n", "x\n", " 1\n"] {
-			let err = serve("a", nothing(), bad.as_bytes(), Vec::new(), false).unwrap_err();
+			let err = serve("a", nothing(), String::new(), bad.as_bytes(), Vec::new(), false).unwrap_err();
 			assert!(err.contains("cannot sample"), "{bad:?}: {err}");
 		}
 	}

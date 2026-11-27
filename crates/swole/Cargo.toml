@@ -16,5 +16,15 @@ swole-macros = { path = "../swole-macros" }
 name = "fixture"
 harness = false
 
+# Allocations counted beside a global allocator that counts them too.
+[[bench]]
+name = "allocs"
+harness = false
+
+# A global allocator that never reaches malloc.
+[[bench]]
+name = "bypass"
+harness = false
+
 [lints]
 workspace = true
