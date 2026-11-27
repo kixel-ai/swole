@@ -870,9 +870,9 @@ fn compares_a_base_with_every_change_in_the_working_tree_from_one_directory() {
 	};
 	// Both sides count from one working directory, whose path is in the count. A program's
 	// threads swole cannot see, so each count is sampled, and compares by its spread.
-	assert_eq!(change("cwd"), "~+0.00% (+0.00% to +0.00%)");
+	assert_eq!(change("cwd"), "~+0.00% (within spread)");
 	let a = change("a");
-	assert!(a.starts_with("~+") && !a.starts_with("~+0.00%"), "{table}");
+	assert!(a.starts_with('+') && a.ends_with("(beyond spread)"), "{table}");
 	assert_eq!(change("b"), "added");
 	assert_eq!(change("c"), "added");
 	assert_eq!(change("d"), "removed");

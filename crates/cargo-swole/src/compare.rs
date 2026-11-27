@@ -820,7 +820,7 @@ mod tests {
 		assert_eq!(
 			table(&before, &after).unwrap(),
 			"| benchmark | base | head | change |\n|---|---:|---:|---:|\n\
-			 | a | 200 | ~150 (140 to 160) | ~-25.00% (-30.00% to -20.00%) |\n| gone | 5 | - | removed |\n\
+			 | a | 200 | ~150 (140 to 160) | ~-25.00% |\n| gone | 5 | - | removed |\n\
 			 | new | - | 7 | added |\n"
 		);
 	}
