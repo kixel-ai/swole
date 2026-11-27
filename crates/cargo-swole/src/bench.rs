@@ -252,6 +252,11 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 							watched = false;
 							Vec::new()
 						}
+						Counted::TooOld => {
+							threaded.insert(name.clone());
+							watched = false;
+							Vec::new()
+						}
 					}
 				}
 				_ => {
@@ -342,6 +347,8 @@ enum Counted {
 	Measures { measures: Vec<Measure>, every_thread: bool },
 	/// The job's harness is too old to count, or to say whether another thread ran.
 	Unwatched,
+	/// Another thread ran beside a call, and the job's harness is too old to count every thread.
+	TooOld,
 }
 
 /// Counts `job`'s benchmark with each of `perf`'s passes over `iterations` calls, under the
@@ -364,10 +371,10 @@ fn count(
 				return Ok((Counted::Measures { measures, every_thread }, libc));
 			}
 			Passes::Unwatched => return Ok((Counted::Unwatched, None)),
-			Passes::Threaded { inherits: true } => {}
-			Passes::Threaded { inherits: false } => {
+			Passes::Threaded { inherits: true, .. } => {}
+			Passes::Threaded { inherits: false, libc } => {
 				eprintln!("{}", too_old(&job.label));
-				return Ok((Counted::Unwatched, None));
+				return Ok((Counted::TooOld, libc));
 			}
 		}
 	}
@@ -418,8 +425,8 @@ enum Passes {
 	/// Each counter's share of a call, and the benchmark's libc.
 	Measures(Vec<Measure>, Option<String>),
 	/// Another thread ran beside a call, whose work counters of the calling thread miss, and
-	/// whether the harness can count with counters every thread inherits.
-	Threaded { inherits: bool },
+	/// whether the harness can count with counters every thread inherits, and the benchmark's libc.
+	Threaded { inherits: bool, libc: Option<String> },
 	/// The job's harness is too old to count.
 	Unwatched,
 }
@@ -485,16 +492,21 @@ fn passes(
 				return Ok(Passes::Unwatched);
 			}
 			[reading] => {
-				if reading.threaded && !every_thread {
-					let inherits = reading.inherits;
-					return Ok(Passes::Threaded { inherits });
-				}
 				let verified = reading
 					.libc
 					.as_deref()
 					.map(crate::fingerprint::validate_libc_record)
 					.transpose()?;
 				libcs.push((job.label.clone(), verified));
+				if reading.threaded && !every_thread {
+					// The passes so far miss the other thread's work, so only their libc is kept.
+					let libc = crate::fingerprint::require_single_libc(
+						libcs.iter().map(|(label, libc)| (label.as_str(), libc.as_deref())),
+						cfg!(target_os = "linux"),
+					)?;
+					let inherits = reading.inherits;
+					return Ok(Passes::Threaded { inherits, libc });
+				}
 				// Over the calls the harness counted (stratified over the sample's iterations), or
 				// `iterations` for a harness too old to emit `swole calls`.
 				values.push((reading.values.clone(), reading.calls.unwrap_or(iterations)));
