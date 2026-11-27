@@ -98,8 +98,14 @@ impl Reservation {
 			let file = open(&self.leases, core)?;
 			if lock(&file).map_err(|e| format!("cannot lease core {}: {e}", core[0]))? {
 				// A killed run's changed governor would otherwise outlive this run on a core it
-				// never times on, since a run leases such a core last.
-				recover(&self.sys, core, &self.leases.join(format!("core{}.restore", core[0])))?;
+				// never times on, since a run leases such a core last. A core whose journal this run
+				// cannot replay, such as one naming a policy its sysfs view lacks, only drops out of
+				// the spread, since timing never needs it; its journal stays for a later run.
+				let journal = self.leases.join(format!("core{}.restore", core[0]));
+				if let Err(err) = recover(&self.sys, core, &journal) {
+					eprintln!("swole: leaving core {} out of the spread: {err}", core[0]);
+					continue;
+				}
 				spread.cpus.extend(core);
 				spread.leases.push(file);
 			}
@@ -810,6 +816,25 @@ mod tests {
 		assert_eq!(next.spread().unwrap().cpus, [0, 1]);
 		assert_eq!(governor(&sys, 0), "powersave");
 		assert!(!leases.join("core0.restore").exists());
+	}
+
+	#[test]
+	fn a_spread_skips_a_core_it_cannot_recover() {
+		let _arms = ARMS.lock().unwrap();
+		let dir = scratch("spread-skip");
+		let sys = sys(&dir, 2, 1, "powersave");
+		let leases = dir.join("leases");
+		let next = reserve_in(&sys, &leases, &[0, 1]).unwrap();
+		assert_eq!(next.cpu, 1);
+		// A journal naming a policy this run's sysfs view lacks.
+		let journal = leases.join("core0.restore");
+		std::fs::write(
+			&journal,
+			"/sys/devices/system/cpu/cpufreq/policy9/scaling_governor\tpowersave\n",
+		)
+		.unwrap();
+		assert_eq!(next.spread().unwrap().cpus, [1]);
+		assert!(journal.exists());
 	}
 
 	#[test]
