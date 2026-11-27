@@ -615,18 +615,12 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 	let all: Vec<&Job> = jobs.iter().collect();
 	let first = run(&all, &work.join("1"), &preload, parallel, counter, false)?;
 	let mut counts = Counts::none(counter);
-	if let CounterKind::Perf { native, .. } = &counter.kind
-		&& let Some(bench_libc) = fingerprint::require_single_libc(
-			first
-				.iter()
-				.flatten()
-				.map(|found| (found.name.as_str(), found.libc.as_deref())),
-			true,
-		)? {
-		let resolved = native.with_libc(Some(bench_libc));
-		counts.fingerprint = resolved.label();
-		counts.host = resolved.describe();
-	}
+	// Each count's benchmark and loaded libc, every round's, which one fingerprint must cover.
+	let mut libcs: Vec<(String, Option<String>)> = first
+		.iter()
+		.flatten()
+		.map(|found| (found.name.clone(), found.libc.clone()))
+		.collect();
 	// Each benchmark's samples: its count, and its details.
 	let mut samples: BTreeMap<String, Vec<(u64, Vec<Measure>)>> = BTreeMap::new();
 	for found in first.iter().flatten() {
@@ -685,6 +679,11 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 				));
 			}
 		}
+		libcs.extend(
+			more.iter()
+				.flatten()
+				.map(|found| (found.name.clone(), found.libc.clone())),
+		);
 		for found in more.iter().flatten() {
 			if found.threaded {
 				counts.threaded.insert(found.name.clone());
@@ -694,6 +693,14 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 				.or_default()
 				.push((found.count, found.details.clone()));
 		}
+	}
+	if let CounterKind::Perf { native, .. } = &counter.kind
+		&& let Some(bench_libc) =
+			fingerprint::require_single_libc(libcs.iter().map(|(name, libc)| (name.as_str(), libc.as_deref())), true)?
+	{
+		let resolved = native.with_libc(Some(bench_libc));
+		counts.fingerprint = resolved.label();
+		counts.host = resolved.describe();
 	}
 	std::fs::remove_dir_all(&work).map_err(|e| format!("cannot remove {}: {e}", work.display()))?;
 	for (name, taken) in samples {

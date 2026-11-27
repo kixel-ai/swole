@@ -257,7 +257,8 @@ pub fn table(counts: &Counts) -> String {
 pub const SAMPLED: &str = "~";
 
 /// A change from `base` to `head` as a table shows it: exact, or between two sampled values, the
-/// change from their median to median, and the least and most their spreads allow, marked sampled.
+/// change from their median to median, and the least and most their spreads allow, marked sampled,
+/// in absolute terms where a base sample of zero leaves no percentage. An exact base is nonzero.
 pub fn change(
 	(base, base_spread): (f64, Option<(f64, f64)>),
 	(head, head_spread): (f64, Option<(f64, f64)>),
@@ -269,7 +270,20 @@ pub fn change(
 	let (base_least, base_most) = base_spread.unwrap_or((base, base));
 	let (head_least, head_most) = head_spread.unwrap_or((head, head));
 	if base_least <= 0.0 {
-		return format!("{SAMPLED}{}", percent(base, head));
+		let delta = |base: f64, head: f64| {
+			let delta = head - base;
+			if delta.fract() == 0.0 {
+				format!("{delta:+}")
+			} else {
+				format!("{delta:+.3}")
+			}
+		};
+		return format!(
+			"{SAMPLED}{} ({} to {})",
+			delta(base, head),
+			delta(base_most, head_least),
+			delta(base_least, head_most)
+		);
 	}
 	format!(
 		"{SAMPLED}{} ({} to {})",
@@ -334,7 +348,8 @@ pub fn details(before: Option<&BTreeMap<String, Vec<Measure>>>, after: &BTreeMap
 			match base {
 				Some(base) => {
 					let change = match (find(base), find(head)) {
-						(Some(b), Some(a)) if b.0 != 0.0 => change(b, a),
+						// A zero base leaves no percentage unless a spread gives an absolute range.
+						(Some(b), Some(a)) if b.0 != 0.0 || b.1.is_some() || a.1.is_some() => change(b, a),
 						(Some(_), Some(_)) => String::new(),
 						(None, Some(_)) => "added".to_owned(),
 						(Some(_), None) => "removed".to_owned(),
@@ -420,6 +435,12 @@ mod tests {
 			change((100.0, Some((90.0, 110.0))), (150.0, None)),
 			"~+50.00% (+36.36% to +66.67%)"
 		);
+		// A base sample of zero leaves no percentage, so the change and its range are absolute.
+		assert_eq!(
+			change((1.0, Some((0.0, 2.0))), (2.0, Some((1.0, 3.0)))),
+			"~+1 (-1 to +3)"
+		);
+		assert_eq!(change((0.0, Some((0.0, 0.5))), (2.0, None)), "~+2 (+1.500 to +2)");
 		let base = BTreeMap::from([(
 			"a".to_owned(),
 			vec![Measure {
