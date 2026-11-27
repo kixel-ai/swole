@@ -306,6 +306,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 						padded: false,
 						cpus: cpus.as_deref().or(perf.map(|perf| &perf.pmu.cpus[..])),
 					},
+					declared[i],
 					&dir.join(side.name()),
 				)? {
 				measures.extend(allocs);

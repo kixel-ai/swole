@@ -973,7 +973,7 @@ fn run(
 									CounterKind::Valgrind => None,
 								},
 							};
-							match heap::measure(job, pass, &dir) {
+							match heap::measure(job, pass, found.throughput, &dir) {
 								Ok(allocs) => found.allocs = Some(allocs),
 								Err(err) => result = Err(err),
 							}
