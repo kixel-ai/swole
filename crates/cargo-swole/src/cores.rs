@@ -8,13 +8,14 @@
 //! off, which the run says.
 //!
 //! Where swole may write the core's cpufreq policy, it switches it to the `performance` governor
-//! for the run, recording what it changed in the lease's file first, and restores it on exit or on
-//! SIGINT, SIGTERM, or SIGHUP; the next run to lease the core restores what a run killed outright
-//! left behind.
+//! for the run, recording what it changed first in a journal beside the lease that only the run's
+//! user may write, and restores it on exit or on SIGINT, SIGTERM, or SIGHUP; the next run of that
+//! user, or of root, to lease the core restores what a run killed outright left behind.
 
 use std::fs::File;
-use std::io::{Read, Seek, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::perf;
 
@@ -46,6 +47,7 @@ pub struct Reservation {
 	governor: Governor,
 	/// What to write back on drop, before the lease's lock is released.
 	restore: Option<Box<Restore>>,
+	#[expect(dead_code, reason = "held for its lock, released after the restore")]
 	lease: File,
 }
 
@@ -90,7 +92,7 @@ impl Reservation {
 		};
 		for core in self.cores.iter().filter(|core| **core != self.core) {
 			let file = open(&self.leases, core)?;
-			if lock(&file, F_OFD_SETLK).map_err(|e| format!("cannot lease core {}: {e}", core[0]))? {
+			if lock(&file).map_err(|e| format!("cannot lease core {}: {e}", core[0]))? {
 				spread.cpus.extend(core);
 				spread.leases.push(file);
 			}
@@ -123,7 +125,7 @@ impl Drop for Reservation {
 	fn drop(&mut self) {
 		if let Some(restore) = self.restore.take() {
 			signals::disarm();
-			if let Err(err) = restore.apply(&mut self.lease) {
+			if let Err(err) = restore.apply() {
 				eprintln!("swole: {err}");
 			}
 		}
@@ -160,8 +162,9 @@ fn performance() -> Result<Vec<usize>, String> {
 /// [`reserve`] with the kernel's CPUs described under `sys` and leases in `leases`.
 fn reserve_in(sys: &Path, leases: &Path, candidates: &[usize]) -> Result<Reservation, String> {
 	let cores = cores(sys, candidates)?;
-	let (core, mut lease) = lease(leases, &cores)?;
-	recover(sys, &core, &mut lease)?;
+	let (core, lease) = lease(leases, &cores)?;
+	let journal = leases.join(format!("core{}.restore", core[0]));
+	recover(sys, &core, &journal)?;
 	let cpu = *core
 		.iter()
 		.find(|cpu| candidates.contains(cpu))
@@ -170,7 +173,7 @@ fn reserve_in(sys: &Path, leases: &Path, candidates: &[usize]) -> Result<Reserva
 		Ok(list) => perf::cpus(&list)?.contains(&cpu),
 		Err(_) => false,
 	};
-	let (governor, restore) = tune(sys, &core, &mut lease)?;
+	let (governor, restore) = tune(sys, &core, &journal)?;
 	Ok(Reservation {
 		cpu,
 		core,
@@ -206,33 +209,31 @@ fn cores(sys: &Path, candidates: &[usize]) -> Result<Vec<Vec<usize>>, String> {
 	Ok(cores)
 }
 
-/// Leases the first of `cores` no other swole run holds, or waits for the first when they hold
-/// every one: the core, and its lease's file, locked.
+/// Leases the first of `cores` no other swole run holds, trying them all again until one is free
+/// when other runs hold every one: the core, and its lease's file, locked.
 fn lease(leases: &Path, cores: &[Vec<usize>]) -> Result<(Vec<usize>, File), String> {
 	shared(leases)?;
-	for core in cores {
-		let file = open(leases, core)?;
-		if lock(&file, F_OFD_SETLK).map_err(|e| format!("cannot lease core {}: {e}", core[0]))? {
-			return Ok((core.clone(), file));
+	let mut pause = Duration::from_millis(10);
+	loop {
+		for core in cores {
+			let file = open(leases, core)?;
+			if lock(&file).map_err(|e| format!("cannot lease core {}: {e}", core[0]))? {
+				return Ok((core.clone(), file));
+			}
 		}
+		// No lock waits on any one of several, and a run may free any core, even one another
+		// run's threaded benchmark holds only for a while.
+		if pause == Duration::from_millis(10) {
+			eprintln!("swole: other swole runs lease every core swole may time on, so waiting for one");
+		}
+		std::thread::sleep(pause);
+		pause = (pause * 2).min(Duration::from_secs(1));
 	}
-	let core = &cores[0];
-	eprintln!(
-		"swole: other swole runs lease every core swole may time on, so waiting for core {}",
-		core[0]
-	);
-	let file = open(leases, core)?;
-	lock(&file, F_OFD_SETLKW).map_err(|e| format!("cannot lease core {}: {e}", core[0]))?;
-	Ok((core.clone(), file))
 }
 
-const F_OFD_SETLK: i32 = 37;
-const F_OFD_SETLKW: i32 = 38;
-
-/// Takes, or with [`F_OFD_SETLKW`] waits for, the write lock of all of `file` for its open file
-/// description, which every descriptor of it shares and the kernel releases with the last:
-/// whether it was free.
-fn lock(file: &File, command: i32) -> std::io::Result<bool> {
+/// Takes the write lock of all of `file` for its open file description, which every descriptor of
+/// it shares and the kernel releases with the last, unless another holds it: whether it was free.
+fn lock(file: &File) -> std::io::Result<bool> {
 	/// `struct flock`, which an open file description's lock takes with `l_pid` 0.
 	#[repr(C)]
 	struct Flock {
@@ -242,6 +243,7 @@ fn lock(file: &File, command: i32) -> std::io::Result<bool> {
 		l_len: i64,
 		l_pid: i32,
 	}
+	const F_OFD_SETLK: i32 = 37;
 	const F_WRLCK: i16 = 1;
 	const EAGAIN: i32 = 11;
 	const EACCES: i32 = 13;
@@ -258,13 +260,19 @@ fn lock(file: &File, command: i32) -> std::io::Result<bool> {
 			l_pid: 0,
 		};
 		// SAFETY: a descriptor of `file`, and a `struct flock` the call reads and may write.
-		let result = unsafe { fcntl(std::os::fd::AsRawFd::as_raw_fd(file), command, &mut flock as *mut Flock) };
+		let result = unsafe {
+			fcntl(
+				std::os::fd::AsRawFd::as_raw_fd(file),
+				F_OFD_SETLK,
+				&mut flock as *mut Flock,
+			)
+		};
 		if result == 0 {
 			return Ok(true);
 		}
 		let err = std::io::Error::last_os_error();
 		match err.raw_os_error() {
-			Some(EAGAIN | EACCES) if command == F_OFD_SETLK => return Ok(false),
+			Some(EAGAIN | EACCES) => return Ok(false),
 			Some(EINTR) => {}
 			_ => return Err(err),
 		}
@@ -288,8 +296,7 @@ fn shared(dir: &Path) -> Result<(), String> {
 	}
 }
 
-/// Opens the lease's file of `core`, named by its first thread, which every user may write, since
-/// a run of any user records there what to restore.
+/// Opens the lease's file of `core`, named by its first thread, which every user may lock.
 fn open(dir: &Path, core: &[usize]) -> Result<File, String> {
 	use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 	let path = dir.join(format!("core{}", core[0]));
@@ -320,15 +327,15 @@ fn open(dir: &Path, core: &[usize]) -> Result<File, String> {
 	}
 }
 
-/// What swole changed in cpufreq policies, each file and what it held, and the lease's file
-/// recording them, which a signal handler restores through.
+/// What swole changed in cpufreq policies, each file and what it held, and the journal recording
+/// them, which a signal handler restores through.
 struct Restore {
 	entries: Vec<(std::ffi::CString, Vec<u8>)>,
-	lease: i32,
+	journal: std::ffi::CString,
 }
 
 impl Restore {
-	/// The record a lease's file holds: a line a file, its path and what it held.
+	/// The record a journal holds: a line a file, its path and what it held.
 	fn record(&self) -> String {
 		self.entries
 			.iter()
@@ -342,8 +349,8 @@ impl Restore {
 			.collect()
 	}
 
-	/// Writes each file back, then empties the record, which stays for the next run on failure.
-	fn apply(&self, lease: &mut File) -> Result<(), String> {
+	/// Writes each file back, then removes the journal, which stays for the next run on failure.
+	fn apply(&self) -> Result<(), String> {
 		for (path, value) in &self.entries {
 			let path = Path::new(path.to_str().expect("a sysfs path is UTF-8"));
 			std::fs::write(path, value).map_err(|e| {
@@ -354,31 +361,55 @@ impl Restore {
 				)
 			})?;
 		}
-		lease
-			.set_len(0)
-			.map_err(|e| format!("cannot clear a core's lease: {e}"))
+		let journal = Path::new(self.journal.to_str().expect("a journal's path is UTF-8"));
+		std::fs::remove_file(journal).map_err(|e| format!("cannot remove {}: {e}", journal.display()))
 	}
 }
 
-/// Restores what the record in `lease` says a run killed outright left on `core`, before this run
-/// reads the policy as the host's.
-fn recover(sys: &Path, core: &[usize], lease: &mut File) -> Result<(), String> {
-	let mut record = String::new();
-	lease
-		.read_to_string(&mut record)
-		.map_err(|e| format!("cannot read a core's lease: {e}"))?;
-	if record.is_empty() {
+/// Restores what `journal` says a run killed outright left on `core`, before this run reads the
+/// policy as the host's.
+fn recover(sys: &Path, core: &[usize], journal: &Path) -> Result<(), String> {
+	use std::os::unix::fs::MetadataExt;
+	unsafe extern "C" {
+		fn geteuid() -> u32;
+	}
+	let read = |e: std::io::Error| format!("cannot read {}: {e}", journal.display());
+	match std::fs::symlink_metadata(journal) {
+		Ok(meta) if meta.is_file() => {}
+		Ok(_) => return Err(format!("{} is no journal swole wrote", journal.display())),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+		Err(e) => return Err(read(e)),
+	}
+	let mut file = File::open(journal).map_err(read)?;
+	// Only the run's own user, or root, may have written the journal, so no user swole may not
+	// change cpufreq for steers what it writes there.
+	// SAFETY: takes no arguments.
+	let trusted = [0, unsafe { geteuid() }].contains(&file.metadata().map_err(read)?.uid());
+	if !trusted {
+		eprintln!(
+			"swole: another user's swole run was killed with core {}'s governor changed, which its journal {} \
+			 records and that user's next run restores",
+			core[0],
+			journal.display()
+		);
 		return Ok(());
 	}
-	let policies = policies(sys, core)?;
+	let mut record = String::new();
+	std::io::Read::read_to_string(&mut file, &mut record).map_err(read)?;
+	// A policy shared with another core is one tuning never changes, as another run may time there.
+	let mut policies = Vec::new();
+	for policy in policies_of(sys, core)? {
+		let related = words(&std::fs::read_to_string(policy.join("related_cpus")).map_err(read)?)?;
+		if related.iter().all(|cpu| core.contains(cpu)) {
+			policies.push(policy);
+		}
+	}
 	let mut entries = Vec::new();
 	for line in record.lines() {
 		let (path, value) = line
 			.split_once('\t')
-			.ok_or_else(|| format!("a core's lease records {line:?}, no file and value"))?;
+			.ok_or_else(|| format!("{} records {line:?}, no file and value", journal.display()))?;
 		let path = Path::new(path);
-		// Any user may write a lease, so it restores only a tuned file of the leased core's own
-		// policies, to a word.
 		let tuned = path
 			.parent()
 			.is_some_and(|policy| policies.iter().any(|own| own == policy))
@@ -388,28 +419,35 @@ fn recover(sys: &Path, core: &[usize], lease: &mut File) -> Result<(), String> {
 				.is_some_and(|name| TUNED.contains(&name));
 		let word = !value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
 		if !tuned || !word {
-			return Err(format!("a core's lease records {line:?}, which swole never changes"));
+			return Err(format!(
+				"{} records {line:?}, which swole never changes",
+				journal.display()
+			));
 		}
 		entries.push((cstring(path), value.as_bytes().to_vec()));
 	}
+	let restore = Restore {
+		entries,
+		journal: cstring(journal),
+	};
 	// One swole may write a policy another may not; the run then times under what it finds.
-	match (Restore { entries, lease: -1 }).apply(lease) {
+	match restore.apply() {
 		Ok(()) => eprintln!("swole: restored the cpufreq policy a killed swole run left changed"),
 		Err(err) => eprintln!("swole: a killed swole run left a cpufreq policy changed, and {err}"),
 	}
 	Ok(())
 }
 
-/// Sets `performance` on every cpufreq policy of `core`, recording in `lease` what each held
+/// Sets `performance` on every cpufreq policy of `core`, recording in `journal` what each held
 /// first, where every one is the core's alone and swole may write it: the governor the run times
 /// under, and what to restore.
-fn tune(sys: &Path, core: &[usize], lease: &mut File) -> Result<(Governor, Option<Box<Restore>>), String> {
+fn tune(sys: &Path, core: &[usize], journal: &Path) -> Result<(Governor, Option<Box<Restore>>), String> {
 	let read = |path: &Path| {
 		std::fs::read_to_string(path)
 			.map(|text| text.trim().to_owned())
 			.map_err(|e| format!("cannot read {}: {e}", path.display()))
 	};
-	let policies = policies(sys, core)?;
+	let policies = policies_of(sys, core)?;
 	let Some(first) = policies.first() else {
 		return Ok((Governor::Absent, None));
 	};
@@ -462,23 +500,32 @@ fn tune(sys: &Path, core: &[usize], lease: &mut File) -> Result<(Governor, Optio
 	}
 	let restore = Box::new(Restore {
 		entries,
-		lease: std::os::fd::AsRawFd::as_raw_fd(lease),
+		journal: cstring(journal),
 	});
-	// Recorded before anything changes, so a run killed at any point leaves what to restore.
-	lease
-		.set_len(0)
-		.and_then(|()| lease.rewind())
-		.and_then(|()| lease.write_all(restore.record().as_bytes()))
-		.map_err(|e| format!("cannot record a core's governor in its lease: {e}"))?;
+	// Recorded before anything changes, so a run killed at any point leaves what to restore, in a
+	// file of the run's user alone, which other users of the shared directory cannot replace.
+	let created = {
+		use std::os::unix::fs::OpenOptionsExt;
+		File::options().write(true).create_new(true).mode(0o644).open(journal)
+	};
+	let mut file = match created {
+		Ok(file) => file,
+		Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+			return kept(format!(
+				"since another user's killed swole run left its governor changed, as {} records",
+				journal.display()
+			));
+		}
+		Err(e) => return Err(format!("cannot create {}: {e}", journal.display())),
+	};
+	file.write_all(restore.record().as_bytes())
+		.map_err(|e| format!("cannot write {}: {e}", journal.display()))?;
 	signals::arm(&restore);
 	for policy in &policies {
 		let path = policy.join(TUNED[0]);
 		if let Err(e) = std::fs::write(&path, PERFORMANCE) {
 			signals::disarm();
-			let undone = restore
-				.apply(lease)
-				.err()
-				.map_or(String::new(), |err| format!("; {err}"));
+			let undone = restore.apply().err().map_or(String::new(), |err| format!("; {err}"));
 			return Err(format!("cannot write {}: {e}{undone}", path.display()));
 		}
 	}
@@ -486,7 +533,7 @@ fn tune(sys: &Path, core: &[usize], lease: &mut File) -> Result<(Governor, Optio
 }
 
 /// The cpufreq policies of `core`'s CPUs, each its directory once, none for a CPU without one.
-fn policies(sys: &Path, core: &[usize]) -> Result<Vec<PathBuf>, String> {
+fn policies_of(sys: &Path, core: &[usize]) -> Result<Vec<PathBuf>, String> {
 	let mut policies: Vec<PathBuf> = Vec::new();
 	for cpu in core {
 		let dir = sys.join(format!("cpu{cpu}/cpufreq"));
@@ -536,7 +583,7 @@ mod signals {
 		fn open(path: *const std::ffi::c_char, flags: i32, ...) -> i32;
 		fn write(fd: i32, buf: *const u8, count: usize) -> isize;
 		fn close(fd: i32) -> i32;
-		fn ftruncate(fd: i32, length: i64) -> i32;
+		fn unlink(path: *const std::ffi::c_char) -> i32;
 	}
 
 	/// Has the handler restore `restore`, which outlives the handler's use by [`disarm`] first.
@@ -557,7 +604,7 @@ mod signals {
 		ARMED.store(std::ptr::null_mut(), Ordering::SeqCst);
 	}
 
-	/// Writes back each file, empties the lease's record if all took, then dies of `signum` as
+	/// Writes back each file, removes the journal if all took, then dies of `signum` as
 	/// it would have.
 	extern "C" fn handle(signum: i32) {
 		let restore = ARMED.swap(std::ptr::null_mut(), Ordering::SeqCst);
@@ -575,8 +622,8 @@ mod signals {
 				}
 			}
 			if restored {
-				// SAFETY: the lease's descriptor, open while the restore is alive.
-				unsafe { ftruncate(restore.lease, 0) };
+				// SAFETY: a NUL-terminated path.
+				unsafe { unlink(restore.journal.as_ptr()) };
 			}
 		}
 		// SAFETY: restores the default action, which the raised signal then takes on return.
@@ -653,7 +700,7 @@ mod tests {
 		let spread = first.spread().unwrap();
 		assert_eq!(spread.cpus, all);
 		// The spread holds the other core until it drops.
-		assert!(!lock(&open(&leases, &[0, 2]).unwrap(), F_OFD_SETLK).unwrap());
+		assert!(!lock(&open(&leases, &[0, 2]).unwrap()).unwrap());
 		drop(spread);
 		let second = reserve_in(&sys, &leases, &all).unwrap();
 		assert_eq!((first.cpu, &first.core), (1, &vec![1, 3]));
@@ -681,14 +728,14 @@ mod tests {
 			(PERFORMANCE.into(), PERFORMANCE.into())
 		);
 		assert_eq!(governor(&sys, 0), "powersave");
-		let record = std::fs::read_to_string(leases.join("core1")).unwrap();
+		let record = std::fs::read_to_string(leases.join("core1.restore")).unwrap();
 		assert_eq!(record.lines().count(), 4, "{record}");
 		drop(reservation);
 		assert_eq!(
 			(governor(&sys, 1), governor(&sys, 3)),
 			("powersave".into(), "powersave".into())
 		);
-		assert_eq!(std::fs::read_to_string(leases.join("core1")).unwrap(), "");
+		assert!(!leases.join("core1.restore").exists());
 	}
 
 	#[test]
@@ -729,7 +776,7 @@ mod tests {
 			format!("{}\tper formance\n", policy(1).join("scaling_governor").display()),
 		] {
 			// The run leases core 1 first.
-			std::fs::write(leases.join("core1"), &record).unwrap();
+			std::fs::write(leases.join("core1.restore"), &record).unwrap();
 			let err = reserve_in(&sys, &leases, &[0, 1]).err().unwrap();
 			assert!(err.contains("which swole never changes"), "{err}");
 		}
