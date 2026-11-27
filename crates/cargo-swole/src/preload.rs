@@ -2,7 +2,8 @@
 //! hands the process a fixed-seed stream for randomness and a clock that advances only as the
 //! process reads it and waits, so a count repeats; and the same library built to count the
 //! threads a process starts alone, for `bench`'s counting passes, which keep the host's clock and
-//! randomness, as its timing does.
+//! randomness, as its timing does; and each of them also counting heap allocations, for the
+//! allocation pass beside each.
 
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,12 @@ const LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/preload.so"));
 
 /// The library built to count threads alone.
 const THREADS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/threads.so"));
+
+/// The whole library, also counting heap allocations, for `quick`'s and `sim`'s allocation pass.
+const HEAP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heap.so"));
+
+/// The library built to count threads alone, also counting heap allocations, for `bench`'s.
+const HEAP_THREADS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heap-threads.so"));
 
 /// What the library logs to Valgrind once it loads: preload.rs's `MARKER`, which a test keeps the
 /// same.
@@ -40,12 +47,28 @@ pub fn threads() -> Result<PathBuf, String> {
 	write("threads", THREADS)
 }
 
+/// Writes the library that also counts heap allocations, the whole one when `shimmed`, else the
+/// one that counts threads alone, as [`install`] writes the whole one: on macOS, interpose.rs.
+pub fn heap(shimmed: bool) -> Result<PathBuf, String> {
+	if shimmed {
+		write("heap", HEAP)
+	} else {
+		write("heap-threads", HEAP_THREADS)
+	}
+}
+
+/// The hash of the library [`heap`] writes, which the allocation series' names hold.
+pub fn heap_hash(shimmed: bool) -> String {
+	digest(if shimmed { HEAP } else { HEAP_THREADS })
+}
+
 fn write(name: &str, library: &[u8]) -> Result<PathBuf, String> {
 	if library.is_empty() {
 		return Err("swole's preload is built for x86_64 Linux alone, where it counts".to_owned());
 	}
-	let path = crate::cache()?.join(format!("{name}-{}.so", digest(library)));
-	// The loader splits LD_PRELOAD at each.
+	let extension = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+	let path = crate::cache()?.join(format!("{name}-{}.{extension}", digest(library)));
+	// The loader splits LD_PRELOAD at each, and dyld DYLD_INSERT_LIBRARIES at a ':'.
 	if path.to_string_lossy().contains([':', ' ']) {
 		return Err(format!(
 			"the preload's path {} holds a ':' or a space, which LD_PRELOAD cannot: point XDG_CACHE_HOME elsewhere",
@@ -56,7 +79,7 @@ fn write(name: &str, library: &[u8]) -> Result<PathBuf, String> {
 		return Ok(path);
 	}
 	// Written aside, then renamed, so a run beside this one never loads a partial library.
-	let partial = path.with_extension(format!("so.{}", std::process::id()));
+	let partial = path.with_extension(format!("{extension}.{}", std::process::id()));
 	std::fs::write(&partial, library).map_err(|e| format!("cannot write {}: {e}", partial.display()))?;
 	std::fs::rename(&partial, &path).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
 	Ok(path)

@@ -7,6 +7,7 @@ mod callgrind;
 mod cargo;
 mod compare;
 mod fingerprint;
+mod heap;
 mod metrics;
 #[cfg_attr(
 	not(target_os = "linux"),
@@ -48,8 +49,8 @@ options:
   --allow-missing      with --benchmarks, report each name no benchmark has and measure the
                        rest, failing only when none is there, as a bisect step needs (no <base>)
   --out <file>         write the headline measures as Kixel Quest's metrics.json: instructions
-                       for quick, instructions and estimated cycles for sim, time for bench
-                       (sim and quick: no <base>)
+                       for quick, instructions and estimated cycles for sim, time for bench,
+                       each beside its heap allocations (sim and quick: no <base>)
   --report <file>      write every measure of every benchmark as JSON
   --jobs <n>           how many jobs run at once (default: every core, or for quick, every core
                        of the PMU it counts on; bench runs one at a time)
@@ -625,7 +626,19 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 	});
 	let work = work(dir)?;
 	let all: Vec<&Job> = jobs.iter().collect();
-	let first = run(&all, &work.join("1"), &preload, parallel, counter)?;
+	// The first round also counts each harness benchmark's allocations, in a pass of its own
+	// beside its count, with the same randomness and clock.
+	let heap = heap::library(true)?;
+	let first = run(
+		&all,
+		&work.join("1"),
+		Preloads {
+			count: &preload,
+			heap: heap.as_deref(),
+		},
+		parallel,
+		counter,
+	)?;
 	let mut counts = Counts::none(counter);
 	if let CounterKind::Perf { native, .. } = &counter.kind
 		&& let Some(bench_libc) = fingerprint::require_single_libc(
@@ -678,7 +691,10 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 			let more = run(
 				&repeated,
 				&work.join((round + 1).to_string()),
-				&preload,
+				Preloads {
+					count: &preload,
+					heap: None,
+				},
 				parallel,
 				counter,
 			)?;
@@ -707,8 +723,17 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 		}
 	}
 	std::fs::remove_dir_all(&work).map_err(|e| format!("cannot remove {}: {e}", work.display()))?;
+	let mut allocs: BTreeMap<String, Vec<Measure>> = first
+		.into_iter()
+		.flatten()
+		.filter_map(|found| match found.allocs {
+			Some(heap::Allocs::Counted(measures)) => Some((found.name, measures)),
+			_ => None,
+		})
+		.collect();
 	for (name, taken) in samples {
-		let details = median(&taken).map_err(|err| format!("{name}: {err}"))?;
+		let mut details = median(&taken).map_err(|err| format!("{name}: {err}"))?;
+		details.extend(allocs.remove(&name).unwrap_or_default());
 		if !details.is_empty() {
 			counts.details.insert(name.clone(), details);
 		}
@@ -825,16 +850,25 @@ pub(crate) fn work(dir: &Path) -> Result<PathBuf, String> {
 	unreachable!("some name is free")
 }
 
-/// Runs each job with the library at `preload`, counted by `counter`, `parallel` at once, each
+/// The libraries a round of jobs preloads: the count's, and the allocation pass's, when the round
+/// counts allocations too.
+#[derive(Clone, Copy)]
+struct Preloads<'a> {
+	count: &'a Path,
+	heap: Option<&'a Path>,
+}
+
+/// Runs each job with the libraries `preloads`, counted by `counter`, `parallel` at once, each
 /// in a directory of its own under `work`, and gathers what each measured, in the jobs' order.
 /// Any failure fails the whole and keeps `work` for its output.
 fn run(
 	jobs: &[&Job],
 	work: &Path,
-	preload: &Path,
+	preloads: Preloads,
 	parallel: usize,
 	counter: &Counter,
 ) -> Result<Vec<Vec<Found>>, String> {
+	let preload = preloads.count;
 	let total = jobs.len();
 	let queue = Mutex::new(jobs.iter().enumerate());
 	let done = AtomicUsize::new(0);
@@ -852,10 +886,28 @@ fn run(
 						};
 						let started = Instant::now();
 						let dir = work.join(index.to_string());
-						let result = match &counter.kind {
+						let mut result = match &counter.kind {
 							CounterKind::Valgrind => one(job, &dir, preload),
 							CounterKind::Perf { pmu, passes, .. } => native(job, &dir, preload, pmu, passes),
 						};
+						// A harness job measures its one benchmark, whose allocations its own pass counts.
+						if let (Ok([found]), Some(heap)) = (result.as_deref_mut(), preloads.heap)
+							&& job.expect.is_some()
+							&& !job.codspeed
+						{
+							let pass = heap::Pass {
+								library: heap,
+								padded: true,
+								pmu: match &counter.kind {
+									CounterKind::Perf { pmu, .. } => Some(pmu),
+									CounterKind::Valgrind => None,
+								},
+							};
+							match heap::measure(job, pass, &dir) {
+								Ok(allocs) => found.allocs = Some(allocs),
+								Err(err) => result = Err(err),
+							}
+						}
 						let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
 						match &result {
 							Ok(measured) => eprintln!(
@@ -981,10 +1033,19 @@ struct Found {
 	libc: Option<String>,
 	/// Every measure of it, its count's among them.
 	details: Vec<Measure>,
+	/// What its allocation pass found, when the round ran one.
+	allocs: Option<heap::Allocs>,
 }
 
 /// What one job measured, or why it failed.
 type Measured = Result<Vec<Found>, String>;
+
+/// The variable that names the libraries a process loads first: macOS inserts with dyld's.
+const PRELOAD: &str = if cfg!(target_os = "macos") {
+	"DYLD_INSERT_LIBRARIES"
+} else {
+	"LD_PRELOAD"
+};
 
 /// The whole environment `command` launches with, with `preload` first in `LD_PRELOAD`, and when
 /// `padded`, padded to [`LAUNCH`] bytes so a counted process starts at the same stack address.
@@ -1003,11 +1064,11 @@ pub(crate) fn environment(
 	}
 	// First, so its randomness and clock stand in front of any other preload's.
 	let mut preloads = preload.as_os_str().to_owned();
-	if let Some(others) = env.get(OsStr::new("LD_PRELOAD")).filter(|others| !others.is_empty()) {
+	if let Some(others) = env.get(OsStr::new(PRELOAD)).filter(|others| !others.is_empty()) {
 		preloads.push(":");
 		preloads.push(others);
 	}
-	env.insert("LD_PRELOAD".into(), preloads);
+	env.insert(PRELOAD.into(), preloads);
 	if padded {
 		let args: Vec<&OsStr> = std::iter::once(command.get_program())
 			.chain(command.get_args())
@@ -1109,6 +1170,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 		watched: true,
 		libc,
 		details,
+		allocs: None,
 	}])
 }
 
@@ -1177,6 +1239,7 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 			count: costs.ir(),
 			libc: None,
 			details: costs.measures(),
+			allocs: None,
 		}));
 	}
 	match &job.expect {

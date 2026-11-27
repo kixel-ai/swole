@@ -9,9 +9,9 @@ repository.workspace = true
 # Installed through the flake, or with `cargo install --git`, until first publish.
 publish = false
 
-# Compiled by build.rs as a separate preloaded library, not through a `mod`.
+# Compiled by build.rs as separate preloaded libraries, not through a `mod`.
 [package.metadata.cargo-shear]
-ignored-paths = ["preload.rs"]
+ignored-paths = ["allocs.rs", "interpose.rs", "preload.rs"]
 
 # One program under two names: `swole` on its own, and `cargo swole` as Cargo runs a subcommand.
 [[bin]]

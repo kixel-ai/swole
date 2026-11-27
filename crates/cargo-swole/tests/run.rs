@@ -1,6 +1,6 @@
 //! swole end to end, under the Valgrind on PATH: this test binary is also the program it
-//! counts, which brackets each benchmark with Callgrind's client requests as CodSpeed's
-//! instrument hooks do.
+//! counts, before libtest starts, which brackets each benchmark with Callgrind's client requests
+//! as CodSpeed's instrument hooks do.
 
 // Valgrind, and the fingerprint, are x86_64 Linux's here.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -55,8 +55,6 @@ unsafe extern "C" {
 /// another or a cache line apart, and one whose name starts with `sorted` or `shuffled` branches
 /// on that many bits, about half of them set, all set first or in a fixed pseudorandom order, so each
 /// pair runs the same instructions but for its caches' or branch predictor's hits.
-#[test]
-#[ignore = "the program the other tests count"]
 fn fixture() {
 	let Ok(list) = std::env::var(FIXTURE) else { return };
 	for bench in list.split(',').filter(|bench| !bench.is_empty()) {
@@ -136,13 +134,28 @@ fn fixture() {
 	}
 }
 
+/// Runs the fixture, then exits, before libtest's `main` when `FIXTURE` is set, so its benchmarks
+/// run alone: libtest runs even one test on a thread of its own, beside a main thread that may
+/// still be on its way to waiting for it when a benchmark starts, and Callgrind counts both.
+#[used]
+#[unsafe(link_section = ".init_array")]
+static FIXTURE_FIRST: extern "C" fn() = {
+	extern "C" fn first() {
+		if std::env::var_os(FIXTURE).is_some() {
+			fixture();
+			std::process::exit(0);
+		}
+	}
+	first
+};
+
 /// The shell command that runs the fixture as a program counting `benches`, launched through
 /// the command `wrap`, if any.
 fn program(benches: &str, wrap: &str) -> String {
 	let me = std::env::current_exe().unwrap();
 	// Quoted for the shell, which may otherwise split the path.
 	let me = me.to_str().unwrap().replace('\'', r"'\''");
-	format!("{FIXTURE}={benches} {wrap} '{me}' --exact fixture --ignored --test-threads=1 -q")
+	format!("{FIXTURE}={benches} {wrap} '{me}'")
 }
 
 /// swole, run in `dir` with `args`, counting the fixture as its one program, launched
@@ -335,17 +348,125 @@ fn fails_on_a_program_that_measures_nothing() {
 /// swole, run in this workspace with `args` on the harness's fixture benchmark target,
 /// built in a target directory of its own, since this test's build holds the workspace's.
 fn harness(args: &[&str]) -> Output {
-	Command::new(env!("CARGO_BIN_EXE_swole"))
+	target("fixture", args).output().unwrap()
+}
+
+/// swole, run in this workspace with `args` on the harness's benchmark target `bench`.
+fn target(bench: &str, args: &[&str]) -> Command {
+	let mut command = Command::new(env!("CARGO_BIN_EXE_swole"));
+	command
 		.args(args)
-		.args(["--", "-p", "swole", "--bench", "fixture"])
+		.args(["--", "-p", "swole", "--bench", bench])
 		.current_dir(env!("CARGO_MANIFEST_DIR"))
 		.env(
 			"CARGO_TARGET_DIR",
 			Path::new(env!("CARGO_TARGET_TMPDIR")).join("harness"),
 		)
-		.env_remove("GITHUB_STEP_SUMMARY")
-		.output()
+		.env_remove("GITHUB_STEP_SUMMARY");
+	command
+}
+
+/// Each of a benchmark's allocation measures in a report's side: its value, and whether it is
+/// sampled, its least and most beside it.
+fn allocs(side: &serde_json::Value) -> ([u64; 3], bool) {
+	let mut values = [0; 3];
+	let mut sampled = None;
+	for (i, name) in ["alloc_count", "alloc_bytes", "peak_live_bytes"]
+		.into_iter()
+		.enumerate()
+	{
+		let measure = &side[name];
+		assert_eq!(measure["pass"], "allocation", "{name}: {side}");
+		values[i] = measure["value"].as_u64().unwrap_or_else(|| panic!("{name}: {side}"));
+		let this = measure["sampled"].as_bool().unwrap();
+		assert_eq!(this, measure.get("lower").is_some(), "{name}: {side}");
+		assert_eq!(*sampled.get_or_insert(this), this, "{side}");
+	}
+	(values, sampled.unwrap())
+}
+
+/// The interposer counts what a counting `#[global_allocator]` does on every single-threaded
+/// workload, exactly; a call beside another thread, even one that never allocates, is sampled;
+/// and an allocator that never reaches malloc has no counts rather than none.
+#[test]
+fn counts_allocations_as_a_global_allocator_does() {
+	let dir = scratch("allocs");
+	let report = dir.join("report.json");
+	let metrics = dir.join("metrics.json");
+	let out = target(
+		"allocs",
+		&[
+			"sim",
+			"--report",
+			report.to_str().unwrap(),
+			"--out",
+			metrics.to_str().unwrap(),
+		],
+	)
+	.env("SWOLE_TEST_ALLOCS", &dir)
+	.output()
+	.unwrap();
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+	let file = "crates/swole/benches/allocs.rs::";
+	let side = |name: &str| report["benchmarks"][format!("{file}{name}")]["head"].clone();
+	for name in ["vec", "boxes", "string", "aligned"] {
+		let counted: Vec<u64> = std::fs::read_to_string(dir.join(name))
+			.unwrap()
+			.split(' ')
+			.map(|n| n.parse().unwrap())
+			.collect();
+		let (values, sampled) = allocs(&side(name));
+		assert!(!sampled, "{name}");
+		assert_eq!(
+			values.as_slice(),
+			counted,
+			"{name}: the interposer against the global allocator"
+		);
+		assert!(values[0] > 0, "{name}");
+	}
+	for name in ["spawned", "beside"] {
+		assert!(allocs(&side(name)).1, "{name}");
+	}
+	// The CLI marks a sampled measure, and metrics.json holds each, with its spread when sampled.
+	let table = String::from_utf8_lossy(&out.stdout);
+	assert!(
+		table.contains(&format!("| {file}beside | alloc_count | ~1 allocations (")),
+		"{table}"
+	);
+	let metrics: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(metrics).unwrap()).unwrap();
+	// Named by the run's fingerprint and the interposer's hash.
+	let (series, unit) = metrics["units"]
+		.as_object()
 		.unwrap()
+		.iter()
+		.find(|(series, _)| series.starts_with("alloc_count ("))
+		.unwrap();
+	assert_eq!(unit, "allocations");
+	let fingerprint = series.strip_prefix("alloc_count (").unwrap().strip_suffix(')').unwrap();
+	assert!(
+		fingerprint.starts_with(&format!("{}+", report["fingerprint"].as_str().unwrap())),
+		"{fingerprint}"
+	);
+	let point = |name: &str| {
+		metrics["samples"][0]["metrics"][format!("{file}{name}")][format!("peak_live_bytes ({fingerprint})")].clone()
+	};
+	assert!(point("vec").get("lower_value").is_none(), "{}", point("vec"));
+	assert!(point("spawned").get("lower_value").is_some(), "{}", point("spawned"));
+
+	let report = dir.join("bypass.json");
+	let out = target("bypass", &["sim", "--report", report.to_str().unwrap()])
+		.output()
+		.unwrap();
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	let err = String::from_utf8_lossy(&out.stderr);
+	assert!(err.contains("never reaches swole's allocation interposer"), "{err}");
+	let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+	let head = &report["benchmarks"]["crates/swole/benches/bypass.rs::bumped"]["head"];
+	assert!(
+		head["instructions"].is_object() && head.get("alloc_count").is_none(),
+		"{head}"
+	);
 }
 
 #[test]

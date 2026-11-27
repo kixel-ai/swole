@@ -18,6 +18,9 @@ tree:
   with a base commit's, beside what each process used and every perf counter the host's
   [capabilities](#capabilities) allow.
 
+Each mode also counts each harness benchmark's [heap allocations](#allocations), with no
+privilege, in a pass of its own.
+
 Benchmarks are plain `#[bench]` functions written with [its harness](crates/swole/README.md),
 or for `sim`, CodSpeed's compatibility crates.
 
@@ -436,6 +439,42 @@ the calling thread alone, and a note under the table names it. A table after the
 prints every measure of each benchmark, beside the base's and its change when paired, and
 `--report` writes them all. A side whose harness predates counters, as a base from before an
 upgrade, says so and has none; one whose harness predates rusage has none of that.
+
+## Allocations
+
+Every mode counts each benchmark of swole's harness's heap allocations: `alloc_count`, the
+allocations a call makes; `alloc_bytes`, the bytes they ask for; and `peak_live_bytes`, the most
+bytes the call's own allocations hold at once, which a free of a block allocated before the call
+never lowers. They count in a pass of their own, one process that sets the benchmark up and
+calls it once under an interposer of glibc's allocator (`malloc`, `calloc`, `realloc`,
+`reallocarray`, `free`, `posix_memalign`, `aligned_alloc`, `memalign`, `valloc`, `pvalloc`), which
+the harness has count only between the same requests that bracket a count, so neither setup nor
+the call's output's drop counts. A `realloc` counts as an allocation of its new size and a free of
+the old block. No other pass loads the interposer, so its hooks' instructions are in no count,
+cycle, or time. Beside `quick` and `sim`, the pass runs under the [preload](#randomness-and-the-clock)'s
+randomness and clock and a padded launch, as their counts do; beside `bench`, under the host's,
+as its times do. On macOS, `bench` inserts an interposer of libSystem's allocator with
+`DYLD_INSERT_LIBRARIES`; elsewhere but x86_64 Linux, a run has no allocation counts, and says so.
+
+A call no other thread ran beside, as the harness [watches](crates/swole/README.md#how-it-runs),
+counts exactly, the same on every run, but for one whose allocations follow an input the host
+decides. One beside which another thread ran, even one that never allocates, is sampled: the
+interposer counts every thread's allocations and cannot tell whose each was, so the pass runs
+five times and each measure is the median of the five, with their least and most, marked `~` in
+the tables. A compare's change of a sampled measure says whether it is within the spread of the
+two sides' samples or beyond it, and with one side's spread alone, nothing more than its `~`.
+
+A benchmark whose global allocator never reaches glibc's `malloc`, as a `#[global_allocator]`
+that maps memory of its own or a static allocator that defines `malloc` in the executable does,
+has no allocation counts rather than counts of none: the harness first allocates through the
+global allocator under the interposer and, when it sees nothing, says so, and swole names the
+benchmark on stderr. A static executable, which loads no interposer, fails the pass.
+
+`--out` holds the three as `alloc_count (<fingerprint>+<interposer>)` and the rest, the mode's
+fingerprint followed by a hash of the interposer that counted them, since a change to how it
+counts can move them, beside the headline for each benchmark that has them, a sampled one's with its `lower_value` and `upper_value`.
+`--report` marks each as the allocation pass's (`"pass":"allocation"`) and says whether it is
+`sampled`, and adds `alloc_churn`, the bytes a call allocated for each byte of its peak.
 
 ## Output
 
