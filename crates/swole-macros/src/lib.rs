@@ -24,6 +24,9 @@ struct Options {
 	before: Option<Path>,
 	/// A step on setup's output after each call, neither counted nor timed.
 	after: Option<Path>,
+	/// What each call processes, `bytes` or `items`, and how many: a count, or with args, a
+	/// function of the case's argument.
+	throughput: Option<(&'static str, Expr)>,
 }
 
 fn options(attr: TokenStream) -> syn::Result<Options> {
@@ -41,8 +44,14 @@ fn options(attr: TokenStream) -> syn::Result<Options> {
 			}
 			options.args = Some(meta.value()?.parse()?);
 			return Ok(());
+		} else if let Some(unit) = ["bytes", "items"].into_iter().find(|unit| meta.path.is_ident(unit)) {
+			if options.throughput.is_some() {
+				return Err(meta.error("#[bench] takes one of bytes and items, once"));
+			}
+			options.throughput = Some((unit, meta.value()?.parse()?));
+			return Ok(());
 		} else {
-			return Err(meta.error("#[bench] takes args, setup, before, and after alone"));
+			return Err(meta.error("#[bench] takes args, setup, before, after, and bytes or items alone"));
 		};
 		if slot.is_some() {
 			return Err(meta.error(format!("{name} is given twice")));
@@ -221,9 +230,22 @@ fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
 			quote!(#h::kept_timed(#setup(#kept), move |#input: &mut _, #iterations| #call))
 		}
 	};
+	// What each call processes: the count itself, or with args, the count for the case's argument,
+	// from a clone of it, as setup takes it, before the case's setup moves it in.
+	let throughput = match &options.throughput {
+		Some((unit, amount)) => {
+			let unit = proc_macro2::Ident::new(unit, proc_macro2::Span::call_site());
+			let amount = match &options.args {
+				Some(_) => quote!((#amount)(::core::clone::Clone::clone(&#arg))),
+				None => quote!(#amount),
+			};
+			quote!(::core::option::Option::Some(#h::#unit(#amount)))
+		}
+		None => quote!(::core::option::Option::None),
+	};
 	let cases = match &options.args {
-		Some(args) => quote!(#h::each(#args, |#arg| move || #build)),
-		None => quote!(#h::single(move || #build)),
+		Some(args) => quote!(#h::each(#args, |#arg| (#throughput, move || #build))),
+		None => quote!(#h::single(#throughput, move || #build)),
 	};
 	let span = ident.span();
 	let registration = quote::quote_spanned! {span=>
@@ -282,8 +304,10 @@ mod tests {
 			(
 				"arg = [1]",
 				"fn f(a: u8) {}",
-				"takes args, setup, before, and after alone",
+				"takes args, setup, before, after, and bytes or items alone",
 			),
+			("bytes = 1, items = 1", "fn f() {}", "one of bytes and items, once"),
+			("bytes = 1, bytes = 2", "fn f() {}", "one of bytes and items, once"),
 			("args = [1], args = [2]", "fn f(a: u8) {}", "args is given twice"),
 			("setup = a, setup = b", "fn f(a: u8) {}", "setup is given twice"),
 			(
@@ -342,7 +366,7 @@ mod tests {
 		let arg = expands("args = [\"a\"]", "fn f(x: &str) {}");
 		assert!(
 			arg.contains(&format!(
-				"each ([\"a\"] , | arg | move || {h} cloned (move || :: core :: clone :: Clone :: clone (& arg) , move | input |"
+				"each ([\"a\"] , | arg | (:: core :: option :: Option :: None , move || {h} cloned (move || :: core :: clone :: Clone :: clone (& arg) , move | input |"
 			)),
 			"{arg}"
 		);
@@ -355,7 +379,9 @@ mod tests {
 		// A borrowed input is set up once, from the argument itself.
 		let both = expands("args = SIZES, setup = s", "fn f(x: &X) {}");
 		assert!(
-			both.contains(&format!("each (SIZES , | arg | move || {h} kept (s (arg) ,")),
+			both.contains(&format!(
+				"each (SIZES , | arg | (:: core :: option :: Option :: None , move || {h} kept (s (arg) ,"
+			)),
 			"{both}"
 		);
 		// And by value, each call's from a clone of it.
@@ -363,6 +389,31 @@ mod tests {
 		assert!(
 			fresh.contains("fresh (move || s (:: core :: clone :: Clone :: clone (& arg)) ,"),
 			"{fresh}"
+		);
+	}
+
+	#[test]
+	fn declares_what_each_call_processes() {
+		let h = ":: swole :: __private ::";
+		let none = expands("", "fn f() {}");
+		assert!(
+			none.contains(&format!("{h} single (:: core :: option :: Option :: None ,")),
+			"{none}"
+		);
+		let constant = expands("bytes = 64 * 1024", "fn f() {}");
+		assert!(
+			constant.contains(&format!(
+				"{h} single (:: core :: option :: Option :: Some ({h} bytes (64 * 1024)) ,"
+			)),
+			"{constant}"
+		);
+		// With args, a function of a clone of the case's argument, before setup moves it.
+		let each = expands("args = [1, 2], items = | n | n * 2, setup = s", "fn f(x: &X) {}");
+		assert!(
+			each.contains(&format!(
+				"| arg | (:: core :: option :: Option :: Some ({h} items ((| n | n * 2) (:: core :: clone :: Clone :: clone (& arg)))) , move ||"
+			)),
+			"{each}"
 		);
 	}
 

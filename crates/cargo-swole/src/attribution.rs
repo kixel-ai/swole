@@ -160,6 +160,7 @@ mod tests {
 			spread: BTreeMap::new(),
 			threaded: BTreeSet::new(),
 			details: BTreeMap::new(),
+			throughput: BTreeMap::new(),
 			functions: BTreeMap::from([("bench".to_owned(), functions(costs))]),
 		};
 		(counter(base), counter(head))

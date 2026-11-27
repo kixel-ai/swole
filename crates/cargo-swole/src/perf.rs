@@ -17,6 +17,9 @@ pub const COUNTERS: &str = "SWOLE_COUNTERS";
 /// The variable that has a harness target call its benchmark this many times, each call counted.
 pub const ITERATIONS: &str = "SWOLE_ITERATIONS";
 
+/// The variable that tells a harness target every thread inherits the counters swole opened.
+pub const INHERIT: &str = "SWOLE_INHERIT";
+
 /// What a harness target prints before each counter's value, in the order swole opened them, and
 /// the benchmark's name.
 const COUNTED: &str = "swole counted ";
@@ -36,6 +39,10 @@ const CALLS: &str = "swole calls ";
 
 /// What a harness target prints before the loaded libc of the benchmark process.
 pub const LIBC: &str = "swole libc ";
+
+/// What a harness target prints, alone on a line, when it counts with counters every thread
+/// inherits as [`INHERIT`] asks; one too old to prints nothing, and would fail asked.
+pub const INHERITS: &str = "swole inherits";
 
 /// Where the kernel lists its PMUs.
 pub const PMUS: &str = "/sys/bus/event_source/devices";
@@ -65,14 +72,16 @@ pub struct Event {
 
 impl Event {
 	/// The `perf_event_attr` that opens it, stopped, counting only the thread that opens it,
-	/// since the kernel lets no process read a counter its threads inherit in user space.
-	fn attr(&self) -> Attr {
+	/// since the kernel lets no process read a counter its threads inherit in user space, or with
+	/// `every_thread`, every thread it starts too.
+	fn attr(&self, every_thread: bool) -> Attr {
 		Attr {
 			kind: self.kind,
 			size: size_of::<Attr>() as u32,
 			config: self.config,
 			read_format: PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING,
 			flags: DISABLED
+				| if every_thread { INHERIT_THREADS } else { 0 }
 				| EXCLUDE_HV | match (self.hardware, self.kernel) {
 				(_, false) => EXCLUDE_KERNEL,
 				(true, true) => EXCLUDE_USER,
@@ -580,12 +589,28 @@ pub fn pin_command(command: &mut std::process::Command, cpus: &[usize]) {
 	let _ = (command, cpus);
 }
 
-/// Has `command` run on `cpus`, which the PMU counting `pass` must count on, at the addresses of
-/// its last run when `fixed`, and open `pass`'s counters on itself just before it `exec`s, telling
-/// the harness how many.
-pub fn launch(command: &mut std::process::Command, cpus: &[usize], pass: &Pass, fixed: bool) {
+/// How a job's counters launch.
+#[derive(Clone, Copy, Debug)]
+pub struct Launch {
+	/// Whether the job runs at the addresses of its last run.
+	pub fixed: bool,
+	/// Whether every thread the job starts inherits its counters, which the harness then reads
+	/// with `read()` alone, rather than only the thread that runs the benchmark counting.
+	pub every_thread: bool,
+}
+
+/// Has `command` run on `cpus`, which the PMU counting `pass` must count on, and open `pass`'s
+/// counters on itself just before it `exec`s, as `how` says, telling the harness how many and how
+/// they count.
+pub fn launch(command: &mut std::process::Command, cpus: &[usize], pass: &Pass, how: Launch) {
+	let Launch { fixed, every_thread } = how;
 	let hardware = pass.hardware();
 	command.env(COUNTERS, format!("{hardware}+{}", pass.len() - hardware));
+	if every_thread {
+		command.env(INHERIT, "1");
+	} else {
+		command.env_remove(INHERIT);
+	}
 	#[cfg(target_os = "linux")]
 	{
 		use std::os::unix::process::CommandExt;
@@ -594,7 +619,12 @@ pub fn launch(command: &mut std::process::Command, cpus: &[usize], pass: &Pass, 
 		let attrs: Vec<(Attr, bool)> = pass
 			.groups
 			.iter()
-			.flat_map(|group| group.iter().enumerate().map(|(i, event)| (event.attr(), i == 0)))
+			.flat_map(|group| {
+				group
+					.iter()
+					.enumerate()
+					.map(move |(i, event)| (event.attr(every_thread), i == 0))
+			})
 			.collect();
 		// SAFETY: between fork and exec it makes only system calls, which allocate nothing.
 		unsafe {
@@ -637,11 +667,14 @@ pub struct Reading {
 	pub usage: Option<Usage>,
 	pub threaded: bool,
 	pub libc: Option<String>,
+	/// Whether its harness can count with counters every thread inherits.
+	pub inherits: bool,
 }
 
 /// What a harness target's output says each benchmark it counted with `counters` counters read.
 pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 	let threads = threads(stdout);
+	let inherits = stdout.lines().any(|line| line == INHERITS);
 	let mut usage = None;
 	let mut calls = None;
 	let mut libc = None;
@@ -686,11 +719,12 @@ pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 				usage: usage.take(),
 				threaded,
 				libc: libc.clone(),
+				inherits,
 			});
 		}
 	}
-	// A threaded case's harness reads no counters, which swole would discard, and says only that
-	// it was threaded.
+	// A threaded case's harness reads no counters of the calling thread alone, which swole would
+	// discard, and says only that it was threaded.
 	for (name, &threaded) in &threads {
 		if threaded && !readings.iter().any(|reading| reading.name == *name) {
 			readings.push(Reading {
@@ -700,6 +734,7 @@ pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 				usage: None,
 				threaded,
 				libc: libc.clone(),
+				inherits,
 			});
 		}
 	}
@@ -966,6 +1001,8 @@ const PERF_PMU_TYPE_SHIFT: u32 = 32;
 const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1;
 const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 2;
 const DISABLED: u64 = 1 << 0;
+/// `inherit`: every thread and child the task starts from then on counts a copy of the event.
+const INHERIT_THREADS: u64 = 1 << 1;
 const EXCLUDE_USER: u64 = 1 << 4;
 const EXCLUDE_KERNEL: u64 = 1 << 5;
 const EXCLUDE_HV: u64 = 1 << 6;
@@ -1065,7 +1102,7 @@ fn trial(events: &[Event]) -> std::io::Result<bool> {
 	let mut fds: Vec<OwnedFd> = Vec::new();
 	for event in events {
 		let group = fds.first().map_or(-1, AsRawFd::as_raw_fd);
-		let fd = open(&event.attr(), group, PERF_FLAG_FD_CLOEXEC)?;
+		let fd = open(&event.attr(false), group, PERF_FLAG_FD_CLOEXEC)?;
 		// SAFETY: the kernel returned a new descriptor, which nothing else owns.
 		fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
 	}
@@ -1099,7 +1136,7 @@ fn readable(event: &Event, pmu: &Pmu) -> Result<(), String> {
 	#[cfg(target_arch = "x86_64")]
 	{
 		use std::os::fd::{FromRawFd, OwnedFd};
-		let fd = open(&event.attr(), -1, PERF_FLAG_FD_CLOEXEC).map_err(|err| refused(&err))?;
+		let fd = open(&event.attr(false), -1, PERF_FLAG_FD_CLOEXEC).map_err(|err| refused(&err))?;
 		// SAFETY: the kernel returned a new descriptor, which nothing else owns.
 		let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 		// SAFETY: maps the counter's one page, read-only and shared, and unmaps it below.
@@ -1208,7 +1245,7 @@ mod tests {
 
 	#[test]
 	fn reads_what_a_harness_counted() {
-		let out = "swole libc glibc 2.44 (build-id 133180439d23)\nswole threaded a.rs::g\nswole alone a.rs::f[1 2]\nswole rusage 1 2 3 4 5 6 7\nswole counted 4096 9 a.rs::f[1 2]\n\
+		let out = "swole libc glibc 2.44 (build-id 133180439d23)\nswole inherits\nswole threaded a.rs::g\nswole alone a.rs::f[1 2]\nswole rusage 1 2 3 4 5 6 7\nswole counted 4096 9 a.rs::f[1 2]\n\
 		           swole ran a.rs::f[1 2]\nown output\nswole calls 3 a.rs::g\nswole counted 12 0 a.rs::g\n";
 		let usage = Usage {
 			user_ns: 1,
@@ -1229,6 +1266,7 @@ mod tests {
 					usage: Some(usage),
 					threaded: false,
 					libc: Some("glibc 2.44 (build-id 133180439d23)".to_owned()),
+					inherits: true,
 				},
 				Reading {
 					name: "a.rs::g".to_owned(),
@@ -1237,6 +1275,7 @@ mod tests {
 					usage: None,
 					threaded: true,
 					libc: Some("glibc 2.44 (build-id 133180439d23)".to_owned()),
+					inherits: true,
 				}
 			]
 		);
@@ -1250,6 +1289,7 @@ mod tests {
 				usage: None,
 				threaded: true,
 				libc: Some("static".to_owned()),
+				inherits: false,
 			}]
 		);
 		// A thread record a fragment without a newline swallowed is no record.

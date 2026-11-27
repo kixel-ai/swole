@@ -33,7 +33,7 @@ fn frames(size: usize) -> Vec<Frame> {
 	(0..100).map(|_| Frame::zeroed(size)).collect()
 }
 
-#[bench(args = [100, 16384], setup = frames)]
+#[bench(args = [100, 16384], setup = frames, bytes = |size| 100 * size)]
 fn write(frames: Vec<Frame>) {
 	for frame in frames {
 		sink(frame);
@@ -92,6 +92,20 @@ many times, in samples of as many calls as fill a millisecond. It takes one inpu
   moved in, each call gets one of its own, built just before it outside the clock, and drops
   it where the benchmark does, so only one is live at a time.
 
+## Throughput
+
+A benchmark may declare what each call processes, for swole to divide its measures by:
+`bytes = <expr>` or `items = <expr>`, one of them, once. Without args it is the count, any
+integer; with args, a function of the case's argument, such as a closure `|n| n` or a path,
+called with a clone of it as `setup` is, so each case scales by its own. A count that is zero,
+negative, or over a `u64` fails the run, since such a call processes nothing to divide by.
+swole then reports each count its mode measured per byte or item, such as `instructions/byte`
+and `estimated cycles/byte` under `sim` and each perf counter's under `quick` and `bench`, the
+allocations and allocated bytes per byte or item where swole counts them, and under `bench`, which alone
+times natively, a `throughput` in `bytes/s` or `items/s` over its calls' wall clock; a benchmark that times itself
+returns a time that may not be one, so it gets the per-byte or per-item counts and no rate. A benchmark that declares neither
+reports as it would without.
+
 A borrowed input may take steps between calls that neither the count nor the clock sees:
 `before = <path>` names a function run on it before each call, and `after = <path>` one run
 after each, such as a step that undoes what the call did. Each takes the input as the benchmark
@@ -130,13 +144,15 @@ does.
 
 `swole::main()` runs every benchmark once, sorted by name, setting up each case
 and bracketing its call with Callgrind's client requests, then prints `swole ran <name>`
-after it, starting its records on a fresh line, as the benchmark's own output may not have ended one. Natively the requests are instructions that do nothing, so `cargo bench` and
+after it, starting its records on a fresh line, as the benchmark's own output may not have ended one,
+and before that `swole throughput <bytes|items> <n> <name>` for one that declares it. Natively the requests are instructions that do nothing, so `cargo bench` and
 `cargo test --benches` run each case once as a check. With `SWOLE_BENCH` set to a name, it
 runs that benchmark alone, which swole sets on each job. It takes no arguments but
 Cargo's own `--bench` and `--quiet`; swole's `--benchmarks` chooses benchmarks.
 
 With `SWOLE_TIME=1` as well, it sets that benchmark up and then times it, a sample for
-each iteration count a line of stdin holds, printing `swole sample <nanoseconds>` on a
+each iteration count a line of stdin holds, printing its `swole throughput` line, if any, before
+the first, and `swole sample <nanoseconds>` on a
 line of its own after each, until stdin ends, after a `swole rusage` line of what the process
 used over the sample: user and system CPU nanoseconds, peak resident bytes, minor and major page
 faults, and voluntary and involuntary context switches. swole drives it so, and reads a
@@ -161,11 +177,17 @@ With `SWOLE_COUNTERS` set to how many Linux perf counters swole opened on the pr
 ran the target, as `<hardware>+<software>`, it starts them all after the case's setup and reads
 each hardware one in user space with `rdpmc`, then reads them again after its call and stops
 them, so a count holds no system call. It counts only under swole's preload, or its build that counts threads alone, whose thread count
-tells swole whether another thread, whose work the counters cannot see, ran beside a call. It
+tells swole whether another thread, whose work the counters cannot see, ran beside a call. For
+such a case, which it reads no counters of, swole counts again with `SWOLE_INHERIT=1` beside
+`SWOLE_COUNTERS`: counters every thread inherits, which the kernel maps no page for, so the harness
+starts and stops them around each call with the same `prctl`s, reads none in user space, and
+reads each once after the last call with `read()`, every thread's count summed. Measured natively
+on Linux, it prints `swole inherits` beside its `swole libc` line, so swole asks that only of a
+harness that can. It
 then prints a `swole rusage` line of what the process used over the call and
 `swole counted <value>... <name>`, each counter's value in the order swole opened them, before
 `swole ran <name>`. The benchmark itself needs no privilege: swole opens the counters with its
-own. `swole quick` sets `SWOLE_COUNTERS` alone (counting one call without warm-up). `swole bench` sets
+own. `swole quick` sets no `SWOLE_ITERATIONS` (counting one call without warm-up). `swole bench` sets
 both `SWOLE_COUNTERS` and `SWOLE_ITERATIONS`: the harness first replays the uncounted calls `bench`
 warms it up with before timing, one call and then batches doubled from one up to that many, then
 calls it that many times, counting a deterministic stratified subset of up to 64 of those calls

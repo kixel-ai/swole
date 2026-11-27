@@ -99,6 +99,7 @@ impl Launch {
 			.env("CODSPEED_CARGO_WORKSPACE_ROOT", root)
 			// Only a native count sets them, on a job whose counters swole opened.
 			.env_remove(crate::perf::COUNTERS)
+			.env_remove(crate::perf::INHERIT)
 			.env_remove(crate::perf::ITERATIONS);
 		command
 	}
