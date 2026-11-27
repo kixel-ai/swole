@@ -96,7 +96,8 @@ fn simulation() -> String {
 /// CPU's model, how many CPUs swole may run on, and what the host lets swole count, the perf
 /// tier, PMU, and counters its probe found, so a series never mixes two kinds of host or two
 /// sets of counters; the loaded libc and glibc tunables every benchmark inherits, which pick its
-/// string and memory routines; and for quick, the preload, whose code runs inside each count.
+/// string and memory routines; for quick, the preload, whose code runs inside each count; and
+/// for bench, the cpufreq governor it times under.
 #[derive(Clone)]
 pub struct Native {
 	pub arch: &'static str,
@@ -111,6 +112,8 @@ pub struct Native {
 	pub tunables: Option<String>,
 	/// The preload's hash, for a count that runs with it.
 	pub preload: Option<String>,
+	/// The cpufreq governor of the core a bench times on, once it holds one.
+	pub governor: Option<String>,
 }
 
 impl Native {
@@ -126,6 +129,7 @@ impl Native {
 			libc: libc()?,
 			tunables: std::env::var("GLIBC_TUNABLES").ok(),
 			preload: (mode == crate::Mode::Quick).then(crate::preload::hash),
+			governor: None,
 		})
 	}
 
@@ -151,6 +155,9 @@ GLIBC_TUNABLES: {}
 			out.push_str(&format!("libc: {libc}\n"));
 		}
 		out.push_str(&self.host.describe());
+		if let Some(governor) = &self.governor {
+			out.push_str(&format!("governor: {governor}\n"));
+		}
 		if let Some(preload) = &self.preload {
 			out.push_str(&format!(
 				"preload: {preload}

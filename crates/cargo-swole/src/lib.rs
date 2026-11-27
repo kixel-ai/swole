@@ -6,6 +6,39 @@ mod bench;
 mod callgrind;
 mod cargo;
 mod compare;
+#[cfg(target_os = "linux")]
+mod cores;
+/// No host but Linux leases a core.
+#[cfg(not(target_os = "linux"))]
+mod cores {
+	pub enum Reservation {}
+
+	pub struct Spread {
+		pub cpus: Vec<usize>,
+	}
+
+	impl Reservation {
+		pub fn cpu(&self) -> usize {
+			match *self {}
+		}
+
+		pub fn governor(&self) -> &str {
+			match *self {}
+		}
+
+		pub fn spread(&self) -> Result<Spread, String> {
+			match *self {}
+		}
+
+		pub fn describe(&self) -> String {
+			match *self {}
+		}
+	}
+
+	pub fn reserve(_: Option<&crate::perf::Pmu>) -> Result<Option<Reservation>, String> {
+		Ok(None)
+	}
+}
 mod fingerprint;
 mod heap;
 mod metrics;
@@ -898,8 +931,8 @@ fn run(
 							let pass = heap::Pass {
 								library: heap,
 								padded: true,
-								pmu: match &counter.kind {
-									CounterKind::Perf { pmu, .. } => Some(pmu),
+								cpus: match &counter.kind {
+									CounterKind::Perf { pmu, .. } => Some(&pmu.cpus),
 									CounterKind::Valgrind => None,
 								},
 							};
@@ -1094,7 +1127,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 		let errors = dir.join("stderr");
 		let stderr = std::fs::File::create(&errors).map_err(|e| format!("cannot create {}: {e}", errors.display()))?;
 		let mut command = job.command();
-		perf::launch(&mut command, pmu, pass, true);
+		perf::launch(&mut command, &pmu.cpus, pass, true);
 		let env = environment(&command, preload, label, true)?;
 		command
 			.env_clear()

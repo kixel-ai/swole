@@ -54,9 +54,9 @@ pub struct Pass<'a> {
 	pub library: &'a Path,
 	/// Whether the launch is padded, as a count's.
 	pub padded: bool,
-	/// The PMU whose CPUs the pass beside it runs on, if any, so a benchmark that sizes its work by
-	/// the CPUs it may use allocates for the same work.
-	pub pmu: Option<&'a perf::Pmu>,
+	/// The CPUs the pass beside it runs on, if pinned, so a benchmark that sizes its work by the
+	/// CPUs it may use allocates for the same work.
+	pub cpus: Option<&'a [usize]>,
 }
 
 /// Counts `job`'s benchmark's allocations as `pass` launches, each run's output under `dir`.
@@ -112,8 +112,8 @@ fn once(job: &Job, pass: Pass, dir: &Path, name: &str) -> Result<Option<Record>,
 		.env(HEAP, "1")
 		.env_remove(perf::COUNTERS)
 		.env_remove(perf::ITERATIONS);
-	if let Some(pmu) = pass.pmu {
-		perf::pin_command(&mut command, pmu);
+	if let Some(cpus) = pass.cpus {
+		perf::pin_command(&mut command, cpus);
 	}
 	let env = crate::environment(&command, pass.library, &job.label, pass.padded)?;
 	let status = command
