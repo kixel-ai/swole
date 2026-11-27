@@ -16,8 +16,6 @@ unsafe impl<T> Sync for Shared<T> {}
 static COUNTING: AtomicBool = AtomicBool::new(false);
 static COUNT: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
-static LIVE: AtomicU64 = AtomicU64::new(0);
-static PEAK: AtomicU64 = AtomicU64::new(0);
 
 /// Each block allocated while counting and not yet freed, by address, with its size, so a
 /// free subtracts from the live bytes only what counting added: an open-addressed table in
@@ -29,6 +27,13 @@ struct Table {
 	len: usize,
 	/// Slots of removed blocks, which a probe passes over.
 	removed: usize,
+	/// The bytes the blocks hold, and the most they held at once, kept with the blocks under one
+	/// lock so no thread sees one moved without the other.
+	live: u64,
+	peak: u64,
+	/// How many times the harness started counting, so a `realloc` that spans a start leaves the
+	/// new window's counts alone.
+	generation: u64,
 }
 
 #[repr(C)]
@@ -42,12 +47,7 @@ struct Slot {
 const EMPTY: usize = 0;
 const REMOVED: usize = 1;
 
-static TABLE: Shared<Table> = Shared(UnsafeCell::new(Table {
-	slots: core::ptr::null_mut(),
-	capacity: 0,
-	len: 0,
-	removed: 0,
-}));
+static TABLE: Shared<Table> = Shared(UnsafeCell::new(Table::new(0)));
 static LOCK: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" {
@@ -76,6 +76,18 @@ fn locked<R>(f: impl FnOnce(&mut Table) -> R) -> R {
 }
 
 impl Table {
+	const fn new(generation: u64) -> Self {
+		Table {
+			slots: core::ptr::null_mut(),
+			capacity: 0,
+			len: 0,
+			removed: 0,
+			live: 0,
+			peak: 0,
+			generation,
+		}
+	}
+
 	fn index(&self, at: usize) -> usize {
 		(at >> 4).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (usize::BITS - self.capacity.trailing_zeros())
 	}
@@ -152,10 +164,11 @@ impl Table {
 			Table {
 				slots: slots.cast(),
 				capacity,
-				len: 0,
-				removed: 0,
+				..Table::new(self.generation)
 			},
 		);
+		self.live = old.live;
+		self.peak = old.peak;
 		for i in 0..old.capacity {
 			let slot = *old.slot(i);
 			if slot.at > REMOVED {
@@ -180,29 +193,65 @@ pub fn allocated(ptr: *mut c_void, size: usize) {
 	}
 	COUNT.fetch_add(1, Relaxed);
 	BYTES.fetch_add(size as u64, Relaxed);
-	locked(|table| table.insert(ptr as usize, size as u64));
-	let live = LIVE.fetch_add(size as u64, Relaxed) + size as u64;
-	PEAK.fetch_max(live, Relaxed);
+	locked(|table| {
+		table.insert(ptr as usize, size as u64);
+		table.live += size as u64;
+		table.peak = table.peak.max(table.live);
+	});
 }
 
-/// Uncounts the block at `ptr`, when counting allocated it, returning its size, before the
-/// allocator frees it: once freed, another thread may be handed the same address.
-pub fn freed(ptr: *mut c_void) -> Option<u64> {
+/// Uncounts the block at `ptr`, when counting allocated it, before the allocator frees it: once
+/// freed, another thread may be handed the same address.
+pub fn freed(ptr: *mut c_void) {
+	if ptr.is_null() || !COUNTING.load(Relaxed) {
+		return;
+	}
+	locked(|table| {
+		if let Some(size) = table.remove(ptr as usize) {
+			table.live -= size;
+		}
+	});
+}
+
+/// A block a `realloc` is resizing, which counting allocated: no longer in the table, whose
+/// address the allocator may hand out again once it frees it, but its bytes still live.
+pub struct Resizing {
+	size: u64,
+	generation: u64,
+}
+
+/// Takes the block at `ptr` out of the table before a `realloc` resizes it, its bytes counted live
+/// until [`resized`] says whether the allocator freed it.
+pub fn resizing(ptr: *mut c_void) -> Option<Resizing> {
 	if ptr.is_null() || !COUNTING.load(Relaxed) {
 		return None;
 	}
-	let size = locked(|table| table.remove(ptr as usize))?;
-	LIVE.fetch_sub(size, Relaxed);
-	Some(size)
+	locked(|table| {
+		let size = table.remove(ptr as usize)?;
+		Some(Resizing {
+			size,
+			generation: table.generation,
+		})
+	})
 }
 
-/// Counts again the block at `ptr` of `size` bytes, which [`freed`] uncounted, when the allocator
-/// did not free it after all, as a failed `realloc` does not.
-pub fn kept(ptr: *mut c_void, size: Option<u64>) {
-	if let Some(size) = size {
-		locked(|table| table.insert(ptr as usize, size));
-		LIVE.fetch_add(size, Relaxed);
-	}
+/// Settles the block at `ptr` that [`resizing`] took out: its bytes no longer live when the
+/// allocator `released` it, as a resize that succeeded did, else back in the table.
+pub fn resized(ptr: *mut c_void, resizing: Option<Resizing>, released: bool) {
+	let Some(Resizing { size, generation }) = resizing else {
+		return;
+	};
+	locked(|table| {
+		// The harness started counting again since, so the block is not this window's.
+		if table.generation != generation {
+			return;
+		}
+		if released {
+			table.live -= size;
+		} else {
+			table.insert(ptr as usize, size);
+		}
+	});
 }
 
 /// Zeroes the counts and starts counting, which the harness's meter calls as its window opens.
@@ -211,14 +260,9 @@ pub extern "C" fn swole_heap_start() {
 	COUNTING.store(false, Relaxed);
 	locked(|table| {
 		table.unmap();
-		*table = Table {
-			slots: core::ptr::null_mut(),
-			capacity: 0,
-			len: 0,
-			removed: 0,
-		};
+		*table = Table::new(table.generation + 1);
 	});
-	for count in [&COUNT, &BYTES, &LIVE, &PEAK] {
+	for count in [&COUNT, &BYTES] {
 		count.store(0, Relaxed);
 	}
 	COUNTING.store(true, SeqCst);
@@ -237,8 +281,9 @@ pub extern "C" fn swole_heap_stop() {
 /// `out` holds three writable `u64`s.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn swole_heap_read(out: *mut u64) {
-	for (i, count) in [&COUNT, &BYTES, &PEAK].into_iter().enumerate() {
+	let peak = locked(|table| table.peak);
+	for (i, count) in [COUNT.load(SeqCst), BYTES.load(SeqCst), peak].into_iter().enumerate() {
 		// SAFETY: the caller hands three.
-		unsafe { out.add(i).write(count.load(SeqCst)) };
+		unsafe { out.add(i).write(count) };
 	}
 }

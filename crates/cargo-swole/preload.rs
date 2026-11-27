@@ -822,7 +822,7 @@ mod heap {
 	use core::ffi::{c_int, c_void};
 	use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering::*};
 
-	use super::allocs::{allocated, freed, kept};
+	use super::allocs::{allocated, freed, resized, resizing};
 	use super::{RTLD_NEXT, abort, dlsym, refuse};
 
 	type Malloc = unsafe extern "C" fn(usize) -> *mut c_void;
@@ -982,7 +982,7 @@ mod heap {
 			// rather than handed to an allocator that never made it.
 			return;
 		};
-		let _ = freed(ptr);
+		freed(ptr);
 		// SAFETY: the caller's argument, as it passed it.
 		unsafe { (real.free)(ptr) }
 	}
@@ -1008,15 +1008,14 @@ mod heap {
 			}
 			return moved;
 		}
-		// Uncounted first, since once the allocator frees it another thread may take its address.
-		let old = freed(ptr);
+		// Out of the table first, since once the allocator frees it another thread may take its
+		// address, but live until the call returns.
+		let old = resizing(ptr);
 		// SAFETY: the caller's arguments, as it passed them.
 		let moved = unsafe { (real.realloc)(ptr, size) };
 		// glibc frees a block resized to nothing, returning null; a failed resize leaves the block
 		// as it was.
-		if moved.is_null() && size != 0 {
-			kept(ptr, old);
-		}
+		resized(ptr, old, !moved.is_null() || size == 0);
 		allocated(moved, size);
 		moved
 	}
