@@ -148,7 +148,10 @@ fn times_each_harness_benchmark() {
 	}
 	// Each one's allocations, on a host with the interposer: none in a loop alone, exactly, and a
 	// sample's beside another thread.
-	if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+	if cfg!(any(
+		all(target_os = "linux", target_arch = "x86_64"),
+		target_os = "macos"
+	)) {
 		assert_eq!(head("alone")["alloc_count"]["value"], 0);
 		assert_eq!(head("alone")["alloc_count"]["sampled"], false);
 		for name in THREADED {

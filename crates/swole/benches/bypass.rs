@@ -6,7 +6,8 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-/// A bump allocator over a static arena, which never frees.
+/// A bump allocator over a static arena, which frees only its latest block, as a benchmark timed
+/// over many calls frees what each call returned.
 struct Bump;
 
 const ARENA: usize = 64 << 20;
@@ -20,7 +21,7 @@ unsafe impl Sync for Arena {}
 static MEMORY: Arena = Arena(UnsafeCell::new([0; ARENA]));
 static USED: AtomicUsize = AtomicUsize::new(0);
 
-// SAFETY: each block is a range of the arena no other block holds, aligned as asked.
+// SAFETY: each block is a range of the arena no other live block holds, aligned as asked.
 unsafe impl GlobalAlloc for Bump {
 	unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
 		let base = MEMORY.0.get() as usize;
@@ -38,7 +39,10 @@ unsafe impl GlobalAlloc for Bump {
 		}
 	}
 
-	unsafe fn dealloc(&self, _: *mut u8, _: Layout) {}
+	unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+		let start = ptr as usize - MEMORY.0.get() as usize;
+		let _ = USED.compare_exchange(start + layout.size(), start, Relaxed, Relaxed);
+	}
 }
 
 #[global_allocator]

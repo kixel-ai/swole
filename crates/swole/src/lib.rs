@@ -98,6 +98,9 @@ mod rusage;
 #[cfg(unix)]
 mod heap;
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 /// Runs every benchmark the program's `#[bench]` functions declare, or only the one
 /// `SWOLE_BENCH` names, each counted alone under Valgrind and once natively, or timed when
 /// `SWOLE_TIME` is set. Call it from a benchmark target's `main`.
@@ -304,7 +307,9 @@ use perf::Counters;
 fn started() -> Option<u64> {
 	#[cfg(target_os = "linux")]
 	return perf::started();
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(target_os = "macos")]
+	return macos::started();
+	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 	None
 }
 
@@ -312,7 +317,9 @@ fn started() -> Option<u64> {
 fn threads() -> Result<usize, String> {
 	#[cfg(target_os = "linux")]
 	return perf::threads();
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(target_os = "macos")]
+	return macos::threads();
+	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 	Ok(1)
 }
 

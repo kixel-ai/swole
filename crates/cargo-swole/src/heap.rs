@@ -40,12 +40,11 @@ pub enum Allocs {
 }
 
 /// The interposer for a pass beside a count, with its randomness and clock when `shimmed`, or
-/// beside a time, without them; `None` where swole has none to load.
+/// beside a time, without them; `None` where swole has none to load: macOS has only a time's.
 pub fn library(shimmed: bool) -> Result<Option<PathBuf>, String> {
-	if !cfg!(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu")) {
-		return Ok(None);
-	}
-	crate::preload::heap(shimmed).map(Some)
+	let built = cfg!(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))
+		|| cfg!(target_os = "macos") && !shimmed;
+	built.then(|| crate::preload::heap(shimmed)).transpose()
 }
 
 /// Counts `job`'s benchmark's allocations under the interposer at `library`, its launch padded as

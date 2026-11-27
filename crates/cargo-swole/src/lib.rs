@@ -49,8 +49,8 @@ options:
   --allow-missing      with --benchmarks, report each name no benchmark has and measure the
                        rest, failing only when none is there, as a bisect step needs (no <base>)
   --out <file>         write the headline measures as Kixel Quest's metrics.json: instructions
-                       for quick, instructions and estimated cycles for sim, time for bench
-                       (sim and quick: no <base>)
+                       for quick, instructions and estimated cycles for sim, time for bench,
+                       each beside its heap allocations (sim and quick: no <base>)
   --report <file>      write every measure of every benchmark as JSON
   --jobs <n>           how many jobs run at once (default: every core, or for quick, every core
                        of the PMU it counts on; bench runs one at a time)
@@ -1032,6 +1032,13 @@ struct Found {
 /// What one job measured, or why it failed.
 type Measured = Result<Vec<Found>, String>;
 
+/// The variable that names the libraries a process loads first: macOS inserts with dyld's.
+const PRELOAD: &str = if cfg!(target_os = "macos") {
+	"DYLD_INSERT_LIBRARIES"
+} else {
+	"LD_PRELOAD"
+};
+
 /// The whole environment `command` launches with, with `preload` first in `LD_PRELOAD`, and when
 /// `padded`, padded to [`LAUNCH`] bytes so a counted process starts at the same stack address.
 pub(crate) fn environment(
@@ -1049,11 +1056,11 @@ pub(crate) fn environment(
 	}
 	// First, so its randomness and clock stand in front of any other preload's.
 	let mut preloads = preload.as_os_str().to_owned();
-	if let Some(others) = env.get(OsStr::new("LD_PRELOAD")).filter(|others| !others.is_empty()) {
+	if let Some(others) = env.get(OsStr::new(PRELOAD)).filter(|others| !others.is_empty()) {
 		preloads.push(":");
 		preloads.push(others);
 	}
-	env.insert("LD_PRELOAD".into(), preloads);
+	env.insert(PRELOAD.into(), preloads);
 	if padded {
 		let args: Vec<&OsStr> = std::iter::once(command.get_program())
 			.chain(command.get_args())

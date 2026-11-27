@@ -48,7 +48,7 @@ pub fn threads() -> Result<PathBuf, String> {
 }
 
 /// Writes the library that also counts heap allocations, the whole one when `shimmed`, else the
-/// one that counts threads alone, as [`install`] writes the whole one.
+/// one that counts threads alone, as [`install`] writes the whole one: on macOS, interpose.rs.
 pub fn heap(shimmed: bool) -> Result<PathBuf, String> {
 	if shimmed {
 		write("heap", HEAP)
@@ -61,8 +61,9 @@ fn write(name: &str, library: &[u8]) -> Result<PathBuf, String> {
 	if library.is_empty() {
 		return Err("swole's preload is built for x86_64 Linux alone, where it counts".to_owned());
 	}
-	let path = crate::cache()?.join(format!("{name}-{}.so", digest(library)));
-	// The loader splits LD_PRELOAD at each.
+	let extension = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+	let path = crate::cache()?.join(format!("{name}-{}.{extension}", digest(library)));
+	// The loader splits LD_PRELOAD at each, and dyld DYLD_INSERT_LIBRARIES at a ':'.
 	if path.to_string_lossy().contains([':', ' ']) {
 		return Err(format!(
 			"the preload's path {} holds a ':' or a space, which LD_PRELOAD cannot: point XDG_CACHE_HOME elsewhere",
@@ -73,7 +74,7 @@ fn write(name: &str, library: &[u8]) -> Result<PathBuf, String> {
 		return Ok(path);
 	}
 	// Written aside, then renamed, so a run beside this one never loads a partial library.
-	let partial = path.with_extension(format!("so.{}", std::process::id()));
+	let partial = path.with_extension(format!("{extension}.{}", std::process::id()));
 	std::fs::write(&partial, library).map_err(|e| format!("cannot write {}: {e}", partial.display()))?;
 	std::fs::rename(&partial, &path).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
 	Ok(path)
