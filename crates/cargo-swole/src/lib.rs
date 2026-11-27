@@ -2,6 +2,7 @@
 //! under stock Valgrind, simulating its caches and branches (`sim`), one process a job, in parallel, and times each by wall clock with
 //! every counter the host allows (`bench`), alone or beside a base commit's.
 
+mod attribution;
 mod bench;
 mod callgrind;
 mod cargo;
@@ -388,6 +389,8 @@ pub(crate) struct Counts {
 	/// Every measure of each benchmark, the headline's among them, each the median of its samples
 	/// with their least and most when it took several.
 	pub details: BTreeMap<String, Vec<Measure>>,
+	/// The self cost of each function in a benchmark's first run, from sim's Callgrind profiles.
+	pub functions: BTreeMap<String, callgrind::Functions>,
 	/// What each call processes, of each benchmark that declares it.
 	pub throughput: BTreeMap<String, metrics::Throughput>,
 }
@@ -402,6 +405,7 @@ impl Counts {
 			spread: BTreeMap::new(),
 			threaded: BTreeSet::new(),
 			details: BTreeMap::new(),
+			functions: BTreeMap::new(),
 			throughput: BTreeMap::new(),
 		}
 	}
@@ -809,14 +813,15 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 		counts.host = resolved.describe();
 	}
 	std::fs::remove_dir_all(&work).map_err(|e| format!("cannot remove {}: {e}", work.display()))?;
-	let mut allocs: BTreeMap<String, Vec<Measure>> = first
-		.into_iter()
-		.flatten()
-		.filter_map(|found| match found.allocs {
-			Some(heap::Allocs::Counted(measures)) => Some((found.name, measures)),
-			_ => None,
-		})
-		.collect();
+	let mut allocs: BTreeMap<String, Vec<Measure>> = BTreeMap::new();
+	for found in first.into_iter().flatten() {
+		if let Some(heap::Allocs::Counted(measures)) = found.allocs {
+			allocs.insert(found.name.clone(), measures);
+		}
+		if !found.functions.is_empty() {
+			counts.functions.insert(found.name, found.functions);
+		}
+	}
 	for (name, taken) in samples {
 		let details: Vec<Vec<Measure>> = taken.iter().map(|(_, details)| details.clone()).collect();
 		let mut details = median(&details).map_err(|err| format!("{name}: {err}"))?;
@@ -842,6 +847,7 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 		counts.spread.retain(|name, _| wanted.contains(name));
 		counts.threaded.retain(|name| wanted.contains(name));
 		counts.details.retain(|name, _| wanted.contains(name));
+		counts.functions.retain(|name, _| wanted.contains(name));
 		counts.throughput.retain(|name, _| wanted.contains(name));
 	}
 	if strict && counts.counts.is_empty() {
@@ -1130,6 +1136,8 @@ struct Found {
 	throughput: Option<metrics::Throughput>,
 	/// What its allocation pass found, when the round ran one.
 	allocs: Option<heap::Allocs>,
+	/// The self cost of each function that ran, when Callgrind profiled it.
+	functions: callgrind::Functions,
 }
 
 /// What one job measured, or why it failed.
@@ -1294,6 +1302,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 		details,
 		throughput: throughput.flatten(),
 		allocs: None,
+		functions: callgrind::Functions::new(),
 	}])
 }
 
@@ -1358,15 +1367,16 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 			let pid = name["callgrind.".len()..].split('.').next().unwrap_or_default();
 			preload::check(dir, pid, label)?;
 		}
-		measured.extend(found.into_iter().map(|(name, costs)| Found {
-			threaded: threads.get(&name) == Some(&true),
-			watched: threads.contains_key(&name),
-			throughput: declared.get(&name).copied(),
-			name,
-			count: costs.ir(),
+		measured.extend(found.into_iter().map(|benchmark| Found {
+			threaded: threads.get(&benchmark.name) == Some(&true),
+			watched: threads.contains_key(&benchmark.name),
+			throughput: declared.get(&benchmark.name).copied(),
+			name: benchmark.name,
+			count: benchmark.costs.ir(),
 			libc: None,
-			details: costs.measures(),
+			details: benchmark.costs.measures(),
 			allocs: None,
+			functions: benchmark.functions,
 		}));
 	}
 	match &job.expect {
