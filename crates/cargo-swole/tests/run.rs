@@ -1,6 +1,6 @@
 //! swole end to end, under the Valgrind on PATH: this test binary is also the program it
-//! counts, which brackets each benchmark with Callgrind's client requests as CodSpeed's
-//! instrument hooks do.
+//! counts, before libtest starts, which brackets each benchmark with Callgrind's client requests
+//! as CodSpeed's instrument hooks do.
 
 // Valgrind, and the fingerprint, are x86_64 Linux's here.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -55,8 +55,6 @@ unsafe extern "C" {
 /// another or a cache line apart, and one whose name starts with `sorted` or `shuffled` branches
 /// on that many bits, about half of them set, all set first or in a fixed pseudorandom order, so each
 /// pair runs the same instructions but for its caches' or branch predictor's hits.
-#[test]
-#[ignore = "the program the other tests count"]
 fn fixture() {
 	let Ok(list) = std::env::var(FIXTURE) else { return };
 	for bench in list.split(',').filter(|bench| !bench.is_empty()) {
@@ -136,13 +134,28 @@ fn fixture() {
 	}
 }
 
+/// Runs the fixture, then exits, before libtest's `main` when `FIXTURE` is set, so its benchmarks
+/// run alone: libtest runs even one test on a thread of its own, beside a main thread that may
+/// still be on its way to waiting for it when a benchmark starts, and Callgrind counts both.
+#[used]
+#[unsafe(link_section = ".init_array")]
+static FIXTURE_FIRST: extern "C" fn() = {
+	extern "C" fn first() {
+		if std::env::var_os(FIXTURE).is_some() {
+			fixture();
+			std::process::exit(0);
+		}
+	}
+	first
+};
+
 /// The shell command that runs the fixture as a program counting `benches`, launched through
 /// the command `wrap`, if any.
 fn program(benches: &str, wrap: &str) -> String {
 	let me = std::env::current_exe().unwrap();
 	// Quoted for the shell, which may otherwise split the path.
 	let me = me.to_str().unwrap().replace('\'', r"'\''");
-	format!("{FIXTURE}={benches} {wrap} '{me}' --exact fixture --ignored --test-threads=1 -q")
+	format!("{FIXTURE}={benches} {wrap} '{me}'")
 }
 
 /// swole, run in `dir` with `args`, counting the fixture as its one program, launched
