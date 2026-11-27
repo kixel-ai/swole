@@ -19,8 +19,8 @@ const LEAST: usize = 3;
 ///
 /// Self costs partition a benchmark's count, so the functions' changes add up to the benchmark's
 /// exactly, which a function's inclusive cost, double-counting a recursion, would not. A
-/// benchmark counted beside other threads is marked, since its functions' costs, from its first
-/// run alone, move with the scheduler.
+/// benchmark counted more than once is marked, since its functions' costs, from its first
+/// run alone, may move with the scheduler against the median.
 pub fn table(before: &Counts, after: &Counts) -> String {
 	let mut out = String::new();
 	for (name, base) in &before.functions {
@@ -29,8 +29,10 @@ pub fn table(before: &Counts, after: &Counts) -> String {
 		};
 		let (base_total, head_total) = (sum(base), sum(head));
 		let shown = name.replace('|', "\\|");
-		let shown = if before.threaded.contains(name) || after.threaded.contains(name) {
-			format!("{shown} (threaded)")
+		// A benchmark counted more than once reports the median of its runs, but these functions
+		// are the first run's, which the scheduler may have moved the other way.
+		let shown = if before.spread.contains_key(name) || after.spread.contains_key(name) {
+			format!("{shown} (first run)")
 		} else {
 			shown
 		};
@@ -48,10 +50,10 @@ pub fn table(before: &Counts, after: &Counts) -> String {
 					);
 				}
 				let change = after as i128 - before as i128;
-				// A function one side lacks entirely was added or removed, not merely idle.
+				// A function one side's profile lacks entirely, not merely idle there, may only have gone unseen.
 				let kind = match (base.contains_key(function), head.contains_key(function)) {
-					(false, _) => " (added)",
-					(_, false) => " (removed)",
+					(false, _) => " (not in base)",
+					(_, false) => " (not in head)",
 					_ => "",
 				};
 				let function = function.replace('|', "\\|");
@@ -151,7 +153,7 @@ mod tests {
 		assert_eq!(rows.len(), 3, "{table}");
 		assert!(rows[0].contains("`decode` | 1000 | 1400 | +400 (+24.39%)"), "{table}");
 		assert!(rows[1].contains("`alloc` | 500 | 560 | +60"), "{table}");
-		assert!(rows[2].contains("`new` (added) | 0 | 30 | +30"), "{table}");
+		assert!(rows[2].contains("`new` (not in base) | 0 | 30 | +30"), "{table}");
 		assert!(!table.contains("gone"), "{table}");
 	}
 
@@ -159,7 +161,10 @@ mod tests {
 	fn names_a_removed_function_when_the_benchmark_shrank_and_skips_an_unchanged_measure() {
 		let (before, after) = sides(&[("a", 400), ("b", 100)], &[("a", 400)]);
 		let table = table(&before, &after);
-		assert!(table.contains("`b` (removed) | 100 | 0 | -100 (-20.00%)"), "{table}");
+		assert!(
+			table.contains("`b` (not in head) | 100 | 0 | -100 (-20.00%)"),
+			"{table}"
+		);
 		assert!(!table.contains("`a`"), "{table}");
 		// Identical sides print nothing.
 		let (before, after) = sides(&[("a", 400)], &[("a", 400)]);
@@ -184,12 +189,12 @@ mod tests {
 	}
 
 	#[test]
-	fn is_empty_for_a_benchmark_one_side_lacks_and_marks_a_threaded_one() {
+	fn is_empty_for_a_benchmark_one_side_lacks_and_marks_one_counted_more_than_once() {
 		let (before, mut after) = sides(&[("a", 400)], &[("a", 500)]);
 		after.functions.insert("other".to_owned(), functions(&[("a", 1)]));
-		after.threaded.insert("bench".to_owned());
+		after.spread.insert("bench".to_owned(), (1, 2));
 		let table = table(&before, &after);
-		assert!(table.contains("| bench (threaded) |"), "{table}");
+		assert!(table.contains("| bench (first run) |"), "{table}");
 		assert!(!table.contains("| other"), "{table}");
 	}
 }
