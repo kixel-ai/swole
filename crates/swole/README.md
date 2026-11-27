@@ -164,7 +164,9 @@ tells swole whether another thread, whose work the counters cannot see, ran besi
 such a case, which it reads no counters of, swole counts again with `SWOLE_INHERIT=1` beside
 `SWOLE_COUNTERS`: counters every thread inherits, which the kernel maps no page for, so the harness
 starts and stops them around each call with the same `prctl`s, reads none in user space, and
-reads each once after the last call with `read()`, every thread's count summed. It
+reads each once after the last call with `read()`, every thread's count summed. Measured natively
+on Linux, it prints `swole inherits` beside its `swole libc` line, so swole asks that only of a
+harness that can. It
 then prints a `swole rusage` line of what the process used over the call and
 `swole counted <value>... <name>`, each counter's value in the order swole opened them, before
 `swole ran <name>`. The benchmark itself needs no privilege: swole opens the counters with its

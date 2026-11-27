@@ -415,7 +415,8 @@ on an Intel E-core, and more with each other thread alive. swole leaves it in ra
 floor, which would take the other threads' kernel work with it. A table after the times
 prints every measure of each benchmark, beside the base's and its change when paired, and
 `--report` writes them all. A side whose harness predates counters, as a base from before an
-upgrade, says so and has none; one whose harness predates rusage has none of that.
+upgrade, says so and has none, as does a threaded benchmark whose harness predates counting every
+thread; one whose harness predates rusage has none of that.
 
 ## Output
 

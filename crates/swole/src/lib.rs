@@ -84,6 +84,10 @@ const ALONE: &str = "swole alone ";
 /// What a run swole measures natively prints before the benchmark process's loaded libc identity.
 const LIBC: &str = "swole libc ";
 
+/// What a run swole measures natively prints, alone on a line, to say it counts with counters
+/// every thread inherits when `SWOLE_INHERIT` asks, so swole never asks a harness too old to.
+const INHERITS: &str = "swole inherits";
+
 #[cfg(target_os = "linux")]
 mod perf;
 
@@ -203,6 +207,7 @@ fn run() -> Result<(), String> {
 		};
 		if counting && let Some(libc) = libc()? {
 			record(format_args!("{LIBC}{libc}"))?;
+			record(format_args!("{INHERITS}"))?;
 		}
 		match watch.threaded {
 			Some(true) => record(format_args!("{THREADED}{name}"))?,
@@ -330,7 +335,7 @@ fn serve(
 		let used = "";
 		let libc_line = if watch_threads && !reported_libc {
 			reported_libc = true;
-			libc()?.map_or_else(String::new, |libc| format!("\n{LIBC}{libc}"))
+			libc()?.map_or_else(String::new, |libc| format!("\n{LIBC}{libc}\n{INHERITS}"))
 		} else {
 			String::new()
 		};

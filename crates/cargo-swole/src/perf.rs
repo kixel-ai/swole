@@ -40,6 +40,10 @@ const CALLS: &str = "swole calls ";
 /// What a harness target prints before the loaded libc of the benchmark process.
 pub const LIBC: &str = "swole libc ";
 
+/// What a harness target prints, alone on a line, when it counts with counters every thread
+/// inherits as [`INHERIT`] asks; one too old to prints nothing, and would fail asked.
+pub const INHERITS: &str = "swole inherits";
+
 /// Where the kernel lists its PMUs.
 const PMUS: &str = "/sys/bus/event_source/devices";
 
@@ -651,11 +655,14 @@ pub struct Reading {
 	pub usage: Option<Usage>,
 	pub threaded: bool,
 	pub libc: Option<String>,
+	/// Whether its harness can count with counters every thread inherits.
+	pub inherits: bool,
 }
 
 /// What a harness target's output says each benchmark it counted with `counters` counters read.
 pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 	let threads = threads(stdout);
+	let inherits = stdout.lines().any(|line| line == INHERITS);
 	let mut usage = None;
 	let mut calls = None;
 	let mut libc = None;
@@ -700,6 +707,7 @@ pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 				usage: usage.take(),
 				threaded,
 				libc: libc.clone(),
+				inherits,
 			});
 		}
 	}
@@ -714,6 +722,7 @@ pub fn readings(stdout: &str, counters: usize) -> Result<Vec<Reading>, String> {
 				usage: None,
 				threaded,
 				libc: libc.clone(),
+				inherits,
 			});
 		}
 	}
@@ -1224,7 +1233,7 @@ mod tests {
 
 	#[test]
 	fn reads_what_a_harness_counted() {
-		let out = "swole libc glibc 2.44 (build-id 133180439d23)\nswole threaded a.rs::g\nswole alone a.rs::f[1 2]\nswole rusage 1 2 3 4 5 6 7\nswole counted 4096 9 a.rs::f[1 2]\n\
+		let out = "swole libc glibc 2.44 (build-id 133180439d23)\nswole inherits\nswole threaded a.rs::g\nswole alone a.rs::f[1 2]\nswole rusage 1 2 3 4 5 6 7\nswole counted 4096 9 a.rs::f[1 2]\n\
 		           swole ran a.rs::f[1 2]\nown output\nswole calls 3 a.rs::g\nswole counted 12 0 a.rs::g\n";
 		let usage = Usage {
 			user_ns: 1,
@@ -1245,6 +1254,7 @@ mod tests {
 					usage: Some(usage),
 					threaded: false,
 					libc: Some("glibc 2.44 (build-id 133180439d23)".to_owned()),
+					inherits: true,
 				},
 				Reading {
 					name: "a.rs::g".to_owned(),
@@ -1253,6 +1263,7 @@ mod tests {
 					usage: None,
 					threaded: true,
 					libc: Some("glibc 2.44 (build-id 133180439d23)".to_owned()),
+					inherits: true,
 				}
 			]
 		);
@@ -1266,6 +1277,7 @@ mod tests {
 				usage: None,
 				threaded: true,
 				libc: Some("static".to_owned()),
+				inherits: false,
 			}]
 		);
 		// A thread record a fragment without a newline swallowed is no record.

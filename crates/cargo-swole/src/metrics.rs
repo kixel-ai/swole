@@ -233,8 +233,12 @@ fn bound(value: f64, round: fn(f64) -> f64) -> Value {
 	if value.fract() == 0.0 && value.abs() < 9e15 {
 		return (value as i64).into();
 	}
-	let scale = 10f64.powi(4 - value.abs().log10().floor() as i32);
-	Number::from_f64(round(value * scale) / scale).map_or(Value::Null, Value::Number)
+	// Five digits, then the decimal they spell, read back as `number` reads its own, so neither
+	// bound crosses the median for a float's last bit.
+	let exponent = 4 - value.abs().log10().floor() as i32;
+	let digits = round(value * 10f64.powi(exponent));
+	let bound: f64 = format!("{digits}e{}", -exponent).parse().expect("a float reads back");
+	Number::from_f64(bound).map_or(Value::Null, Value::Number)
 }
 
 /// Each benchmark's count, a line each, with the least and most of its samples when it took more
@@ -490,6 +494,12 @@ mod tests {
 			spread["instructions:u"],
 			json!({ "value": 408_649, "unit": "events", "lower": 408_640.0, "upper": 408_650.0 })
 		);
+		let spread = side(&[Measure {
+			spread: Some((7_999_999_999.0, 7_999_999_999.5)),
+			..Measure::new("instructions:u", 7_999_999_999.5, "events")
+		}]);
+		assert_eq!(spread["instructions:u"]["value"], json!(8e9));
+		assert_eq!(spread["instructions:u"]["upper"], json!(8e9));
 	}
 
 	#[test]

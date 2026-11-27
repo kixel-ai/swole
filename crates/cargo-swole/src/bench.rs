@@ -147,6 +147,8 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	// The benchmarks beside which another thread ran, on either side, whose counters, when the
 	// host has them, every thread inherited.
 	let mut threaded = std::collections::BTreeSet::new();
+	// The benchmarks whose counters every thread inherited, on either side.
+	let mut every = std::collections::BTreeSet::new();
 	// Whether another thread ran beside each benchmark, where every side was watched or one
 	// was seen threaded.
 	let mut seen = BTreeMap::new();
@@ -160,7 +162,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 		let base = before.as_mut().and_then(|jobs| jobs.remove(&name));
 		let head = after.remove(&name);
 		let pmu = perf.map(|perf| &perf.pmu);
-		let (timed, iterations, used, timed_threaded) = match (&base, &head) {
+		let (timed, iterations, used, timed_threaded, inherits) = match (&base, &head) {
 			(Some(base), Some(head)) => {
 				let mut base = Process::spawn(base, pmu, preload.as_deref(), &dir.join("base"))?;
 				let mut head = Process::spawn(head, pmu, preload.as_deref(), &dir.join("head"))?;
@@ -169,6 +171,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				let head_threaded = head.threaded || pairs.iter().any(|(_, h)| h.threaded);
 				libcs.push((format!("{name} (base)"), base.libc.take()));
 				libcs.push((format!("{name} (head)"), head.libc.take()));
+				let inherits = [base.inherits, head.inherits];
 				base.finish()?;
 				head.finish()?;
 				let nanos: Vec<(u64, u64)> = pairs.iter().map(|(b, h)| (b.nanos, h.nanos)).collect();
@@ -180,6 +183,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					iterations,
 					[base_used, head_used],
 					[base_threaded, head_threaded],
+					inherits,
 				)
 			}
 			(base, head) => {
@@ -192,6 +196,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				let (iterations, samples) = alone(&mut process)?;
 				let side_threaded = process.threaded || samples.iter().any(|sample| sample.threaded);
 				libcs.push((name.clone(), process.libc.take()));
+				let inherits = process.inherits;
 				process.finish()?;
 				let nanos: Vec<u64> = samples.iter().map(|sample| sample.nanos).collect();
 				let timed = Times::alone(side, iterations, &nanos).map_err(|err| format!("{name}: {err}"))?;
@@ -209,6 +214,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					} else {
 						[false, side_threaded]
 					},
+					[inherits; 2],
 				)
 			}
 		};
@@ -219,6 +225,11 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				threaded.insert(name.clone());
 			}
 			let mut measures = match (perf, &preload) {
+				(Some(_), Some(_)) if timed_threaded[i] && !inherits[i] => {
+					eprintln!("{}", too_old(&job.label));
+					watched = false;
+					Vec::new()
+				}
 				(Some(perf), Some(preload)) => {
 					let (counted, count_libc) = count(
 						job,
@@ -233,6 +244,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 						Counted::Measures { measures, every_thread } => {
 							if every_thread {
 								threaded.insert(name.clone());
+								every.insert(name.clone());
 							}
 							measures
 						}
@@ -280,8 +292,8 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	eprintln!("swole: fingerprint {host}");
 	let paired = checkout.is_some();
 	print!("{}", table(&times, paired));
-	if let Some(kernel) = kernel.filter(|_| !threaded.is_empty()) {
-		let names: Vec<&str> = threaded.iter().map(String::as_str).collect();
+	if let Some(kernel) = kernel.filter(|_| !every.is_empty()) {
+		let names: Vec<&str> = every.iter().map(String::as_str).collect();
 		// The kernel's work to start and stop counting stays in an inherited count, which no
 		// read in user space keeps out, and a floor would take other threads' work with it.
 		let kernel = if kernel {
@@ -352,7 +364,11 @@ fn count(
 				return Ok((Counted::Measures { measures, every_thread }, libc));
 			}
 			Passes::Unwatched => return Ok((Counted::Unwatched, None)),
-			Passes::Threaded => {}
+			Passes::Threaded { inherits: true } => {}
+			Passes::Threaded { inherits: false } => {
+				eprintln!("{}", too_old(&job.label));
+				return Ok((Counted::Unwatched, None));
+			}
 		}
 	}
 	let mut rounds = Vec::new();
@@ -372,7 +388,7 @@ fn count(
 				libcs.push((label, libc));
 			}
 			Passes::Unwatched => return Ok((Counted::Unwatched, None)),
-			Passes::Threaded => unreachable!("counters every thread inherits count a threaded call"),
+			Passes::Threaded { .. } => unreachable!("counters every thread inherits count a threaded call"),
 		}
 	}
 	let libc = crate::fingerprint::require_single_libc(
@@ -389,12 +405,21 @@ fn count(
 	))
 }
 
+/// Why `label`'s threaded benchmark has no counters: its harness is too old to count every thread,
+/// as a base from before swole could is, and the calling thread's would miss the others' work.
+fn too_old(label: &str) -> String {
+	format!(
+		"swole: {label}'s swole harness is too old to count every thread, so its threaded benchmark has no counters"
+	)
+}
+
 /// What one count of every pass found.
 enum Passes {
 	/// Each counter's share of a call, and the benchmark's libc.
 	Measures(Vec<Measure>, Option<String>),
-	/// Another thread ran beside a call, whose work counters of the calling thread miss.
-	Threaded,
+	/// Another thread ran beside a call, whose work counters of the calling thread miss, and
+	/// whether the harness can count with counters every thread inherits.
+	Threaded { inherits: bool },
 	/// The job's harness is too old to count.
 	Unwatched,
 }
@@ -461,7 +486,8 @@ fn passes(
 			}
 			[reading] => {
 				if reading.threaded && !every_thread {
-					return Ok(Passes::Threaded);
+					let inherits = reading.inherits;
+					return Ok(Passes::Threaded { inherits });
 				}
 				let verified = reading
 					.libc
@@ -881,6 +907,8 @@ struct Process {
 	threaded: bool,
 	/// The loaded libc identity reported by this benchmark process on Linux.
 	libc: Option<String>,
+	/// Whether its harness can count with counters every thread inherits, as it says once.
+	inherits: bool,
 }
 
 impl Process {
@@ -922,6 +950,7 @@ impl Process {
 			log: file("stdout")?,
 			threaded: false,
 			libc: None,
+			inherits: false,
 		};
 		let first = process.sample(1)?;
 		process.threaded |= first.threaded;
@@ -1043,6 +1072,10 @@ impl Side for Process {
 			}
 			if line.starts_with(perf::THREADED.as_bytes()) {
 				threaded = true;
+				continue;
+			}
+			if line.strip_suffix(b"\n") == Some(perf::INHERITS.as_bytes()) {
+				self.inherits = true;
 				continue;
 			}
 			self.log

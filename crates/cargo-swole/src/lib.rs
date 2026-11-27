@@ -1083,7 +1083,14 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 				}
 			};
 			// The calling thread's counters missed the other thread, so every pass counts again,
-			// with counters every thread inherits.
+			// with counters every thread inherits, which a harness too old to says it cannot.
+			if reading.threaded && !every_thread && !reading.inherits {
+				return Err(format!(
+					"{}: another thread ran beside a counted call, whose work the calling thread's counters miss, and its \
+					 swole harness is too old to count every thread: upgrade it, or count it with sim",
+					reading.name
+				));
+			}
 			if reading.threaded && !every_thread {
 				every_thread = true;
 				continue 'count;
