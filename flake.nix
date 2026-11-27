@@ -30,7 +30,7 @@
       [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
+        # No x86_64-darwin: nixpkgs no longer evaluates it.
         "aarch64-darwin"
       ]
       (
@@ -75,7 +75,7 @@
                   "--package"
                   "cargo-swole"
                 ];
-                nativeBuildInputs = [ pkgs.makeWrapper ];
+                nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
                 postInstall = lib.optionalString linux ''
                   for bin in swole cargo-swole; do
                     wrapProgram $out/bin/$bin --prefix PATH : ${valgrind}/bin
@@ -109,6 +109,7 @@
                 cargo-shear
                 cargo-sort
                 actionlint
+                yq-go
                 taplo
                 nixfmt
               ]

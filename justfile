@@ -11,6 +11,9 @@ check:
     cargo shear
     cargo sort --workspace --check --no-format
     actionlint
+    # Every action pins a release's commit and names its tag, which Dependabot moves; it cannot move a branch's.
+    # yq parses every form of a job's, step's, or composite step's `uses`, such as a quoted key or an inline mapping.
+    find .github \( -name '*.yml' -o -name '*.yaml' \) -exec yq e --no-doc '((.jobs[]? | (.uses, .steps[]?.uses)), .runs.steps[]?.uses) | select(. != null) | filename + ":" + (line | tostring) + ": " + . + " #" + line_comment' {} + | { ! grep -vE '^[^:]+:[0-9]+: (\./\S+ #.*|[^ #]+@[0-9a-f]{40} #v[0-9]\S*)$'; }
     taplo format --check
     nixfmt --check flake.nix
     quest check
@@ -22,7 +25,7 @@ test *args:
 # Run what CI runs: lint, then test.
 ci: check test
 
-# Run swole from the development checkout: `just run run --out metrics.json`.
+# Run swole from the development checkout: `just run sim --out metrics.json`.
 run *args:
     cargo run --locked --quiet --release --bin swole -- {{ args }}
 

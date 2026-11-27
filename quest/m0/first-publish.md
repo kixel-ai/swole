@@ -23,4 +23,4 @@ Recommendations for the implementer:
 
 ## Required
 
-- [Three modes (quick, sim, bench), capability probe, CAP_PERFMON, L2/L1 perf, and OS rusage](/quest/m0/modes-and-counters.md) - settles the initial public CLI and harness surface before 0.1.0
+- [Optional #[bench] throughput and --report schema version](/quest/m0/throughput-and-schema.md) - locks the harness attribute and JSON report schema before publishing 0.1.0

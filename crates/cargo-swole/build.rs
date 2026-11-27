@@ -12,29 +12,34 @@ fn main() {
 		// Only x86_64 Linux is fingerprinted, which fails the run first; an empty library
 		// keeps the runner building elsewhere, as its unit tests do.
 		std::fs::write(out.join("preload.so"), []).expect("OUT_DIR is writable");
+		std::fs::write(out.join("threads.so"), []).expect("OUT_DIR is writable");
 		return;
 	}
 	let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-	let status = Command::new(rustc)
-		.args([
-			"--crate-type=cdylib",
-			"--crate-name=swole_preload",
-			"--edition=2024",
-			"-Cpanic=abort",
-			"-Copt-level=3",
-			// Its bytes enter the fingerprint, so nothing of where it was built may: no debug
-			// info, and the toolchain's own lld rather than the host's C compiler, which may add
-			// a search path of the build's, as Nix's does.
-			"-Cstrip=debuginfo",
-			"-Clinker=rust-lld",
-			"-Clinker-flavor=ld.lld",
-			"--target",
-			&target,
-			"-o",
-		])
-		.arg(out.join("preload.so"))
-		.arg("preload.rs")
-		.status()
-		.expect("rustc runs");
-	assert!(status.success(), "building preload.rs failed ({status})");
+	// The whole library, and the one that only counts threads, built with `--cfg threads`.
+	for (name, cfg) in [("preload.so", None), ("threads.so", Some("--cfg=threads"))] {
+		let status = Command::new(&rustc)
+			.args([
+				"--crate-type=cdylib",
+				"--crate-name=swole_preload",
+				"--edition=2024",
+				"-Cpanic=abort",
+				"-Copt-level=3",
+				// Its bytes enter the fingerprint, so nothing of where it was built may: no debug
+				// info, and the toolchain's own lld rather than the host's C compiler, which may add
+				// a search path of the build's, as Nix's does.
+				"-Cstrip=debuginfo",
+				"-Clinker=rust-lld",
+				"-Clinker-flavor=ld.lld",
+				"--target",
+				&target,
+			])
+			.args(cfg)
+			.arg("-o")
+			.arg(out.join(name))
+			.arg("preload.rs")
+			.status()
+			.expect("rustc runs");
+		assert!(status.success(), "building preload.rs as {name} failed ({status})");
+	}
 }

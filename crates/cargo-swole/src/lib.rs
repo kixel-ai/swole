@@ -1,16 +1,19 @@
-//! swole: counts each benchmark's instructions under stock Valgrind, one process a job,
-//! in parallel, for Kixel Quest's `metrics.json` and for a local base-versus-head compare, or
-//! natively with Linux perf counters, for a quick local compare, and times them by wall clock,
-//! alone or paired with a base commit's.
+//! swole: counts each benchmark's instructions natively with Linux perf counters (`quick`) or
+//! under stock Valgrind (`sim`), one process a job, in parallel, and times each by wall clock with
+//! every counter the host allows (`bench`), alone or beside a base commit's.
 
+mod bench;
 mod callgrind;
 mod cargo;
 mod compare;
 mod fingerprint;
 mod metrics;
+#[cfg_attr(
+	not(target_os = "linux"),
+	allow(dead_code, reason = "elsewhere it only says the host has no perf counters")
+)]
 mod perf;
 mod preload;
-mod time;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -20,38 +23,38 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use fingerprint::Fingerprint;
+use fingerprint::{Fingerprint, Native};
 
 /// The hidden argument that runs this executable as the fingerprint's CPU probe.
 const PROBE: &str = "__cpu";
 
 const USAGE: &str = "\
-usage: swole run [options] [-- cargo bench args...]
-       swole compare <base> [options] [-- cargo bench args...]
-       swole time [<base>] [options] [-- cargo bench args...]
-       swole fingerprint
+usage: swole quick [<base>] [options] [-- cargo bench args...]
+       swole sim [<base>] [options] [-- cargo bench args...]
+       swole bench [<base>] [options] [-- cargo bench args...]
+       swole fingerprint quick|sim|bench
 
-run counts the working tree's benchmarks; compare counts <base>, a commit, then the working
-tree, both in one worktree of their own under ~/.cache/swole, and prints each change. time
-times the working tree's by wall clock, one at a time, or with <base> each paired with the base's.
+quick counts each benchmark once, natively, with this host's perf counters; sim counts each
+under Valgrind, the same on any host that shares its fingerprint; bench times each by wall clock,
+with every perf counter this host allows. With <base>, a commit, each measures <base> too, in
+a worktree of its own under ~/.cache/swole, and prints each change.
 
-Benchmarks are the Cargo workspace's, written with swole's harness or CodSpeed's
+Benchmarks are the Cargo workspace's, written with swole's harness, or for sim, CodSpeed's
 compatibility crates, unless --program names them.
 
 options:
-  --benchmarks <file>  count only the benchmarks it names, one a line; any it names that no
+  --benchmarks <file>  measure only the benchmarks it names, one a line; any it names that no
                        benchmark has fails the run
-  --allow-missing      with --benchmarks, report each name no benchmark has and count the rest,
-                       failing only when none is there, as a bisect step needs (run only)
-  --out <file>         write the counts or times as Kixel Quest's metrics.json (run and time)
-  --perf               count swole harness benchmarks natively with Linux perf
-                       counters, not under Valgrind: faster, comparable only on this host,
-                       and never written out
-  --jobs <n>           how many jobs run at once (default: every core, or with --perf,
-                       every core of the PMU it counts on)
-  --build <command>    a shell command that builds the programs, run first (with --program)
+  --allow-missing      with --benchmarks, report each name no benchmark has and measure the
+                       rest, failing only when none is there, as a bisect step needs (no <base>)
+  --out <file>         write the headline measure as Kixel Quest's metrics.json: instructions
+                       for quick and sim, time for bench (sim and quick: no <base>)
+  --report <file>      write every measure of every benchmark as JSON
+  --jobs <n>           how many jobs run at once (default: every core, or for quick, every core
+                       of the PMU it counts on; bench runs one at a time)
+  --build <command>    a shell command that builds the programs, run first (sim, with --program)
   --program <command>  a shell command that runs a program whose benchmarks run through
-                       swole or CodSpeed's instrument hooks; repeat for each";
+                       swole or CodSpeed's instrument hooks; repeat for each (sim)";
 
 /// Runs swole's command line, as either of its binaries.
 pub fn main() -> ExitCode {
@@ -73,7 +76,7 @@ pub fn main() -> ExitCode {
 			}
 		};
 	}
-	match cli(&args) {
+	match perf::drop_ambient().and_then(|()| cli(&args)) {
 		Ok(()) => ExitCode::SUCCESS,
 		Err(err) => {
 			eprintln!("swole: {err}");
@@ -82,53 +85,96 @@ pub fn main() -> ExitCode {
 	}
 }
 
+/// How a run measures each benchmark.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Mode {
+	/// Once, natively, with perf counters.
+	Quick,
+	/// Under Valgrind.
+	Sim,
+	/// By wall clock, with every perf counter the host allows.
+	Bench,
+}
+
+impl Mode {
+	fn parse(name: &str) -> Option<Self> {
+		match name {
+			"quick" => Some(Self::Quick),
+			"sim" => Some(Self::Sim),
+			"bench" => Some(Self::Bench),
+			_ => None,
+		}
+	}
+
+	pub(crate) fn name(self) -> &'static str {
+		match self {
+			Self::Quick => "quick",
+			Self::Sim => "sim",
+			Self::Bench => "bench",
+		}
+	}
+}
+
 fn cli(args: &[String]) -> Result<(), String> {
 	let (command, rest) = args.split_first().ok_or(USAGE)?;
+	if let Some(mode) = Mode::parse(command) {
+		// A base is a commit, and no commit's name starts with a dash.
+		let (base, rest) = match rest.split_first() {
+			Some((base, rest)) if !base.starts_with('-') => (Some(base.as_str()), rest),
+			_ => (None, rest),
+		};
+		let options = Options::parse(rest, mode, base.is_some())?;
+		return match (mode, base) {
+			(Mode::Bench, base) => bench::bench(base, &options),
+			(_, Some(base)) => compare::compare(base, &options, mode),
+			(_, None) => {
+				let counter = Counter::new(mode)?;
+				let counts = measure(Path::new("."), &options, &counter, true)?;
+				if mode == Mode::Quick {
+					eprintln!("swole: fingerprint {}", counts.fingerprint);
+				}
+				print!("{}", metrics::table(&counts));
+				print!("{}", threaded(&counts));
+				print!("{}", metrics::details(None, &counts.details));
+				if let Some(out) = &options.out {
+					metrics::File::counts(&counts, counter.measure(&counts.fingerprint)).write(out)?;
+					eprintln!("swole: wrote {}", out.display());
+				}
+				if let Some(report) = &options.report {
+					metrics::report(&counts, None, &counter, None).write(report)?;
+					eprintln!("swole: wrote {}", report.display());
+				}
+				Ok(())
+			}
+		};
+	}
 	match command.as_str() {
-		"run" => {
-			let options = Options::parse(rest)?;
-			let counts = measure(Path::new("."), &options, true)?;
-			print!("{}", metrics::table(&counts.counts));
-			print!("{}", threaded(&counts.threaded));
-			if let Some(out) = &options.out {
-				metrics::File::counts(&counts).write(out)?;
-				eprintln!("swole: wrote {}", out.display());
-			}
-			Ok(())
-		}
-		"compare" => {
-			let (base, rest) = rest.split_first().ok_or(USAGE)?;
-			let options = Options::parse(rest)?;
-			if options.out.is_some() {
-				return Err("compare writes no metrics.json: --out is run's and time's".to_owned());
-			}
-			if options.allow_missing {
-				return Err("compare already counts a name only one side has: --allow-missing is run's".to_owned());
-			}
-			compare::compare(base, &options)
-		}
-		"time" => {
-			// A base is a commit, and no commit's name starts with a dash.
-			let (base, rest) = match rest.split_first() {
-				Some((base, rest)) if !base.starts_with('-') => (Some(base.as_str()), rest),
-				_ => (None, rest),
-			};
-			time::time(base, &Options::parse(rest)?)
-		}
 		"fingerprint" => {
-			if !rest.is_empty() {
+			let [mode] = rest else {
 				return Err(USAGE.to_owned());
+			};
+			let mode = Mode::parse(mode).ok_or(USAGE)?;
+			match mode {
+				Mode::Sim => {
+					let fingerprint = Fingerprint::probe()?;
+					println!("{}", fingerprint.label());
+					eprint!("{}", fingerprint.describe());
+				}
+				Mode::Quick | Mode::Bench => {
+					let native = Native::probe(mode)?;
+					if mode == Mode::Quick {
+						native.host.perf.as_ref().map_err(|why| quick_needs(why))?;
+					}
+					println!("{}", native.label());
+					eprint!("{}", native.describe());
+					if cfg!(target_os = "linux") {
+						eprintln!(
+							"note: host probe uses swole's own libc; quick and bench fingerprint each benchmark's \
+							 mapped libc"
+						);
+					}
+				}
 			}
-			let fingerprint = Fingerprint::probe()?;
-			println!("{}", fingerprint.label());
-			eprintln!("arch: {}", fingerprint.arch);
-			eprintln!("valgrind: {}", fingerprint.valgrind);
-			eprintln!(
-				"GLIBC_TUNABLES: {}",
-				fingerprint.tunables.as_deref().unwrap_or("(unset)")
-			);
-			eprintln!("preload: {}", fingerprint.preload);
-			eprint!("cpu:\n{}", fingerprint.cpu);
 			Ok(())
 		}
 		"-h" | "--help" | "help" => {
@@ -139,16 +185,20 @@ fn cli(args: &[String]) -> Result<(), String> {
 	}
 }
 
-/// What to count, and how.
+/// Why a quick count cannot run on a host without perf counters, and what can.
+fn quick_needs(why: &str) -> String {
+	format!("quick counts with perf counters, and {why}: count under Valgrind with swole sim, or time with swole bench")
+}
+
+/// What to measure, and how.
 #[derive(Clone)]
 pub(crate) struct Options {
-	/// The only benchmarks to count, when given.
+	/// The only benchmarks to measure, when given.
 	benchmarks: Option<BTreeSet<String>>,
 	/// Whether a wanted benchmark no benchmark is gets reported rather than failing the run.
 	allow_missing: bool,
 	out: Option<PathBuf>,
-	/// Whether to count natively with perf counters rather than under Valgrind.
-	perf: bool,
+	report: Option<PathBuf>,
 	/// How many jobs run at once, when given.
 	jobs: Option<usize>,
 	build: Option<String>,
@@ -157,12 +207,12 @@ pub(crate) struct Options {
 }
 
 impl Options {
-	fn parse(args: &[String]) -> Result<Self, String> {
+	fn parse(args: &[String], mode: Mode, base: bool) -> Result<Self, String> {
 		let mut options = Options {
 			benchmarks: None,
 			allow_missing: false,
 			out: None,
-			perf: false,
+			report: None,
 			jobs: None,
 			build: None,
 			programs: Vec::new(),
@@ -179,7 +229,7 @@ impl Options {
 				}
 				"--allow-missing" => options.allow_missing = true,
 				"--out" => options.out = Some(PathBuf::from(value()?)),
-				"--perf" => options.perf = true,
+				"--report" => options.report = Some(PathBuf::from(value()?)),
 				"--jobs" => {
 					let jobs = value()?;
 					options.jobs = Some(
@@ -195,6 +245,7 @@ impl Options {
 				_ => return Err(format!("unknown argument {arg}\n\n{USAGE}")),
 			}
 		}
+		let name = mode.name();
 		if options.allow_missing && options.benchmarks.is_none() {
 			return Err("--allow-missing tolerates names --benchmarks lists: give it one".to_owned());
 		}
@@ -204,13 +255,27 @@ impl Options {
 		if !options.programs.is_empty() && !options.cargo.is_empty() {
 			return Err("cargo bench args are for a Cargo workspace's benchmarks, not --program's".to_owned());
 		}
-		if options.perf && options.out.is_some() {
+		if mode != Mode::Sim && !options.programs.is_empty() {
+			return Err(format!(
+				"{name} measures a Cargo workspace's benchmarks of swole's harness: --program is sim's"
+			));
+		}
+		if mode == Mode::Bench && options.jobs.is_some() {
 			return Err(
-				"--perf counts stay on this host, whose CPU they follow: --out writes Valgrind's counts".to_owned(),
+				"bench runs one benchmark at a time, so a time is never another's load: --jobs is quick's and sim's"
+					.to_owned(),
 			);
 		}
-		if options.perf && !options.programs.is_empty() {
-			return Err("--perf counts a Cargo workspace's benchmarks of swole's harness, not --program's".to_owned());
+		if base && mode != Mode::Bench && options.out.is_some() {
+			return Err(format!("{name} <base> writes no metrics.json: --out is for one tree's"));
+		}
+		if base && options.allow_missing {
+			return Err(
+				"a compare already measures a name only one side has: --allow-missing is for one tree's".to_owned(),
+			);
+		}
+		if mode == Mode::Bench && options.allow_missing {
+			return Err("bench fails on any name --benchmarks lists that no benchmark has: --allow-missing is quick's and sim's".to_owned());
 		}
 		Ok(options)
 	}
@@ -225,7 +290,7 @@ fn names(text: &str) -> BTreeSet<String> {
 		.collect()
 }
 
-/// One Valgrind process: its command, and the one benchmark it must measure, when known.
+/// One process to run: its command, and the one benchmark it must measure, when known.
 pub(crate) struct Job {
 	label: String,
 	command: Command,
@@ -234,30 +299,197 @@ pub(crate) struct Job {
 	codspeed: bool,
 }
 
-/// Each benchmark's instruction count, under one fingerprint.
+impl Job {
+	/// A new command that launches the job as its own does, so a job can run more than once.
+	pub(crate) fn command(&self) -> Command {
+		let mut command = Command::new(self.command.get_program());
+		command.args(self.command.get_args());
+		for (key, value) in self.command.get_envs() {
+			match value {
+				Some(value) => command.env(key, value),
+				None => command.env_remove(key),
+			};
+		}
+		if let Some(dir) = self.command.get_current_dir() {
+			command.current_dir(dir);
+		}
+		command
+	}
+}
+
+/// One measure of a benchmark beside its headline, in its unit.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Measure {
+	pub name: String,
+	pub value: f64,
+	pub unit: &'static str,
+}
+
+impl Measure {
+	pub(crate) fn new(name: &str, value: f64, unit: &'static str) -> Self {
+		Self {
+			name: name.to_owned(),
+			value,
+			unit,
+		}
+	}
+}
+
+/// Each benchmark's headline count under one fingerprint, and every other measure of it.
 pub(crate) struct Counts {
 	pub fingerprint: String,
+	/// The fingerprint's inputs, a line each, reflecting the benchmark process's loaded libc.
+	pub host: String,
+	/// The median of a benchmark's samples, or its one count.
 	pub counts: BTreeMap<String, u64>,
-	/// The benchmarks beside which other threads ran, whose perf counts are noisy.
+	/// The least and most of the samples of each benchmark counted more than once.
+	pub spread: BTreeMap<String, (u64, u64)>,
+	/// The benchmarks beside which the process had other threads.
 	pub threaded: BTreeSet<String>,
+	/// Every measure of each benchmark, the headline's among them, when a count takes more.
+	pub details: BTreeMap<String, Vec<Measure>>,
 }
 
-/// What counts each job's instructions.
-enum Counter {
-	Valgrind,
-	Perf(perf::Pmu),
-}
-
-/// A note naming the benchmarks beside which other threads ran, if any.
-fn threaded(names: &BTreeSet<String>) -> String {
-	if names.is_empty() {
-		return String::new();
+impl Counts {
+	/// None, labeled as `counter` labels its counts, so they compare with another side's.
+	pub(crate) fn none(counter: &Counter) -> Self {
+		Self {
+			fingerprint: counter.fingerprint.clone(),
+			host: counter.host.clone(),
+			counts: BTreeMap::new(),
+			spread: BTreeMap::new(),
+			threaded: BTreeSet::new(),
+			details: BTreeMap::new(),
+		}
 	}
-	let names: Vec<&str> = names.iter().map(String::as_str).collect();
-	format!(
-		"\nOther threads ran during the perf counts of {}, which the scheduler makes noisy.\n",
-		names.join(", ")
-	)
+}
+
+/// How many times sim counts a benchmark beside which the process had another thread, or might
+/// have, since what the threads run while its call does depends on the scheduler.
+const SAMPLES: usize = 5;
+
+/// What counts each job, and the fingerprint its counts carry.
+pub(crate) struct Counter {
+	kind: CounterKind,
+	pub fingerprint: String,
+	/// The fingerprint's inputs, a line each.
+	pub host: String,
+}
+
+enum CounterKind {
+	Valgrind,
+	Perf {
+		native: Box<Native>,
+		pmu: perf::Pmu,
+		passes: Vec<perf::Pass>,
+	},
+}
+
+impl Counter {
+	/// The counter of `mode`, quick's or sim's, once it has probed the host, saying what it found.
+	pub(crate) fn new(mode: Mode) -> Result<Self, String> {
+		let counter = match mode {
+			Mode::Sim => {
+				let fingerprint = Fingerprint::probe()?;
+				let counter = Self {
+					kind: CounterKind::Valgrind,
+					fingerprint: fingerprint.label(),
+					host: fingerprint.describe(),
+				};
+				eprintln!("swole: fingerprint {}", counter.fingerprint);
+				counter
+			}
+			Mode::Quick => {
+				let native = Native::probe(mode)?;
+				let perf = native.host.perf.as_ref().map_err(|why| quick_needs(why))?;
+				eprint!("{}", indent(&native.host.describe()));
+				let pmu = perf.pmu.clone();
+				let passes = perf.passes.clone();
+				Self {
+					fingerprint: native.label(),
+					host: native.describe(),
+					kind: CounterKind::Perf {
+						native: Box::new(native),
+						pmu,
+						passes,
+					},
+				}
+			}
+			Mode::Bench => unreachable!("bench times rather than counts"),
+		};
+		Ok(counter)
+	}
+
+	/// The headline measure, as `metrics.json` names it: instructions in user space, natively,
+	/// or Valgrind's, which are user space's too.
+	pub(crate) fn measure(&self, fingerprint: &str) -> String {
+		match self.kind {
+			CounterKind::Valgrind => format!("instructions ({fingerprint})"),
+			CounterKind::Perf { .. } => format!("instructions:u ({fingerprint})"),
+		}
+	}
+
+	/// The mode that counts so.
+	pub(crate) fn mode(&self) -> Mode {
+		match self.kind {
+			CounterKind::Valgrind => Mode::Sim,
+			CounterKind::Perf { .. } => Mode::Quick,
+		}
+	}
+}
+
+/// The reason a failed harness target gave on its stderr, at `errors`, after a colon, or nothing.
+pub(crate) fn reason(errors: &Path) -> String {
+	std::fs::read(errors)
+		.ok()
+		.and_then(|bytes| {
+			String::from_utf8_lossy(&bytes)
+				.lines()
+				.rev()
+				.find_map(|line| line.strip_prefix("swole: ").map(str::to_owned))
+		})
+		.map_or(String::new(), |why| format!(": {why}"))
+}
+
+/// A harness target's stdout at `path`, where a benchmark may write any bytes around the
+/// harness's own lines, which are UTF-8.
+pub(crate) fn printed(path: &Path) -> Result<String, String> {
+	let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+	Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Each line of `text` under swole's prefix.
+pub(crate) fn indent(text: &str) -> String {
+	text.lines().map(|line| format!("swole: {line}\n")).collect()
+}
+
+/// A note naming the benchmarks beside which other threads ran, if any, and what that did.
+pub(crate) fn threaded(counts: &Counts) -> String {
+	let mut out = String::new();
+	if !counts.threaded.is_empty() {
+		let names: Vec<&str> = counts.threaded.iter().map(String::as_str).collect();
+		// Only sim counts them: quick's and bench's counters fail a benchmark that runs a thread.
+		out += &format!(
+			"\nOther threads ran beside {}, so each count is the median of {SAMPLES}, with their least and most, which \
+			 the scheduler moves.\n",
+			names.join(", ")
+		);
+	}
+	// Sampled without having been seen to run other threads: swole could not watch them.
+	let unwatched: Vec<&str> = counts
+		.spread
+		.keys()
+		.filter(|name| !counts.threaded.contains(*name))
+		.map(String::as_str)
+		.collect();
+	if !unwatched.is_empty() {
+		out += &format!(
+			"\nswole cannot see whether other threads ran beside {}, so each count is the median of {SAMPLES}, with \
+			 their least and most.\n",
+			unwatched.join(", ")
+		);
+	}
+	out
 }
 
 /// The Valgrind every count and the fingerprint's probe run under: Callgrind, counting only
@@ -308,26 +540,13 @@ pub(crate) fn valgrind_path() -> Result<&'static Path, String> {
 	.map_err(Clone::clone)
 }
 
-/// What counts each job's instructions under `options`, and the fingerprint its counts carry.
-fn counter(options: &Options) -> Result<(Counter, String), String> {
-	Ok(if options.perf {
-		let pmu = perf::Pmu::find()?;
-		let label = pmu.label();
-		(Counter::Perf(pmu), label)
-	} else {
-		(Counter::Valgrind, Fingerprint::probe()?.label())
-	})
-}
-
-/// Counts the benchmarks in `dir`: builds them, then runs each job under Valgrind. When
+/// Counts the benchmarks in `dir` with `counter`: builds them, then runs each job. When
 /// `strict`, a wanted benchmark `dir` lacks fails it; a compare checks that across both trees.
-fn measure(dir: &Path, options: &Options, strict: bool) -> Result<Counts, String> {
+pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: bool) -> Result<Counts, String> {
 	// Absolute, since each job runs in a directory of its own choosing.
 	let dir = &dir
 		.canonicalize()
 		.map_err(|e| format!("cannot resolve {}: {e}", dir.display()))?;
-	let (counter, fingerprint) = counter(options)?;
-	eprintln!("swole: fingerprint {fingerprint}");
 	let preload = preload::install()?;
 	fits(&std::fs::read_to_string("/proc/self/limits").map_err(|e| format!("cannot read /proc/self/limits: {e}"))?)?;
 	let mut jobs = if options.programs.is_empty() {
@@ -363,9 +582,9 @@ fn measure(dir: &Path, options: &Options, strict: bool) -> Result<Counts, String
 			})
 			.collect()
 	};
-	if let (Counter::Perf(_), Some(job)) = (&counter, jobs.iter().find(|job| job.codspeed)) {
+	if let (CounterKind::Perf { .. }, Some(job)) = (&counter.kind, jobs.iter().find(|job| job.codspeed)) {
 		return Err(format!(
-			"--perf counts benchmarks of swole's harness, and {} is of CodSpeed's crates, which only Valgrind counts",
+			"quick counts benchmarks of swole's harness, and {} is of CodSpeed's crates, which only sim counts",
 			job.label
 		));
 	}
@@ -379,29 +598,114 @@ fn measure(dir: &Path, options: &Options, strict: bool) -> Result<Counts, String
 		// whichever it holds.
 		jobs.retain(|job| job.expect.as_ref().is_none_or(|name| wanted.contains(name)));
 	}
-	let parallel = options.jobs.unwrap_or_else(|| match &counter {
-		Counter::Perf(pmu) => pmu.cpus.len(),
-		Counter::Valgrind => std::thread::available_parallelism().map_or(1, usize::from),
+	let parallel = options.jobs.unwrap_or_else(|| match &counter.kind {
+		CounterKind::Perf { pmu, .. } => pmu.cpus.len(),
+		CounterKind::Valgrind => std::thread::available_parallelism().map_or(1, usize::from),
 	});
-	let (mut counts, mut threaded) = run(jobs, &work(dir)?, &preload, parallel, &counter)?;
+	let work = work(dir)?;
+	let all: Vec<&Job> = jobs.iter().collect();
+	let first = run(&all, &work.join("1"), &preload, parallel, counter)?;
+	let mut counts = Counts::none(counter);
+	if let CounterKind::Perf { native, .. } = &counter.kind
+		&& let Some(bench_libc) = fingerprint::require_single_libc(
+			first
+				.iter()
+				.flatten()
+				.map(|found| (found.name.as_str(), found.libc.as_deref())),
+			true,
+		)? {
+		let resolved = native.with_libc(Some(bench_libc));
+		counts.fingerprint = resolved.label();
+		counts.host = resolved.describe();
+	}
+	// Each benchmark's samples, and the details of its first.
+	let mut samples: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+	for found in first.iter().flatten() {
+		if found.threaded {
+			counts.threaded.insert(found.name.clone());
+		}
+		if !found.details.is_empty() {
+			counts.details.insert(found.name.clone(), found.details.clone());
+		}
+		if samples.insert(found.name.clone(), vec![found.count]).is_some() {
+			return Err(format!("two benchmarks are named {}", found.name));
+		}
+	}
+	if matches!(counter.kind, CounterKind::Valgrind) {
+		// Under Valgrind, a job beside whose benchmarks other threads ran counts again, its
+		// samples' spread standing for what the scheduler moves. So does one whose threads
+		// swole cannot see: CodSpeed's, a program's, whose harness no `SWOLE_BENCH` watches, and
+		// one whose harness is too old to say.
+		// Each job repeated, with the names its first round measured.
+		let again: Vec<(&Job, Vec<&String>)> = jobs
+			.iter()
+			.zip(&first)
+			.filter(|(job, found)| {
+				job.codspeed || job.expect.is_none() || found.iter().any(|found| found.threaded || !found.watched)
+			})
+			.map(|(job, found)| {
+				let mut names: Vec<&String> = found.iter().map(|found| &found.name).collect();
+				names.sort_unstable();
+				(job, names)
+			})
+			.collect();
+		let repeated: Vec<&Job> = again.iter().map(|(job, _)| *job).collect();
+		for round in 1..SAMPLES {
+			if repeated.is_empty() {
+				break;
+			}
+			let more = run(
+				&repeated,
+				&work.join((round + 1).to_string()),
+				&preload,
+				parallel,
+				counter,
+			)?;
+			// Each job counts again exactly what its first round did, so every median is of
+			// SAMPLES of one job's benchmark.
+			for ((job, expected), found) in again.iter().zip(&more) {
+				let mut names: Vec<&String> = found.iter().map(|found| &found.name).collect();
+				names.sort_unstable();
+				if names != *expected {
+					return Err(format!(
+						"count {} of {} measured {names:?}, not {expected:?}",
+						round + 1,
+						job.label
+					));
+				}
+			}
+			for found in more.iter().flatten() {
+				if found.threaded {
+					counts.threaded.insert(found.name.clone());
+				}
+				samples.entry(found.name.clone()).or_default().push(found.count);
+			}
+		}
+	}
+	std::fs::remove_dir_all(&work).map_err(|e| format!("cannot remove {}: {e}", work.display()))?;
+	for (name, mut taken) in samples {
+		taken.sort_unstable();
+		if taken.len() > 1 {
+			counts.spread.insert(name.clone(), (taken[0], taken[taken.len() - 1]));
+		}
+		counts.counts.insert(name, taken[taken.len() / 2]);
+	}
 	if let Some(wanted) = &options.benchmarks {
 		if strict {
-			let absent = absent(wanted, |name| counts.contains_key(name), options.allow_missing)?;
+			let absent = absent(wanted, |name| counts.counts.contains_key(name), options.allow_missing)?;
 			if !absent.is_empty() {
 				report(&absent)?;
 			}
 		}
-		counts.retain(|name, _| wanted.contains(name));
-		threaded.retain(|name| wanted.contains(name));
+		counts.counts.retain(|name, _| wanted.contains(name));
+		counts.spread.retain(|name, _| wanted.contains(name));
+		counts.threaded.retain(|name| wanted.contains(name));
+		counts.details.retain(|name, _| wanted.contains(name));
 	}
-	if strict && counts.is_empty() {
+	if strict && counts.counts.is_empty() {
 		return Err("no benchmark ran".to_owned());
 	}
-	Ok(Counts {
-		fingerprint,
-		counts,
-		threaded,
-	})
+	Ok(counts)
 }
 
 /// Fails naming each wanted benchmark `has` says no benchmark is, so a bisect step never
@@ -469,21 +773,20 @@ pub(crate) fn work(dir: &Path) -> Result<PathBuf, String> {
 }
 
 /// Runs each job with the library at `preload`, counted by `counter`, `parallel` at once, each
-/// in a directory of its own under `work`, and gathers what they measured, and beside which
-/// other threads ran. Any failure fails the whole and keeps `work` for its output; success
-/// removes it.
+/// in a directory of its own under `work`, and gathers what each measured, in the jobs' order.
+/// Any failure fails the whole and keeps `work` for its output.
 fn run(
-	jobs: Vec<Job>,
+	jobs: &[&Job],
 	work: &Path,
 	preload: &Path,
 	parallel: usize,
 	counter: &Counter,
-) -> Result<(BTreeMap<String, u64>, BTreeSet<String>), String> {
+) -> Result<Vec<Vec<Found>>, String> {
 	let total = jobs.len();
-	let queue = Mutex::new(jobs.into_iter().enumerate());
+	let queue = Mutex::new(jobs.iter().enumerate());
 	let done = AtomicUsize::new(0);
 	let failed = AtomicBool::new(false);
-	let results: Vec<Measured> = std::thread::scope(|scope| {
+	let mut results: Vec<(usize, Measured)> = std::thread::scope(|scope| {
 		let workers: Vec<_> = (0..parallel.min(total))
 			.map(|_| {
 				scope.spawn(|| {
@@ -495,23 +798,23 @@ fn run(
 							break;
 						};
 						let started = Instant::now();
-						let label = job.label.clone();
 						let dir = work.join(index.to_string());
-						let result = match counter {
-							Counter::Valgrind => one(job, &dir, preload),
-							Counter::Perf(pmu) => native(job, &dir, preload, pmu),
+						let result = match &counter.kind {
+							CounterKind::Valgrind => one(job, &dir, preload),
+							CounterKind::Perf { pmu, passes, .. } => native(job, &dir, preload, pmu, passes),
 						};
 						let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
 						match &result {
 							Ok(measured) => eprintln!(
-								"swole: [{finished}/{total}] {label}: {} benchmark(s), {} instructions, {:.1}s",
+								"swole: [{finished}/{total}] {}: {} benchmark(s), {} instructions, {:.1}s",
+								job.label,
 								measured.len(),
-								measured.iter().map(|(_, ir, _)| ir).sum::<u64>(),
+								measured.iter().map(|found| found.count).sum::<u64>(),
 								started.elapsed().as_secs_f64()
 							),
 							Err(_) => failed.store(true, Ordering::Relaxed),
 						}
-						results.push(result);
+						results.push((index, result));
 					}
 					results
 				})
@@ -522,29 +825,19 @@ fn run(
 			.flat_map(|worker| worker.join().expect("a job's thread panicked"))
 			.collect()
 	});
-	let mut counts = BTreeMap::new();
-	let mut threaded = BTreeSet::new();
+	results.sort_by_key(|(index, _)| *index);
+	let mut found = Vec::new();
 	let mut errors = Vec::new();
-	for result in results {
+	for (_, result) in results {
 		match result {
-			Ok(measured) => {
-				for (name, ir, threads) in measured {
-					if threads {
-						threaded.insert(name.clone());
-					}
-					if counts.insert(name.clone(), ir).is_some() {
-						errors.push(format!("two benchmarks are named {name}"));
-					}
-				}
-			}
+			Ok(measured) => found.push(measured),
 			Err(err) => errors.push(err),
 		}
 	}
 	if !errors.is_empty() {
 		return Err(errors.join("\n"));
 	}
-	std::fs::remove_dir_all(work).map_err(|e| format!("cannot remove {}: {e}", work.display()))?;
-	Ok((counts, threaded))
+	Ok(found)
 }
 
 /// The prefix of the variables [`pad`] fills.
@@ -622,13 +915,32 @@ fn fits(limits: &str) -> Result<(), String> {
 	Ok(())
 }
 
-/// What one job measured: each benchmark's name, its count, and whether other threads ran
-/// beside it, or why it failed.
-type Measured = Result<Vec<(String, u64, bool)>, String>;
+/// One benchmark a job measured.
+struct Found {
+	name: String,
+	/// Its instructions.
+	count: u64,
+	/// Whether the process had another thread beside it.
+	threaded: bool,
+	/// Whether its harness said whether it had, as one too old to watch does not.
+	watched: bool,
+	/// The loaded libc identity reported by the benchmark process on Linux.
+	libc: Option<String>,
+	/// Every measure of it, when its count took more than instructions.
+	details: Vec<Measure>,
+}
 
-/// The whole environment `command` launches with, spelled out so its size is known exactly:
-/// the library at `preload` first in `LD_PRELOAD`, and padded, so it starts at the same place.
-fn environment(command: &Command, preload: &Path, label: &str) -> Result<BTreeMap<OsString, OsString>, String> {
+/// What one job measured, or why it failed.
+type Measured = Result<Vec<Found>, String>;
+
+/// The whole environment `command` launches with, with `preload` first in `LD_PRELOAD`, and when
+/// `padded`, padded to [`LAUNCH`] bytes so a counted process starts at the same stack address.
+pub(crate) fn environment(
+	command: &Command,
+	preload: &Path,
+	label: &str,
+	padded: bool,
+) -> Result<BTreeMap<OsString, OsString>, String> {
 	let mut env: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
 	for (key, value) in command.get_envs() {
 		match value {
@@ -643,70 +955,115 @@ fn environment(command: &Command, preload: &Path, label: &str) -> Result<BTreeMa
 		preloads.push(others);
 	}
 	env.insert("LD_PRELOAD".into(), preloads);
-	let args: Vec<&OsStr> = std::iter::once(command.get_program())
-		.chain(command.get_args())
-		.collect();
-	pad(&mut env, &args).map_err(|err| format!("{label}: {err}"))?;
+	if padded {
+		let args: Vec<&OsStr> = std::iter::once(command.get_program())
+			.chain(command.get_args())
+			.collect();
+		pad(&mut env, &args).map_err(|err| format!("{label}: {err}"))?;
+	}
 	Ok(env)
 }
 
-/// Runs one job natively, its benchmark counted by perf counters of `pmu` on its CPUs, with the
-/// library at `preload`, its output in `dir`, and reads what it counted.
-fn native(job: Job, dir: &Path, preload: &Path, pmu: &perf::Pmu) -> Measured {
-	let Job {
-		label,
-		mut command,
-		expect,
-		..
-	} = job;
-	std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-	let path = dir.join("stdout");
-	let stdout = std::fs::File::create(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-	let stderr = dir.join("stderr");
-	let stderr = std::fs::File::create(&stderr).map_err(|e| format!("cannot create {}: {e}", stderr.display()))?;
-	pmu.select(&mut command);
-	let env = environment(&command, preload, &label)?;
-	command
-		.env_clear()
-		.envs(env)
-		.stdin(std::process::Stdio::null())
-		.stdout(stdout)
-		.stderr(stderr);
-	pmu.launch(&mut command);
-	let status = command.status().map_err(|e| format!("cannot run {label}: {e}"))?;
-	if !status.success() {
-		return Err(format!("{label} failed ({status}); its output is in {}", dir.display()));
-	}
-	let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-	let measured = perf::counted(&text).map_err(|err| format!("{label}: {err}"))?;
-	match (expect, measured.as_slice()) {
-		(Some(name), [(only, _, _)]) if *only == name => Ok(measured),
-		(_, []) => Err(format!(
-			"{label} printed no perf count: its swole harness is older than --perf; its output is in {}",
-			dir.display()
-		)),
-		_ => {
-			let found: Vec<&str> = measured.iter().map(|(name, _, _)| name.as_str()).collect();
-			Err(format!(
-				"{label} should count itself alone, but counted [{}]; its output is in {}",
-				found.join(", "),
+/// Runs one job natively, once for each of `passes`, its benchmark counted by that pass's perf
+/// counters of `pmu` on its CPUs, with the library at `preload`, each pass's output under `dir`,
+/// and reads what they counted.
+fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf::Pass]) -> Measured {
+	let label = &job.label;
+	let mut values = Vec::new();
+	let mut libcs: Vec<(String, Option<String>)> = Vec::new();
+	let mut first: Option<perf::Reading> = None;
+	for (i, pass) in passes.iter().enumerate() {
+		let dir = dir.join(format!("pass-{}", i + 1));
+		std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+		let path = dir.join("stdout");
+		let stdout = std::fs::File::create(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+		let errors = dir.join("stderr");
+		let stderr = std::fs::File::create(&errors).map_err(|e| format!("cannot create {}: {e}", errors.display()))?;
+		let mut command = job.command();
+		perf::launch(&mut command, pmu, pass, true);
+		let env = environment(&command, preload, label, true)?;
+		command
+			.env_clear()
+			.envs(env)
+			.stdin(std::process::Stdio::null())
+			.stdout(stdout)
+			.stderr(stderr);
+		let status = command.status().map_err(|e| format!("cannot run {label}: {e}"))?;
+		if !status.success() {
+			return Err(format!(
+				"{label} failed ({status}){}; its output is in {}",
+				reason(&errors),
 				dir.display()
-			))
+			));
+		}
+		let text = printed(&path)?;
+		let mut readings = perf::readings(&text, pass.len()).map_err(|err| format!("{label}: {err}"))?;
+		let reading = match (&job.expect, readings.len()) {
+			(Some(name), 1) if readings[0].name == *name => readings.remove(0),
+			(_, 0) => {
+				return Err(format!(
+					"{label} printed no perf count: its swole harness is older than quick; its output is in {}",
+					dir.display()
+				));
+			}
+			_ => {
+				let found: Vec<&str> = readings.iter().map(|reading| reading.name.as_str()).collect();
+				return Err(format!(
+					"{label} should count itself alone, but counted [{}]; its output is in {}",
+					found.join(", "),
+					dir.display()
+				));
+			}
+		};
+		let verified = reading
+			.libc
+			.as_deref()
+			.map(fingerprint::validate_libc_record)
+			.transpose()?;
+		libcs.push((label.clone(), verified));
+		values.push(reading.values.clone());
+		match &mut first {
+			Some(first) => first.threaded |= reading.threaded,
+			None => first = Some(reading),
 		}
 	}
+	let first = first.expect("a host that counts has a pass");
+	if first.threaded {
+		return Err(format!(
+			"{}: another thread ran beside a counted call, whose work quick's perf counters, read in user space for \
+			 the calling thread alone, cannot see: count it with sim",
+			first.name
+		));
+	}
+	let libc = fingerprint::require_single_libc(
+		libcs.iter().map(|(label, libc)| (label.as_str(), libc.as_deref())),
+		true,
+	)?;
+	let values: Vec<(Vec<u64>, u64)> = values.into_iter().map(|values| (values, 1)).collect();
+	let mut details = perf::measures(passes, &values);
+	let count = details
+		.iter()
+		.find(|measure| measure.name == "instructions:u")
+		.map(|measure| measure.value as u64)
+		.expect("every pass plan counts user-space instructions");
+	if let Some(usage) = first.usage {
+		details.extend(usage.measures(1));
+	}
+	Ok(vec![Found {
+		name: first.name,
+		count,
+		threaded: first.threaded,
+		watched: true,
+		libc,
+		details,
+	}])
 }
 
 /// Runs one job under Valgrind with the library at `preload` in every process, its profiles
 /// and output in `dir`, and reads what it measured.
-fn one(job: Job, dir: &Path, preload: &Path) -> Measured {
-	let Job {
-		label,
-		mut command,
-		expect,
-		..
-	} = job;
-	// A `--program`'s shell inherits swole's environment, whose perf setting is a native count's.
-	command.env_remove(perf::PERF);
+fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
+	let label = &job.label;
+	let command = job.command();
 	std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 	let file = |name: &str| {
 		std::fs::File::create(dir.join(name)).map_err(|e| format!("cannot create {}: {e}", dir.join(name).display()))
@@ -725,7 +1082,11 @@ fn one(job: Job, dir: &Path, preload: &Path) -> Measured {
 	if let Some(cwd) = command.get_current_dir() {
 		valgrind.current_dir(cwd);
 	}
-	valgrind.env_clear().envs(environment(&command, preload, &label)?);
+	let mut env = environment(&command, preload, label, true)?;
+	// A `--program`'s shell inherits swole's environment, whose counter settings are a native count's.
+	env.remove(OsStr::new(perf::COUNTERS));
+	env.remove(OsStr::new(perf::ITERATIONS));
+	valgrind.env_clear().envs(env);
 	let status = valgrind.status().map_err(|e| format!("cannot run valgrind: {e}"))?;
 	if !status.success() {
 		return Err(format!(
@@ -733,6 +1094,7 @@ fn one(job: Job, dir: &Path, preload: &Path) -> Measured {
 			dir.display()
 		));
 	}
+	let threads = perf::threads(&printed(&dir.join("stdout"))?);
 	let mut measured = Vec::new();
 	let mut entries: Vec<_> = std::fs::read_dir(dir)
 		.map_err(|e| format!("cannot read {}: {e}", dir.display()))?
@@ -753,15 +1115,22 @@ fn one(job: Job, dir: &Path, preload: &Path) -> Measured {
 			// `callgrind.<pid>`, then `.<n>` for each dump after the first.
 			let name = path.file_name().expect("listed").to_string_lossy();
 			let pid = name["callgrind.".len()..].split('.').next().unwrap_or_default();
-			preload::check(dir, pid, &label)?;
+			preload::check(dir, pid, label)?;
 		}
-		measured.extend(found.into_iter().map(|(name, ir)| (name, ir, false)));
+		measured.extend(found.into_iter().map(|(name, count)| Found {
+			threaded: threads.get(&name) == Some(&true),
+			watched: threads.contains_key(&name),
+			name,
+			count,
+			libc: None,
+			details: Vec::new(),
+		}));
 	}
-	match expect {
+	match &job.expect {
 		Some(name) => match measured.as_slice() {
-			[(only, _, _)] if *only == name => {}
+			[only] if only.name == *name => {}
 			_ => {
-				let found: Vec<&str> = measured.iter().map(|(name, _, _)| name.as_str()).collect();
+				let found: Vec<&str> = measured.iter().map(|found| found.name.as_str()).collect();
 				return Err(format!(
 					"{label} should measure itself alone, but measured [{}]",
 					found.join(", ")
@@ -828,17 +1197,23 @@ mod tests {
 	#[test]
 	fn options_keep_programs_and_cargo_args_apart() {
 		let args = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-		let options = Options::parse(&args(&["--jobs", "3", "--", "-p", "net", "--features", "x"])).unwrap();
+		let sim = |list: &[&str]| Options::parse(&args(list), Mode::Sim, false);
+		let options = sim(&["--jobs", "3", "--", "-p", "net", "--features", "x"]).unwrap();
 		assert_eq!(options.jobs, Some(3));
-		assert!(Options::parse(&args(&["--perf", "--", "-p", "net"])).unwrap().perf);
-		assert!(Options::parse(&args(&["--perf", "--out", "m.json"])).is_err());
-		assert!(Options::parse(&args(&["--perf", "--program", "a"])).is_err());
 		assert_eq!(options.cargo, ["-p", "net", "--features", "x"]);
-		assert!(Options::parse(&args(&["--program", "a", "--", "-p", "net"])).is_err());
-		assert!(Options::parse(&args(&["--build", "make"])).is_err());
-		assert!(Options::parse(&args(&["--jobs", "0"])).is_err());
-		assert!(Options::parse(&args(&["--jobs"])).is_err());
-		assert!(Options::parse(&args(&["--frobnicate"])).is_err());
-		assert!(Options::parse(&args(&["--allow-missing"])).is_err());
+		assert!(sim(&["--program", "a", "--", "-p", "net"]).is_err());
+		assert!(sim(&["--build", "make"]).is_err());
+		assert!(sim(&["--jobs", "0"]).is_err());
+		assert!(sim(&["--jobs"]).is_err());
+		assert!(sim(&["--frobnicate"]).is_err());
+		assert!(sim(&["--allow-missing"]).is_err());
+		// A quick count writes its own host's series, but no compare writes any.
+		assert!(Options::parse(&args(&["--out", "m.json"]), Mode::Quick, false).is_ok());
+		assert!(Options::parse(&args(&["--out", "m.json"]), Mode::Quick, true).is_err());
+		assert!(Options::parse(&args(&["--out", "m.json"]), Mode::Sim, true).is_err());
+		assert!(Options::parse(&args(&["--out", "m.json"]), Mode::Bench, true).is_ok());
+		assert!(Options::parse(&args(&["--program", "a"]), Mode::Quick, false).is_err());
+		assert!(Options::parse(&args(&["--program", "a"]), Mode::Bench, false).is_err());
+		assert!(Options::parse(&args(&["--jobs", "2"]), Mode::Bench, false).is_err());
 	}
 }

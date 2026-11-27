@@ -8,7 +8,7 @@ swole runs only its own harness's benchmarks and programs that bracket theirs wi
 
 Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2, [kixel-ai/rust2#1031](https://github.com/kixel-ai/rust2/pull/1031)): ✅ no CodSpeed service, app, or code remains in any moq-dev or kixel-ai repository. This is swole's part of [rust2's CodSpeed epic](https://github.com/kixel-ai/rust2/blob/main/quest/m1/codspeed/README.md), moved here with the runner.
 
-- A base before a consumer's rewrite still has only CodSpeed's benchmarks, which `time <base>` times as none today; once this lands such a base fails instead, so land it after both consumers' nightly bases are past their rewrites.
+- A base before a consumer's rewrite still has only CodSpeed's benchmarks, which paired wall-clock timing against a base times as none today; once this lands such a base fails instead, so land it after both consumers' nightly bases are past their rewrites.
 
 ## Waiting
 

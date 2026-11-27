@@ -1,6 +1,6 @@
 [package]
 name = "cargo-swole"
-description = "Count each benchmark's instructions under stock Valgrind, in parallel, and time them paired with a base commit's"
+description = "Count each benchmark's instructions under stock Valgrind or with perf counters, in parallel, and time them with every counter, paired with a base commit's"
 readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
@@ -24,8 +24,6 @@ path = "src/bin/cargo-swole.rs"
 
 [dependencies]
 serde_json = "1.0.154"
-# For its perf counters, which a perf count checks this host exposes before building anything.
-swole = { path = "../swole" }
 toml = "1.1.8"
 
 [lints]

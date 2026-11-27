@@ -97,8 +97,9 @@ impl Launch {
 			.envs(&self.env)
 			.env_remove(HARNESS_TIME)
 			.env("CODSPEED_CARGO_WORKSPACE_ROOT", root)
-			// Only a perf count sets it, on a job pinned to its PMU's cores.
-			.env_remove(crate::perf::PERF);
+			// Only a native count sets them, on a job whose counters swole opened.
+			.env_remove(crate::perf::COUNTERS)
+			.env_remove(crate::perf::ITERATIONS);
 		command
 	}
 }
@@ -649,7 +650,7 @@ pub fn manifest_path(args: &[String]) -> Option<&str> {
 /// returns each with how Cargo launches it: `cargo bench` runs each through this executable as
 /// its runner, which records the launch rather than running it.
 fn build(dir: &Path, args: &[String]) -> Result<Vec<(Target, Launch)>, String> {
-	let exe = std::env::current_exe().map_err(|e| format!("cannot find swole's own executable: {e}"))?;
+	let exe = crate::perf::helper()?;
 	let exe = exe.to_str().ok_or("swole's own path is not UTF-8")?;
 	// A launch's environment holds whatever secrets the caller exported, so it goes to a
 	// directory only this user can read, removed once read.
@@ -849,7 +850,7 @@ mod tests {
 		let (harness, names) = ran(out).unwrap().unwrap();
 		assert_eq!(harness, Harness::CodSpeed);
 		assert_eq!(names, ["benches/a.rs::g::f[1]", "benches/a.rs::g::h"]);
-		let out = "a benchmark's own line\nswole ran benches/a.rs::f[1]\nswole ran benches/a.rs::m::g\n";
+		let out = "a benchmark's own line\nswole ran benches/a.rs::f[1]\nswole ran benches/a.rs::m::g\nlast time swole ran this benchmark\n";
 		let (harness, names) = ran(out).unwrap().unwrap();
 		assert_eq!(harness, Harness::Swole);
 		assert_eq!(names, ["benches/a.rs::f[1]", "benches/a.rs::m::g"]);
