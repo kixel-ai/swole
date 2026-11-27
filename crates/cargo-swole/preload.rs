@@ -809,3 +809,264 @@ pub unsafe extern "C" fn thrd_create(
 	}
 	made
 }
+
+// Heap allocations: built with `--cfg heap`, the library also counts the allocations the process
+// makes while the harness's meter has it count, for swole's allocation pass alone, so no other
+// pass carries these hooks' instructions.
+#[cfg(heap)]
+mod allocs;
+
+#[cfg(heap)]
+mod heap {
+	use core::cell::UnsafeCell;
+	use core::ffi::{c_int, c_void};
+	use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering::*};
+
+	use super::allocs::{allocated, freed, resized, resizing};
+	use super::{RTLD_NEXT, abort, dlsym, refuse};
+
+	type Malloc = unsafe extern "C" fn(usize) -> *mut c_void;
+	type Free = unsafe extern "C" fn(*mut c_void);
+	type Calloc = unsafe extern "C" fn(usize, usize) -> *mut c_void;
+	type Realloc = unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void;
+	type PosixMemalign = unsafe extern "C" fn(*mut *mut c_void, usize, usize) -> c_int;
+	/// `aligned_alloc` and `memalign`: an alignment, then a size.
+	type Aligned = unsafe extern "C" fn(usize, usize) -> *mut c_void;
+
+	/// The allocator's functions after this library's: glibc's, or another preload's.
+	struct Real {
+		malloc: Malloc,
+		free: Free,
+		calloc: Calloc,
+		realloc: Realloc,
+		posix_memalign: PosixMemalign,
+		aligned_alloc: Aligned,
+		memalign: Aligned,
+		valloc: Malloc,
+		pvalloc: Malloc,
+	}
+
+	/// Whether [`REAL`] is unfound, being found, or found.
+	static STATE: AtomicU8 = AtomicU8::new(0);
+	const UNFOUND: u8 = 0;
+	const FINDING: u8 = 1;
+	const FOUND: u8 = 2;
+
+	struct Shared<T>(UnsafeCell<T>);
+
+	// SAFETY: each user synchronizes its access: REAL is written once before STATE says FOUND, and
+	// the arena's blocks are each bumped apart.
+	unsafe impl<T> Sync for Shared<T> {}
+
+	static REAL: Shared<Option<Real>> = Shared(UnsafeCell::new(None));
+
+	/// Finds `name`, NUL-terminated, after this library, or aborts.
+	fn find(name: &[u8]) -> *mut c_void {
+		// SAFETY: the name is NUL-terminated, and RTLD_NEXT is a handle dlsym takes.
+		let found = unsafe { dlsym(RTLD_NEXT, name.as_ptr().cast()) };
+		if found.is_null() {
+			refuse(b"swole preload: the allocator after this library lacks a function it interposes\n\0");
+		}
+		found
+	}
+
+	/// The allocator's functions, or `None` while they are being found: `dlsym` may allocate,
+	/// which [`bootstrap`] then serves.
+	fn real() -> Option<&'static Real> {
+		if STATE.load(Acquire) != FOUND {
+			if STATE.compare_exchange(UNFOUND, FINDING, Acquire, Acquire).is_err() {
+				// Found already by another thread, or being found by this one, under `dlsym`.
+				if STATE.load(Acquire) != FOUND {
+					return None;
+				}
+			}
+			macro_rules! find {
+				($name:literal) => {
+					// SAFETY: glibc's function of this name has this type.
+					unsafe { core::mem::transmute(find(concat!($name, "\0").as_bytes())) }
+				};
+			}
+			let real = Real {
+				malloc: find!("malloc"),
+				free: find!("free"),
+				calloc: find!("calloc"),
+				realloc: find!("realloc"),
+				posix_memalign: find!("posix_memalign"),
+				aligned_alloc: find!("aligned_alloc"),
+				memalign: find!("memalign"),
+				valloc: find!("valloc"),
+				pvalloc: find!("pvalloc"),
+			};
+			// SAFETY: only this thread writes it, before STATE says FOUND.
+			unsafe { *REAL.0.get() = Some(real) };
+			STATE.store(FOUND, Release);
+		}
+		// SAFETY: written once, before STATE turned FOUND.
+		unsafe { (*REAL.0.get()).as_ref() }
+	}
+
+	// What `dlsym` allocates while the allocator is being found: a bump arena never freed, each
+	// block after a header holding its size, for a `realloc` that moves it out.
+
+	const ARENA: usize = 64 * 1024;
+	const HEADER: usize = 16;
+
+	#[repr(align(16))]
+	struct Arena([u8; ARENA]);
+
+	static BOOT: Shared<Arena> = Shared(UnsafeCell::new(Arena([0; ARENA])));
+	static BOOTED: AtomicUsize = AtomicUsize::new(0);
+
+	fn bootstrap(size: usize) -> *mut c_void {
+		let need = HEADER + size.div_ceil(HEADER) * HEADER;
+		let at = BOOTED.fetch_add(need, Relaxed);
+		if at + need > ARENA {
+			refuse(b"swole preload: the allocator's lookup allocated more than its bootstrap arena holds\n\0");
+		}
+		// SAFETY: `at..at + need` is this call's own range of the arena, which starts zeroed.
+		unsafe {
+			let block = BOOT.0.get().cast::<u8>().add(at);
+			block.cast::<usize>().write(size);
+			block.add(HEADER).cast()
+		}
+	}
+
+	/// The size of a block of the arena, or `None` for a pointer elsewhere.
+	fn booted(ptr: *mut c_void) -> Option<usize> {
+		let start = BOOT.0.get() as usize;
+		let at = ptr as usize;
+		// SAFETY: a block of the arena follows its header.
+		(start + HEADER..start + ARENA)
+			.contains(&at)
+			.then(|| unsafe { ptr.cast::<u8>().sub(HEADER).cast::<usize>().read() })
+	}
+
+	#[unsafe(no_mangle)]
+	pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
+		let Some(real) = real() else {
+			return bootstrap(size);
+		};
+		// SAFETY: the caller's argument, as it passed it.
+		let ptr = unsafe { (real.malloc)(size) };
+		allocated(ptr, size);
+		ptr
+	}
+
+	#[unsafe(no_mangle)]
+	pub unsafe extern "C" fn calloc(n: usize, size: usize) -> *mut c_void {
+		let Some(total) = n.checked_mul(size) else {
+			// The real call refuses it as it would without this library.
+			return match real() {
+				// SAFETY: the caller's arguments, as it passed them.
+				Some(real) => unsafe { (real.calloc)(n, size) },
+				None => core::ptr::null_mut(),
+			};
+		};
+		let Some(real) = real() else {
+			// The arena starts zeroed and never reuses a block.
+			return bootstrap(total);
+		};
+		// SAFETY: the caller's arguments, as it passed them.
+		let ptr = unsafe { (real.calloc)(n, size) };
+		allocated(ptr, total);
+		ptr
+	}
+
+	#[unsafe(no_mangle)]
+	pub unsafe extern "C" fn free(ptr: *mut c_void) {
+		if booted(ptr).is_some() {
+			return;
+		}
+		let Some(real) = real() else {
+			// A block from before the allocator was found, as the loader's own, which is leaked
+			// rather than handed to an allocator that never made it.
+			return;
+		};
+		freed(ptr);
+		// SAFETY: the caller's argument, as it passed it.
+		unsafe { (real.free)(ptr) }
+	}
+
+	/// A `realloc` counts as freeing the old block and allocating the new, as Rust's
+	/// `GlobalAlloc::realloc` replaces one layout with another.
+	#[unsafe(no_mangle)]
+	pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
+		let Some(real) = real() else {
+			let moved = bootstrap(size);
+			if let Some(old) = booted(ptr) {
+				// SAFETY: both are the arena's, `moved` new and at least `size` long.
+				unsafe { core::ptr::copy_nonoverlapping(ptr.cast::<u8>(), moved.cast::<u8>(), old.min(size)) };
+			}
+			return moved;
+		};
+		if let Some(old) = booted(ptr) {
+			// SAFETY: the caller's size, as it passed it.
+			let moved = unsafe { malloc(size) };
+			if !moved.is_null() {
+				// SAFETY: `moved` holds `size` bytes, and the arena's block `old`.
+				unsafe { core::ptr::copy_nonoverlapping(ptr.cast::<u8>(), moved.cast::<u8>(), old.min(size)) };
+			}
+			return moved;
+		}
+		// Out of the table first, since once the allocator frees it another thread may take its
+		// address, but live until the call returns.
+		let old = resizing(ptr);
+		// SAFETY: the caller's arguments, as it passed them.
+		let moved = unsafe { (real.realloc)(ptr, size) };
+		// glibc frees a block resized to nothing, returning null; a failed resize leaves the block
+		// as it was.
+		resized(ptr, old, !moved.is_null() || size == 0);
+		allocated(moved, size);
+		moved
+	}
+
+	/// glibc's `reallocarray`, which calls its own `realloc` past this library's.
+	#[unsafe(no_mangle)]
+	pub unsafe extern "C" fn reallocarray(ptr: *mut c_void, n: usize, size: usize) -> *mut c_void {
+		let Some(total) = n.checked_mul(size) else {
+			super::set_errno(12);
+			return core::ptr::null_mut();
+		};
+		// SAFETY: the caller's block and the size it asked for.
+		unsafe { realloc(ptr, total) }
+	}
+
+	#[unsafe(no_mangle)]
+	pub unsafe extern "C" fn posix_memalign(out: *mut *mut c_void, align: usize, size: usize) -> c_int {
+		let Some(real) = real() else {
+			// SAFETY: abort takes nothing and never returns: the lookup asks for no alignment.
+			unsafe { abort() }
+		};
+		// SAFETY: the caller's arguments, as it passed them.
+		let failed = unsafe { (real.posix_memalign)(out, align, size) };
+		if failed == 0 {
+			// SAFETY: the call succeeded, so it wrote the block's address to `out`.
+			allocated(unsafe { *out }, size);
+		}
+		failed
+	}
+
+	/// Defines the allocating functions that take an alignment, or a page's, and a size.
+	macro_rules! aligned {
+		($($name:ident($($arg:ident: $ty:ty),*) => $size:ident;)*) => {$(
+			#[unsafe(no_mangle)]
+			pub unsafe extern "C" fn $name($($arg: $ty),*) -> *mut c_void {
+				let Some(real) = real() else {
+					// SAFETY: abort takes nothing and never returns: the lookup asks for no alignment.
+					unsafe { abort() }
+				};
+				// SAFETY: the caller's arguments, as it passed them.
+				let ptr = unsafe { (real.$name)($($arg),*) };
+				allocated(ptr, $size);
+				ptr
+			}
+		)*};
+	}
+
+	aligned! {
+		aligned_alloc(align: usize, size: usize) => size;
+		memalign(align: usize, size: usize) => size;
+		valloc(size: usize) => size;
+		pvalloc(size: usize) => size;
+	}
+}
