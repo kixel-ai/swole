@@ -1089,7 +1089,11 @@ impl Together<'_> {
 /// counted in a pass of its own.
 fn breakdown(together: &Together) -> Vec<crate::Measure> {
 	let mut out = Vec::new();
-	let percent = |name: &str, share: f64| crate::Measure::new(name, 100.0 * share.max(0.0), "%");
+	// A share is a difference of counts or of shares at most, so one under a billionth is rounding.
+	let percent = |name: &str, share: f64| {
+		let share = if share < 1e-9 { 0.0 } else { share };
+		crate::Measure::new(name, 100.0 * share, "%")
+	};
 	// A second-level share and what is left of its parent.
 	let split = |out: &mut Vec<crate::Measure>, [part, rest]: [&str; 2], parent: f64, share: f64| {
 		let parent = parent.max(0.0);
