@@ -37,9 +37,10 @@ const SAMPLE: &str = "swole sample ";
 /// what the time holds alone.
 const PROFILE: &str = "SWOLE_PROFILE";
 
-/// What a timed run prints, alone on a line before its first sample, when it profiles as
-/// `SWOLE_PROFILE` asks; one too old to prints nothing.
-const PROFILES: &str = "swole profiles";
+/// What a timed run prints before its first sample, when it profiles as `SWOLE_PROFILE` asks,
+/// with what its clock brackets: `sample`, a sample's calls at once, `call`, each call alone, or
+/// `own`, each run of a benchmark that times itself; one too old to prints nothing.
+const PROFILES: &str = "swole profiles ";
 
 /// How many times a benchmark that times itself runs its work, as a loop takes it:
 /// `for _ in iterations`.
@@ -196,7 +197,7 @@ fn run() -> Result<(), String> {
 		});
 		let mut first = throughput.unwrap_or_default();
 		if profiled {
-			first.push_str(&format!("\n{PROFILES}"));
+			first.push_str(&format!("\n{PROFILES}{}", sampler.window()));
 		}
 		return serve(&name, sampler, first, std::io::stdin().lock(), std::io::stdout(), true);
 	}
@@ -638,6 +639,8 @@ pub mod __private {
 		fn self_timed(&self) -> bool {
 			false
 		}
+		/// What its clock brackets, as a profile says: `sample`, `call`, or `own`.
+		fn window(&self) -> &'static str;
 	}
 
 	/// A deterministic, phase-free subset of `iterations` calls: every call when `iterations <=
@@ -1020,6 +1023,10 @@ pub mod __private {
 			calls
 		}
 
+		fn window(&self) -> &'static str {
+			if self.batched::<I, O>() { "sample" } else { "call" }
+		}
+
 		fn time(&mut self, iterations: u64) -> u64 {
 			if self.batched::<I, O>() {
 				// Clones with nothing to drop, so one clock around every call, the clones built
@@ -1086,6 +1093,14 @@ pub mod __private {
 			calls
 		}
 
+		fn window(&self) -> &'static str {
+			if self.before.is_none() && self.after.is_none() && !std::mem::needs_drop::<O>() {
+				"sample"
+			} else {
+				"call"
+			}
+		}
+
 		fn time(&mut self, iterations: u64) -> u64 {
 			if self.before.is_none() && self.after.is_none() && !std::mem::needs_drop::<O>() {
 				// No step and nothing to drop, so one clock around every call.
@@ -1139,6 +1154,10 @@ pub mod __private {
 		fn self_timed(&self) -> bool {
 			true
 		}
+
+		fn window(&self) -> &'static str {
+			"own"
+		}
 	}
 
 	/// A benchmark that times itself, given the iterations to run, borrowing one input
@@ -1163,6 +1182,10 @@ pub mod __private {
 
 		fn self_timed(&self) -> bool {
 			true
+		}
+
+		fn window(&self) -> &'static str {
+			"own"
 		}
 	}
 

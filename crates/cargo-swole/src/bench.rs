@@ -52,8 +52,10 @@ const UNIT: &str = "ns";
 /// it with its clock, so a profile samples what a time holds alone.
 const PROFILE: &str = "SWOLE_PROFILE";
 
-/// What a harness target prints, alone on a line, when it profiles as [`PROFILE`] asks.
-const PROFILES: &str = "swole profiles";
+/// What a harness target prints when it profiles as [`PROFILE`] asks, before what its clock
+/// brackets: `sample`, a sample's calls at once, `call`, each call alone, or `own`, each run of a
+/// benchmark that times itself.
+const PROFILES: &str = "swole profiles ";
 
 /// How much of its calls' time a profile of one side samples, some 5,000 samples' worth.
 const PROFILED: Duration = Duration::from_millis(250);
@@ -432,11 +434,21 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					preload,
 					iterations,
 				};
-				if let (Some(base), Some(head)) = (
-					profile(base, how, &dir.join("base").join("profile"))?,
-					profile(head, how, &dir.join("head").join("profile"))?,
-				) {
-					profiles.insert(name.clone(), [base, head]);
+				// The head's only once the base's can be compared with it.
+				if let Some(base) = profile(base, how, &dir.join("base").join("profile"))?
+					&& let Some(head) = profile(head, how, &dir.join("head").join("profile"))?
+				{
+					// The `prctl`s that start and stop sampling around each call put kernel cycles
+					// of their own in each, which a side sampling a whole sample at once lacks.
+					if base.0 == head.0 {
+						profiles.insert(name.clone(), [base.1, head.1]);
+					} else {
+						eprintln!(
+							"swole: {name}'s clock brackets each {} in the base and each {} in the head, so their samples \
+							 hold unlike harness work and name no functions",
+							base.0, head.0
+						);
+					}
 				}
 			}
 			break (timed, declared, own, watched);
@@ -513,13 +525,19 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 }
 
 /// `cargo`'s args, having Cargo build each benchmark with the symbols and line tables a profile
-/// names inlined functions by, which leave the code it times as it is.
+/// names inlined functions by, which leave the code it times as it is, kept whatever a profile it
+/// inherits strips.
 fn symbols(cargo: &[String]) -> Vec<String> {
-	["--config", "profile.bench.debug=\"limited\""]
-		.into_iter()
-		.map(str::to_owned)
-		.chain(cargo.iter().cloned())
-		.collect()
+	[
+		"--config",
+		"profile.bench.debug=\"limited\"",
+		"--config",
+		"profile.bench.strip=\"none\"",
+	]
+	.into_iter()
+	.map(str::to_owned)
+	.chain(cargo.iter().cloned())
+	.collect()
 }
 
 /// The CPUs `name`'s processes spread over in place of the reserved CPU, when another thread ran
@@ -648,8 +666,9 @@ struct Profiling<'a> {
 
 /// Profiles `job`'s benchmark as `how` says, its output under `dir`, in a timed process of its own
 /// whose clock starts and stops the sampling, so its samples take neither the time's nor the
-/// counters' place; none when its harness is too old to.
-fn profile(job: &Job, how: Profiling, dir: &Path) -> Result<Option<crate::profile::Profile>, String> {
+/// counters' place: what its clock brackets, and the profile. None when its harness is too old
+/// to, or the benchmark times itself, whose calls may hold work its time leaves out.
+fn profile(job: &Job, how: Profiling, dir: &Path) -> Result<Option<(String, crate::profile::Profile)>, String> {
 	#[cfg(target_os = "linux")]
 	{
 		let mut command = Process::command(job, Some(how.cpus), Some(how.preload))?;
@@ -657,10 +676,18 @@ fn profile(job: &Job, how: Profiling, dir: &Path) -> Result<Option<crate::profil
 		let armed = crate::profile::arm(&mut command, how.sampling, how.cpus)?;
 		let mut process = Process::start(&job.label, command, dir)?;
 		let mut rings = armed.rings(process.child.id())?;
-		if !process.profiles {
+		let Some(window) = process.profiles.take() else {
 			process.finish()?;
 			eprintln!(
 				"swole: {}'s swole harness is too old to profile, so its change names no functions",
+				job.label
+			);
+			return Ok(None);
+		};
+		if window == "own" {
+			process.finish()?;
+			eprintln!(
+				"swole: {} times itself, so its samples could hold work its time leaves out, and name no functions",
 				job.label
 			);
 			return Ok(None);
@@ -688,6 +715,13 @@ fn profile(job: &Job, how: Profiling, dir: &Path) -> Result<Option<crate::profil
 				job.label, samples.lost, samples.throttled
 			));
 		}
+		// A ring that filled may have dropped samples the kernel had no later room to say it dropped.
+		if samples.filled > 0 {
+			return Err(format!(
+				"{}: a sample of {} calls filled a CPU's ring buffer while profiling it, so its profile may miss cycles",
+				job.label, how.iterations
+			));
+		}
 		if samples.count() == 0 {
 			return Err(format!(
 				"{}: profiling its calls for {} ms took no samples",
@@ -695,7 +729,21 @@ fn profile(job: &Job, how: Profiling, dir: &Path) -> Result<Option<crate::profil
 				timed.as_millis()
 			));
 		}
-		samples.resolve(&maps, calls).map(Some)
+		let profile = samples.resolve(&maps, calls)?;
+		// The kernel names a mapping by its real path.
+		let executable = std::fs::canonicalize(job.command().get_program()).ok();
+		if profile
+			.bare
+			.iter()
+			.any(|object| Some(Path::new(object)) == executable.as_deref())
+		{
+			eprintln!(
+				"swole: {} has neither symbols nor debug info, so its samples name no function: a profile that sets \
+				 `strip` past what bench builds with removes them",
+				job.label
+			);
+		}
+		Ok(Some((window, profile)))
 	}
 	#[cfg(not(target_os = "linux"))]
 	{
@@ -1247,8 +1295,9 @@ struct Process {
 	own_timer: bool,
 	/// Whether its harness can count with counters every thread inherits, as it says once.
 	inherits: bool,
-	/// Whether its harness starts and stops a profile's sampling with its clock, as it says once.
-	profiles: bool,
+	/// What its clock brackets, when its harness starts and stops a profile's sampling with it,
+	/// as it says once.
+	profiles: Option<String>,
 }
 
 impl Process {
@@ -1303,7 +1352,7 @@ impl Process {
 			throughput: None,
 			own_timer: false,
 			inherits: false,
-			profiles: false,
+			profiles: None,
 		};
 		let first = process.sample(1)?;
 		process.threaded |= first.threaded;
@@ -1462,8 +1511,11 @@ impl Side for Process {
 				self.inherits = true;
 				continue;
 			}
-			if line.strip_suffix(b"\n") == Some(PROFILES.as_bytes()) {
-				self.profiles = true;
+			if let Some(window) = line
+				.strip_prefix(PROFILES.as_bytes())
+				.and_then(|rest| rest.strip_suffix(b"\n"))
+			{
+				self.profiles = Some(String::from_utf8_lossy(window).into_owned());
 				continue;
 			}
 			self.log

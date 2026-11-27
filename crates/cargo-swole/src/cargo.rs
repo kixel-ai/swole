@@ -96,6 +96,7 @@ impl Launch {
 			.current_dir(&self.dir)
 			.envs(&self.env)
 			.env_remove(HARNESS_TIME)
+			.env_remove("SWOLE_PROFILE")
 			.env("CODSPEED_CARGO_WORKSPACE_ROOT", root)
 			// Only a native count sets them, on a job whose counters swole opened.
 			.env_remove(crate::perf::COUNTERS)

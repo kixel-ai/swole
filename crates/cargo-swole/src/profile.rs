@@ -28,6 +28,8 @@ pub struct Profile {
 	pub functions: BTreeMap<Function, f64>,
 	/// How many samples it holds.
 	pub samples: u64,
+	/// The files sampled that hold neither a symbol table nor debug info, whose samples name no function.
+	pub bare: BTreeSet<String>,
 }
 
 /// What a profile's ring buffers held: each user-space instruction pointer's cycles, the
@@ -41,6 +43,8 @@ pub struct Samples {
 	pub lost: u64,
 	/// How often the kernel stopped sampling for a while, since interrupts came too fast.
 	pub throttled: u64,
+	/// How often a drain found a ring buffer full, which may have dropped samples unsaid.
+	pub filled: u64,
 }
 
 impl Samples {
@@ -53,6 +57,7 @@ impl Samples {
 		self.count += other.count;
 		self.lost += other.lost;
 		self.throttled += other.throttled;
+		self.filled += other.filled;
 	}
 
 	/// How many samples it holds.
@@ -64,6 +69,7 @@ impl Samples {
 	pub fn resolve(&self, maps: &str, calls: u64) -> Result<Profile, String> {
 		let mappings = mappings(maps)?;
 		let mut objects: HashMap<&str, Option<Object>> = HashMap::new();
+		let mut bare = BTreeSet::new();
 		let mut cycles: BTreeMap<Function, u64> = BTreeMap::new();
 		if self.kernel > 0 {
 			*cycles.entry(function("[kernel]", "kernel")).or_default() += self.kernel;
@@ -89,6 +95,9 @@ impl Samples {
 							.flatten()
 					});
 					// A mapping of no file, such as `[vdso]`, names its samples itself.
+					if object.as_ref().is_some_and(|object| object.bare) {
+						bare.insert(mapping.path.clone());
+					}
 					let name = match object {
 						Some(object) => object
 							.function(ip - mapping.start + mapping.offset)
@@ -108,6 +117,7 @@ impl Samples {
 				.map(|(function, cycles)| (function, cycles as f64 / calls as f64))
 				.collect(),
 			samples: self.count,
+			bare,
 		})
 	}
 }
@@ -178,6 +188,8 @@ struct Object {
 	loader: addr2line::Loader,
 	/// Each loaded segment's offset and size in the file, and its address.
 	segments: Vec<(u64, u64, u64)>,
+	/// Whether it holds neither a symbol table nor debug info.
+	bare: bool,
 }
 
 impl Object {
@@ -193,9 +205,11 @@ impl Object {
 				(offset, size, segment.address())
 			})
 			.collect();
+		let bare = file.symbol_table().is_none() && !file.has_debug_symbols();
 		Some(Self {
 			loader: addr2line::Loader::new(path).ok()?,
 			segments,
+			bare,
 		})
 	}
 
@@ -269,9 +283,9 @@ pub fn table(profiles: &BTreeMap<String, [Profile; 2]>, sampling: &crate::perf::
 			if out.is_empty() {
 				write!(
 					out,
-					"\nFunctions behind each time change, by self cycles a call sampled with {} ({}), up to five for each \
-					 benchmark:\n\n\
-					 | benchmark | measure | function | base | head | change (of benchmark) |\n\
+					"\nFunctions whose CPU cycles moved with each time change, each one's own cycles a call on every \
+					 thread, sampled with {} ({}), up to five for each benchmark:\n\n\
+					 | benchmark | measure | function | base | head | change (of benchmark's cycles) |\n\
 					 |---|---|---|---:|---:|---:|\n",
 					crate::perf::Sampling::NAME,
 					sampling.by
@@ -447,6 +461,7 @@ mod tests {
 					(function("[unmapped]", ""), 2.0),
 				]),
 				samples: 3,
+				bare: BTreeSet::new(),
 			}
 		);
 	}
@@ -461,6 +476,7 @@ mod tests {
 				})
 				.collect(),
 			samples: 1000,
+			bare: BTreeSet::new(),
 		}
 	}
 
@@ -483,7 +499,8 @@ mod tests {
 			&[("decode", 1400.0), ("alloc", 560.0), ("main", 100.0), ("new", 30.0)],
 		);
 		assert!(table.starts_with(
-			"\nFunctions behind each time change, by self cycles a call sampled with cycles:pp (AMD IBS op)"
+			"\nFunctions whose CPU cycles moved with each time change, each one's own cycles a call on every thread, \
+			 sampled with cycles:pp (AMD IBS op)"
 		));
 		let rows: Vec<&str> = table.lines().filter(|row| row.starts_with("| bench |")).collect();
 		// +400 and +60 and +30 and -40 make +450: decode alone is the majority, past the least three.
@@ -750,6 +767,10 @@ mod linux {
 	const DATA_OFFSET: usize = 1040;
 	const DATA_SIZE: usize = 1048;
 
+	/// The largest record a profile's event writes: a sample's header, instruction pointer,
+	/// process and thread, and period.
+	const MOST_RECORD: usize = 32;
+
 	/// The records a profile reads.
 	const PERF_RECORD_LOST: u32 = 2;
 	const PERF_RECORD_THROTTLE: u32 = 5;
@@ -819,6 +840,11 @@ mod linux {
 		fn drain(&mut self, pid: u32, samples: &mut Samples) -> Result<(), String> {
 			let head = self.word(DATA_HEAD).load(Ordering::Acquire);
 			let mut tail = self.word(DATA_TAIL).load(Ordering::Relaxed);
+			// Without room for another record, the kernel dropped what came next, and says so only
+			// in a record it writes once there is room again, which may never come.
+			if head - tail > (self.size - MOST_RECORD) as u64 {
+				samples.filled += 1;
+			}
 			while tail < head {
 				let header = self.copy(tail, 8);
 				let kind = u32::from_ne_bytes(header[0..4].try_into().expect("4 bytes"));

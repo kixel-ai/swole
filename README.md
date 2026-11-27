@@ -474,15 +474,20 @@ whole and keeps the process's samples alone, since an event each thread inherite
 period afresh with every thread and miss a worker that lives shorter than one. The harness starts
 the sampling as its clock starts and stops it as the clock stops, so setup, steps, and inputs
 built between calls stay out of a profile as they stay out of a time, and neither the times nor
-the counters share a process with it. swole resolves each sample's instruction pointer against the executable or library mapped
-there, by the symbols and line tables `bench` builds every benchmark with
-(`profile.bench.debug = "limited"`, which leaves the code it times as it is), and names the
+the counters share a process with it. swole resolves each sample's instruction pointer against
+the executable or library mapped there, by the symbols and line tables `bench` builds every
+benchmark with (`profile.bench.debug = "limited"` and `profile.bench.strip = "none"`, which leave
+the code it times as it is), and names the
 innermost function inlined there that is not Rust's standard library's, whose generic helpers
 count as the code that called them; a sample in the kernel counts as `[kernel]`. A table under
-the measures prints the three to five functions whose sampled self cycles a call (`~`) moved the
-benchmark's most its way, past three only until they explain the majority of its change, and `--report` writes every function of each side under the
-benchmark's `functions`. A sample the kernel dropped, or a stretch it stopped sampling, fails the
-run, since the other functions would claim its cycles.
+the measures prints the three to five functions whose sampled self cycles a call (`~`), on every
+thread, moved the benchmark's cycles most its way, past three only until they explain the
+majority of that change, and `--report` writes every function of each side under the
+benchmark's `functions`. A sample the kernel dropped, a stretch it stopped sampling, or a ring
+buffer that filled fails the run, since the other functions would claim its cycles. A benchmark
+that times itself names no functions, since its calls may hold work its time leaves out, nor does
+one whose two sides' clocks bracket unlike windows, such as a sample's calls in one and each call
+alone in the other.
 
 Sampling needs a PMU that takes precise samples, which a VM's often lacks, and, since it samples
 whole CPUs, `perf_event_paranoid` at most 0 or `CAP_PERFMON`, as [Privileges](#privileges)
