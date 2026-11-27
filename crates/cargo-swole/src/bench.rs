@@ -142,13 +142,13 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	match &reservation {
 		Some(reservation) => {
 			eprintln!("swole: {}", reservation.describe());
-			native.governor = Some(reservation.governor.active().to_owned());
+			native.governor = Some(reservation.governor().to_owned());
 		}
 		None => {
 			eprintln!("swole: timing on whichever CPUs the host schedules, since swole leases a core on Linux alone")
 		}
 	}
-	let exclusive = reservation.as_ref().map(|reservation| vec![reservation.cpu]);
+	let exclusive = reservation.as_ref().map(|reservation| vec![reservation.cpu()]);
 	let work = work(Path::new("."))?;
 	let mut coin = Coin::seeded();
 	let mut times = BTreeMap::new();
@@ -170,19 +170,19 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 		let head = after.remove(&name);
 		let (timed, iterations, used, timed_threaded, cpus) = match (&base, &head) {
 			(Some(base), Some(head)) => {
-				let spawn = |cpus| -> Result<(Process, Process), String> {
+				let spawn = |cpus: Option<&[usize]>| -> Result<(Process, Process), String> {
 					Ok((
 						Process::spawn(base, cpus, preload.as_deref(), &dir.join("base"))?,
 						Process::spawn(head, cpus, preload.as_deref(), &dir.join("head"))?,
 					))
 				};
-				let mut cpus = exclusive.as_deref();
-				let (mut base, mut head) = spawn(cpus)?;
-				if let Some(spread) = spread(reservation.as_ref(), &name, base.threaded || head.threaded) {
+				let mut cpus = exclusive.clone();
+				let (mut base, mut head) = spawn(cpus.as_deref())?;
+				if let Some(spread) = spread(reservation.as_ref(), &name, base.threaded || head.threaded)? {
 					base.finish()?;
 					head.finish()?;
 					cpus = Some(spread);
-					(base, head) = spawn(cpus)?;
+					(base, head) = spawn(cpus.as_deref())?;
 				}
 				let (iterations, pairs) = paired(&mut base, &mut head, &mut coin)?;
 				let base_threaded = base.threaded || pairs.iter().any(|(b, _)| b.threaded);
@@ -209,12 +209,12 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					(None, Some(head)) => (Which::Head, head),
 					_ => unreachable!("every name is one side's"),
 				};
-				let mut cpus = exclusive.as_deref();
-				let mut process = Process::spawn(job, cpus, preload.as_deref(), &dir.join(side.name()))?;
-				if let Some(spread) = spread(reservation.as_ref(), &name, process.threaded) {
+				let mut cpus = exclusive.clone();
+				let mut process = Process::spawn(job, cpus.as_deref(), preload.as_deref(), &dir.join(side.name()))?;
+				if let Some(spread) = spread(reservation.as_ref(), &name, process.threaded)? {
 					process.finish()?;
 					cpus = Some(spread);
-					process = Process::spawn(job, cpus, preload.as_deref(), &dir.join(side.name()))?;
+					process = Process::spawn(job, cpus.as_deref(), preload.as_deref(), &dir.join(side.name()))?;
 				}
 				let (iterations, samples) = alone(&mut process)?;
 				let side_threaded = process.threaded || samples.iter().any(|sample| sample.threaded);
@@ -249,7 +249,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 			} else {
 				match (perf, &preload) {
 					(Some(perf), Some(preload)) => {
-						let cpus = cpus.unwrap_or(&perf.pmu.cpus);
+						let cpus = cpus.as_deref().unwrap_or(&perf.pmu.cpus);
 						let (counted, count_libc) =
 							count(job, perf, cpus, preload, iterations, &dir.join(side.name()))?;
 						libcs.push((format!("{name} ({} counters)", side.name()), count_libc));
@@ -328,14 +328,22 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 
 /// The CPUs `name`'s processes spread over in place of the reserved CPU, when another thread ran
 /// beside its first call, which one CPU would serialize.
-fn spread<'a>(reservation: Option<&'a crate::cores::Reservation>, name: &str, threaded: bool) -> Option<&'a [usize]> {
-	let reservation = reservation.filter(|_| threaded)?;
+fn spread(
+	reservation: Option<&crate::cores::Reservation>,
+	name: &str,
+	threaded: bool,
+) -> Result<Option<Vec<usize>>, String> {
+	let Some(reservation) = reservation.filter(|_| threaded) else {
+		return Ok(None);
+	};
+	let spread = reservation.spread()?;
 	eprintln!(
-		"swole: {name} runs other threads, so it times on CPUs {} rather than CPU {} alone",
-		perf::list(&reservation.spread),
-		reservation.cpu
+		"swole: {name} runs other threads, so it times on CPUs {}, every core no other swole run leases, rather \
+		 than CPU {} alone",
+		perf::list(&spread),
+		reservation.cpu()
 	);
-	Some(&reservation.spread)
+	Ok(Some(spread))
 }
 
 /// What the process used over `samples`, in all, and how many samples that took, when its harness
@@ -841,10 +849,11 @@ struct Process {
 }
 
 impl Process {
-	/// Starts `job`'s target timing its benchmark, pinned to `cpus` when given, preloading `preload` (threads-only) when
-	/// perf counters are available so short-lived workers spawned during timed samples are detected,
-	/// its output in `dir`, and waits until its benchmark is set up: a sample of one call, which
-	/// no time keeps, answers only after setup, so no kept sample's wall time takes it in.
+	/// Starts `job`'s target timing its benchmark, pinned to `cpus` when given, preloading `preload`
+	/// (threads-only) when perf counters are available so short-lived workers spawned during timed
+	/// samples are detected, its output in `dir`, and waits until its benchmark is set up: a sample
+	/// of one call, which no time keeps, answers only after setup, so no kept sample's wall time
+	/// takes it in.
 	fn spawn(job: &Job, cpus: Option<&[usize]>, preload: Option<&Path>, dir: &Path) -> Result<Self, String> {
 		let label = job.label.clone();
 		let mut command = job.command();

@@ -12,14 +12,10 @@ Decided 2026-11-26 (maintainer, `/quest-plan`, splitting the former `quest/m0/de
 
 Recommendations for the implementer:
 
-- Extend [exclusive cores](/quest/m0/exclusive-cores.md)' lease mechanism with a host-enforced whole-socket lease, active only when the host exposes L0; a pass that cannot take a host-enforced whole-socket lease fails loudly rather than reporting socket-wide counts on a shared host (a cooperative lockfile cannot keep an unrelated process, such as a Nix build, off the socket). A host with more than one package fails the pass too: moving a task's CPUs leaves its memory on the measured socket's controllers, and no host here has two sockets to justify isolating NUMA memory.
+- Extend `swole bench`'s core lease (`crates/cargo-swole/src/cores.rs`, a cooperative lock per physical core in `/dev/shm/swole`) with a host-enforced whole-socket lease, active only when the host exposes L0; a pass that cannot take a host-enforced whole-socket lease fails loudly rather than reporting socket-wide counts on a shared host (a cooperative lockfile cannot keep an unrelated process, such as a Nix build, off the socket). A host with more than one package fails the pass too: moving a task's CPUs leaves its memory on the measured socket's controllers, and no host here has two sockets to justify isolating NUMA memory.
 - Probe `/sys/bus/event_source/devices/` for `power` / `power_core` (RAPL `energy-pkg`, `energy-cores` with their `*.scale` and `*.unit` sysfs files) and uncore memory/L3 PMUs (`amd_l3`, `amd_df`, `amd_umc_*` on AMD; `uncore_imc_*` on Intel), failing loudly if a probed sysfs event cannot open.
 - Report energy in joules (or microjoules) per iteration, and memory bandwidth / L3 misses as socket-wide counts for the pass, labeled clearly as socket-wide measurements that include device traffic (timed like wall clock rather than trusted as exact counts).
 - Verify on a real Linux host (`fedora` / `nixos`, AMD Zen 5 or Intel Core Ultra) that a memory-streaming benchmark moves DRAM bandwidth and energy cleanly.
-
-## Required
-
-- [Exclusive pinned cores for bench mode](/quest/m0/exclusive-cores.md) - its lease mechanism grants the host-enforced whole-socket lease this pass needs
 
 ## Hosts
 

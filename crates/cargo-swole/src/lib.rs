@@ -6,7 +6,35 @@ mod bench;
 mod callgrind;
 mod cargo;
 mod compare;
+#[cfg(target_os = "linux")]
 mod cores;
+/// No host but Linux leases a core.
+#[cfg(not(target_os = "linux"))]
+mod cores {
+	pub enum Reservation {}
+
+	impl Reservation {
+		pub fn cpu(&self) -> usize {
+			match *self {}
+		}
+
+		pub fn governor(&self) -> &str {
+			match *self {}
+		}
+
+		pub fn spread(&self) -> Result<Vec<usize>, String> {
+			match *self {}
+		}
+
+		pub fn describe(&self) -> String {
+			match *self {}
+		}
+	}
+
+	pub fn reserve(_: Option<&crate::perf::Pmu>) -> Result<Option<Reservation>, String> {
+		Ok(None)
+	}
+}
 mod fingerprint;
 mod metrics;
 #[cfg_attr(

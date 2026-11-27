@@ -178,11 +178,12 @@ it, how many CPUs the run may use, and everything the [capability probe](#capabi
 core PMU and its counters, and the passes the probe packed them into; on Linux, the mapped libc
 image (by ELF build ID) loaded by the benchmark processes (refusing runs that mix libc builds or
 leave a process's libc unverified) and `GLIBC_TUNABLES`, which pick glibc's string and memory
-routines; and for `quick`, the preload. `swole fingerprint quick` and `swole fingerprint bench`
-run a standalone host probe using the runner's own libc, printing that probe's label and inputs
-on stderr; when a workspace's benchmark targets load a different libc (such as a Nix-packaged
-runner running benchmarks built in a project dev shell), `quick` and `bench` fingerprint the
-benchmark's mapped libc instead, so look up a measurement series by the fingerprint printed by
+routines; for `quick`, the preload; and for `bench`, the cpufreq governor of the
+[core](#cores) it times on. `swole fingerprint quick` and `swole fingerprint bench`
+run a standalone host probe using the runner's own libc and leasing no core, printing that probe's
+label and inputs on stderr; when a workspace's benchmark targets load a different libc (such as a
+Nix-packaged runner running benchmarks built in a project dev shell), `quick` and `bench`
+fingerprint the benchmark's mapped libc instead, and `bench` the governor it found, so look up a measurement series by the fingerprint printed by
 the run or recorded in `--out` / `--report`.
 
 Valgrind 3.27.1 on x86_64 presents one fixed Intel CPU, not the host's: an AMD Ryzen 9 9950X
@@ -381,9 +382,8 @@ Beside each time, `bench` reports what the process used over its samples, from `
 Linux and macOS: user and system CPU time, minor and major page faults, and voluntary and
 involuntary context switches, each a call's share, and the process's peak resident memory.
 Each covers a sample's whole, steps and inputs built between calls included, which the clock
-leaves out. Where the host has perf counters, `bench` pins both the timing and counting processes
-to the probed core PMU's CPUs so times and counters measure the same cores on hybrid hosts, and
-counts each side's benchmark with every counter the [probe](#capabilities) found, one process for
+leaves out. Where the host has perf counters, `bench` times and counts on the same
+[core](#cores), and counts each side's benchmark with every counter the [probe](#capabilities) found, one process for
 each pass, each calling the benchmark as many times as a sample did and counting a deterministic
 stratified subset of up to 64 of those calls (the same calls in every pass and on both sides), a
 counter's share of a call. Both the timing and counter processes run under the preload built to
@@ -394,6 +394,39 @@ the calling thread alone, and a note under the table names it. A table after the
 prints every measure of each benchmark, beside the base's and its change when paired, and
 `--report` writes them all. A side whose harness predates counters, as a base from before an
 upgrade, says so and has none; one whose harness predates rusage has none of that.
+
+### Cores
+
+On Linux, `bench` leases one physical core once its builds are done and runs every benchmark
+process on that core's first hardware thread, so a sample never migrates and a pair's two sides
+run on one core. The lease is an advisory lock on a file in `/dev/shm/swole`, shared by every
+user, which the kernel drops however the run ends: no other `swole bench` uses any hardware
+thread of the core meanwhile, so concurrent runs take disjoint cores and never contend through an
+SMT sibling. A run takes the last free core, leaving the first, where the kernel does most of its
+own work, for last, and waits for one when other runs hold them all. On a hybrid Intel host it
+takes a performance core, counted by the `cpu_core` PMU, while `quick` counts on the PMU of the
+most CPUs. A benchmark that starts another thread in its first call would have its threads
+serialized on one CPU, so it times and counts on every CPU the run may use instead, which the run
+says.
+
+The lease keeps other `swole bench` runs off the core, not the host's other processes, which
+the run says unless the kernel isolates the CPU (`isolcpus`, listed in
+`/sys/devices/system/cpu/isolated`).
+
+Where swole may write the core's cpufreq policy, and the policy sets no CPU outside the core, a
+run switches the core to the `performance` governor, recording what it changed in the lease's file
+first, and restores the governor and energy preference when it exits or a SIGINT, SIGTERM, or
+SIGHUP ends it; the next run to lease the core restores what a run killed outright left. Elsewhere
+it times under the host's governor and says why. Either way the governor it times under enters
+the [fingerprint](#fingerprints), so times under two governors never share a series. sysfs
+attributes take a group and mode, so a host grants its benchmarking group the governors and
+energy preferences at boot:
+
+```bash
+# /etc/tmpfiles.d/swole-cpufreq.conf
+z /sys/devices/system/cpu/cpufreq/policy*/scaling_governor               0664 root wheel -
+z /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference  0664 root wheel -
+```
 
 ## Output
 

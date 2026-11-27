@@ -1,10 +1,11 @@
 //! The physical core a `bench` run times on, leased from every other swole run on the host.
 //!
-//! A run leases one physical core with an advisory lock on a file in [`LEASES`], which the kernel
-//! drops however the run ends, and times every benchmark on the core's first hardware thread. No
-//! other swole run uses any of the core's threads while the lease is held, so two runs never share
-//! a core or contend through its SMT sibling. The lease keeps other swole runs off the core, not
-//! the host's other processes: only the kernel's isolated CPUs keep those off, which the run says.
+//! A run leases one physical core with an open file description lock on a file in [`LEASES`],
+//! which the kernel drops however the run ends, and times every benchmark on the core's first
+//! hardware thread. No other swole run uses any of the core's threads while the lease is held, so
+//! two runs never share a core or contend through its SMT sibling. The lease keeps other swole
+//! runs off the core, not the host's other processes: only the kernel's isolated CPUs keep those
+//! off, which the run says.
 //!
 //! Where swole may write the core's cpufreq policy, it switches it to the `performance` governor
 //! for the run, recording what it changed in the lease's file first, and restores it on exit or on
@@ -19,11 +20,9 @@ use crate::perf;
 
 /// Where every swole run on the host leases cores: a tmpfs every user may write, which a reboot
 /// empties as it resets every governor.
-#[cfg(target_os = "linux")]
 const LEASES: &str = "/dev/shm/swole";
 
 /// Where the kernel describes each CPU.
-#[cfg(target_os = "linux")]
 const SYS: &str = "/sys/devices/system/cpu";
 
 /// The governor a run times under, where swole may set it.
@@ -35,23 +34,23 @@ const TUNED: [&str; 2] = ["scaling_governor", "energy_performance_preference"];
 
 /// The physical core a run holds, and the CPU it times on.
 pub struct Reservation {
-	/// The CPU every benchmark process runs on.
-	pub cpu: usize,
+	cpu: usize,
 	/// Every hardware thread of its core, which no other swole run uses meanwhile.
-	pub core: Vec<usize>,
-	/// The CPUs a benchmark that runs other threads spreads over instead, since one CPU would
-	/// serialize them.
-	pub spread: Vec<usize>,
+	core: Vec<usize>,
+	/// Every core the run may time on, its own among them, each its hardware threads.
+	cores: Vec<Vec<usize>>,
+	/// Where the leases of `cores` are.
+	leases: PathBuf,
 	/// Whether the kernel keeps other processes off the CPU.
-	pub isolated: bool,
-	pub governor: Governor,
+	isolated: bool,
+	governor: Governor,
 	/// What to write back on drop, before the lease's lock is released.
 	restore: Option<Box<Restore>>,
 	lease: File,
 }
 
 /// The cpufreq governor a run times under.
-pub enum Governor {
+enum Governor {
 	/// The CPU has no cpufreq policy, as in many VMs.
 	Absent,
 	/// The host's own, and why swole left it.
@@ -60,18 +59,34 @@ pub enum Governor {
 	Set { was: String },
 }
 
-impl Governor {
+impl Reservation {
+	/// The CPU every benchmark process runs on.
+	pub fn cpu(&self) -> usize {
+		self.cpu
+	}
+
 	/// The governor active while the run times, as the fingerprint names it.
-	pub fn active(&self) -> &str {
-		match self {
-			Self::Absent => "none",
-			Self::Kept { governor, .. } => governor,
-			Self::Set { .. } => PERFORMANCE,
+	pub fn governor(&self) -> &str {
+		match &self.governor {
+			Governor::Absent => "none",
+			Governor::Kept { governor, .. } => governor,
+			Governor::Set { .. } => PERFORMANCE,
 		}
 	}
-}
 
-impl Reservation {
+	/// The CPUs a benchmark that runs other threads spreads over instead, since one CPU would
+	/// serialize them: its own core's, and every other core no other swole run leases now.
+	pub fn spread(&self) -> Result<Vec<usize>, String> {
+		let mut cpus = Vec::new();
+		for core in &self.cores {
+			if *core == self.core || !leased(&self.leases, core)? {
+				cpus.extend(core);
+			}
+		}
+		cpus.sort_unstable();
+		Ok(cpus)
+	}
+
 	/// What the run holds, in a line.
 	pub fn describe(&self) -> String {
 		let others = if self.isolated {
@@ -95,7 +110,7 @@ impl Reservation {
 impl Drop for Reservation {
 	fn drop(&mut self) {
 		if let Some(restore) = self.restore.take() {
-			restore.disarm();
+			signals::disarm();
 			if let Err(err) = restore.apply(&mut self.lease) {
 				eprintln!("swole: {err}");
 			}
@@ -105,24 +120,17 @@ impl Drop for Reservation {
 
 /// Leases a physical core of `pmu`'s CPUs, or without counters of the performance cores swole may
 /// run on, waiting for one when other swole runs hold them all, and sets its governor where
-/// swole may; off Linux, none.
-#[cfg(target_os = "linux")]
+/// swole may.
 pub fn reserve(pmu: Option<&perf::Pmu>) -> Result<Option<Reservation>, String> {
 	let candidates = match pmu {
 		Some(pmu) => pmu.cpus.clone(),
 		None => performance()?,
 	};
-	reserve_in(Path::new(SYS), Path::new(LEASES), candidates).map(Some)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn reserve(_: Option<&perf::Pmu>) -> Result<Option<Reservation>, String> {
-	Ok(None)
+	reserve_in(Path::new(SYS), Path::new(LEASES), &candidates).map(Some)
 }
 
 /// The CPUs swole may run on, only the performance cores' on a hybrid Intel host that lets it run
 /// on one.
-#[cfg(target_os = "linux")]
 fn performance() -> Result<Vec<usize>, String> {
 	let allowed = perf::allowed()?;
 	let path = Path::new(perf::PMUS).join(perf::PERFORMANCE).join("cpus");
@@ -138,8 +146,8 @@ fn performance() -> Result<Vec<usize>, String> {
 }
 
 /// [`reserve`] with the kernel's CPUs described under `sys` and leases in `leases`.
-fn reserve_in(sys: &Path, leases: &Path, candidates: Vec<usize>) -> Result<Reservation, String> {
-	let cores = cores(sys, &candidates)?;
+fn reserve_in(sys: &Path, leases: &Path, candidates: &[usize]) -> Result<Reservation, String> {
+	let cores = cores(sys, candidates)?;
 	let (core, mut lease) = lease(leases, &cores)?;
 	recover(sys, &mut lease)?;
 	let cpu = *core
@@ -154,7 +162,8 @@ fn reserve_in(sys: &Path, leases: &Path, candidates: Vec<usize>) -> Result<Reser
 	Ok(Reservation {
 		cpu,
 		core,
-		spread: candidates,
+		cores,
+		leases: leases.to_owned(),
 		isolated,
 		governor,
 		restore,
@@ -191,10 +200,8 @@ fn lease(leases: &Path, cores: &[Vec<usize>]) -> Result<(Vec<usize>, File), Stri
 	shared(leases)?;
 	for core in cores {
 		let file = open(leases, core)?;
-		match file.try_lock() {
-			Ok(()) => return Ok((core.clone(), file)),
-			Err(std::fs::TryLockError::WouldBlock) => {}
-			Err(std::fs::TryLockError::Error(e)) => return Err(format!("cannot lease core {}: {e}", core[0])),
+		if lock(&file, F_OFD_SETLK).map_err(|e| format!("cannot lease core {}: {e}", core[0]))? {
+			return Ok((core.clone(), file));
 		}
 	}
 	let core = &cores[0];
@@ -203,8 +210,68 @@ fn lease(leases: &Path, cores: &[Vec<usize>]) -> Result<(Vec<usize>, File), Stri
 		core[0]
 	);
 	let file = open(leases, core)?;
-	file.lock().map_err(|e| format!("cannot lease core {}: {e}", core[0]))?;
+	lock(&file, F_OFD_SETLKW).map_err(|e| format!("cannot lease core {}: {e}", core[0]))?;
 	Ok((core.clone(), file))
+}
+
+/// Whether another swole run leases `core` now, without leasing it.
+fn leased(leases: &Path, core: &[usize]) -> Result<bool, String> {
+	let file = match File::open(leases.join(format!("core{}", core[0]))) {
+		Ok(file) => file,
+		// No run ever leased it since boot.
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+		Err(e) => return Err(format!("cannot read core {}'s lease: {e}", core[0])),
+	};
+	lock(&file, F_OFD_GETLK)
+		.map(|free| !free)
+		.map_err(|e| format!("cannot read core {}'s lease: {e}", core[0]))
+}
+
+const F_OFD_GETLK: i32 = 36;
+const F_OFD_SETLK: i32 = 37;
+const F_OFD_SETLKW: i32 = 38;
+
+/// Takes, waits for, or with [`F_OFD_GETLK`] only tests, the write lock of all of `file` for its
+/// open file description, which every descriptor of it shares and the kernel releases with the
+/// last: whether it was free.
+fn lock(file: &File, command: i32) -> std::io::Result<bool> {
+	/// `struct flock`, which an open file description's lock takes with `l_pid` 0.
+	#[repr(C)]
+	struct Flock {
+		l_type: i16,
+		l_whence: i16,
+		l_start: i64,
+		l_len: i64,
+		l_pid: i32,
+	}
+	const F_WRLCK: i16 = 1;
+	const F_UNLCK: i16 = 2;
+	const EAGAIN: i32 = 11;
+	const EACCES: i32 = 13;
+	const EINTR: i32 = 4;
+	unsafe extern "C" {
+		fn fcntl(fd: i32, command: i32, ...) -> i32;
+	}
+	loop {
+		let mut flock = Flock {
+			l_type: F_WRLCK,
+			l_whence: 0,
+			l_start: 0,
+			l_len: 0,
+			l_pid: 0,
+		};
+		// SAFETY: a descriptor of `file`, and a `struct flock` the call reads and may write.
+		let result = unsafe { fcntl(std::os::fd::AsRawFd::as_raw_fd(file), command, &mut flock as *mut Flock) };
+		if result == 0 {
+			return Ok(command != F_OFD_GETLK || flock.l_type == F_UNLCK);
+		}
+		let err = std::io::Error::last_os_error();
+		match err.raw_os_error() {
+			Some(EAGAIN | EACCES) if command == F_OFD_SETLK => return Ok(false),
+			Some(EINTR) => {}
+			_ => return Err(err),
+		}
+	}
 }
 
 /// Creates `dir` for every user's leases, as `/tmp` is shared, when no run has yet.
@@ -294,24 +361,6 @@ impl Restore {
 			.set_len(0)
 			.map_err(|e| format!("cannot clear a core's lease: {e}"))
 	}
-
-	/// Hands it to the signal handler until [`Restore::disarm`].
-	#[cfg(target_os = "linux")]
-	fn arm(&self) {
-		signals::arm(self);
-	}
-
-	#[cfg(not(target_os = "linux"))]
-	fn arm(&self) {}
-
-	/// Takes it back from the signal handler, which then restores nothing.
-	#[cfg(target_os = "linux")]
-	fn disarm(&self) {
-		signals::disarm();
-	}
-
-	#[cfg(not(target_os = "linux"))]
-	fn disarm(&self) {}
 }
 
 /// Restores what the record in `lease` says a run killed outright left, before this run reads the
@@ -409,7 +458,7 @@ fn tune(sys: &Path, core: &[usize], lease: &mut File) -> Result<(Governor, Optio
 			if let Err(e) = File::options().write(true).open(&path) {
 				return match e.kind() {
 					std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem => kept(format!(
-						"since swole may not write {}: grant it as the README's Bench says",
+						"since swole may not write {}: grant it as the README's Cores says",
 						path.display()
 					)),
 					_ => Err(format!("cannot open {}: {e}", path.display())),
@@ -435,11 +484,11 @@ fn tune(sys: &Path, core: &[usize], lease: &mut File) -> Result<(Governor, Optio
 		.and_then(|()| lease.rewind())
 		.and_then(|()| lease.write_all(restore.record().as_bytes()))
 		.map_err(|e| format!("cannot record a core's governor in its lease: {e}"))?;
-	restore.arm();
+	signals::arm(&restore);
 	for policy in &policies {
 		let path = policy.join(TUNED[0]);
 		if let Err(e) = std::fs::write(&path, PERFORMANCE) {
-			restore.disarm();
+			signals::disarm();
 			let undone = restore
 				.apply(lease)
 				.err()
@@ -455,7 +504,6 @@ fn cstring(path: &Path) -> std::ffi::CString {
 }
 
 /// Restores a run's governor when a signal ends it, which unwinds nothing.
-#[cfg(target_os = "linux")]
 mod signals {
 	use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -590,13 +638,17 @@ mod tests {
 		let sys = sys(&dir, 2, 2, "performance");
 		let leases = dir.join("leases");
 		let all: Vec<usize> = (0..4).collect();
-		let first = reserve_in(&sys, &leases, all.clone()).unwrap();
-		let second = reserve_in(&sys, &leases, all.clone()).unwrap();
+		let first = reserve_in(&sys, &leases, &all).unwrap();
+		assert_eq!(first.spread().unwrap(), all);
+		let second = reserve_in(&sys, &leases, &all).unwrap();
 		assert_eq!((first.cpu, &first.core), (1, &vec![1, 3]));
 		assert_eq!((second.cpu, &second.core), (0, &vec![0, 2]));
-		assert_eq!(second.spread, all);
+		// A threaded benchmark spreads over its own run's core alone while the other is leased.
+		assert_eq!(first.spread().unwrap(), [1, 3]);
+		assert_eq!(second.spread().unwrap(), [0, 2]);
 		drop(first);
-		let third = reserve_in(&sys, &leases, all).unwrap();
+		assert_eq!(second.spread().unwrap(), all);
+		let third = reserve_in(&sys, &leases, &all).unwrap();
 		assert_eq!(third.cpu, 1);
 		assert!(matches!(&third.governor, Governor::Kept { governor, .. } if governor == PERFORMANCE));
 	}
@@ -607,7 +659,7 @@ mod tests {
 		let dir = scratch("governor");
 		let sys = sys(&dir, 2, 2, "powersave");
 		let leases = dir.join("leases");
-		let reservation = reserve_in(&sys, &leases, vec![0, 1, 2, 3]).unwrap();
+		let reservation = reserve_in(&sys, &leases, &[0, 1, 2, 3]).unwrap();
 		assert!(matches!(&reservation.governor, Governor::Set { was } if was == "powersave"));
 		assert_eq!(
 			(governor(&sys, 1), governor(&sys, 3)),
@@ -630,13 +682,14 @@ mod tests {
 		let dir = scratch("recover");
 		let sys = sys(&dir, 1, 2, "powersave");
 		let leases = dir.join("leases");
-		let killed = reserve_in(&sys, &leases, vec![0, 1]).unwrap();
+		let killed = reserve_in(&sys, &leases, &[0, 1]).unwrap();
 		assert_eq!(governor(&sys, 0), PERFORMANCE);
 		// Killed outright: the lock goes with its file, and nothing restores.
 		let mut killed = killed;
-		killed.restore.take().unwrap().disarm();
+		killed.restore.take().unwrap();
+		signals::disarm();
 		drop(killed);
-		let next = reserve_in(&sys, &leases, vec![0, 1]).unwrap();
+		let next = reserve_in(&sys, &leases, &[0, 1]).unwrap();
 		assert!(matches!(&next.governor, Governor::Set { was } if was == "powersave"));
 		drop(next);
 		assert_eq!(
@@ -661,7 +714,7 @@ mod tests {
 			),
 		] {
 			std::fs::write(leases.join("core0"), &record).unwrap();
-			let err = reserve_in(&sys, &leases, vec![0]).err().unwrap();
+			let err = reserve_in(&sys, &leases, &[0]).err().unwrap();
 			assert!(err.contains("which swole never changes"), "{err}");
 		}
 	}
@@ -671,7 +724,7 @@ mod tests {
 		let dir = scratch("shared");
 		let sys = sys(&dir, 2, 1, "powersave");
 		std::fs::write(sys.join("cpufreq/policy1/related_cpus"), "0-1\n").unwrap();
-		let reservation = reserve_in(&sys, &dir.join("leases"), vec![0, 1]).unwrap();
+		let reservation = reserve_in(&sys, &dir.join("leases"), &[0, 1]).unwrap();
 		assert_eq!(reservation.cpu, 1);
 		assert!(
 			matches!(&reservation.governor, Governor::Kept { governor, why } if governor == "powersave" && why.contains("CPU 0"))
