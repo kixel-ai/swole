@@ -165,8 +165,8 @@ pub fn side(measures: &[Measure]) -> Value {
 	for measure in measures {
 		let mut value = json!({ "value": number(measure.value), "unit": measure.unit });
 		if let Some((least, most)) = measure.spread {
-			value["lower"] = number(least);
-			value["upper"] = number(most);
+			value["lower"] = bound(least, f64::floor);
+			value["upper"] = bound(most, f64::ceil);
 		}
 		side.insert(measure.name.clone(), value);
 	}
@@ -225,6 +225,16 @@ pub fn number(value: f64) -> Value {
 	}
 	let rounded: f64 = format!("{value:.4e}").parse().expect("a float reads back");
 	Number::from_f64(rounded).map_or(Value::Null, Value::Number)
+}
+
+/// A spread's bound as [`number`] gives a value, but rounded away from the median by `round`
+/// (`floor` or `ceil`), so the bounds still hold the median however each rounds.
+fn bound(value: f64, round: fn(f64) -> f64) -> Value {
+	if value.fract() == 0.0 && value.abs() < 9e15 {
+		return (value as i64).into();
+	}
+	let scale = 10f64.powi(4 - value.abs().log10().floor() as i32);
+	Number::from_f64(round(value * scale) / scale).map_or(Value::Null, Value::Number)
 }
 
 /// Each benchmark's count, a line each, with the least and most of its samples when it took more
@@ -470,6 +480,15 @@ mod tests {
 		assert_eq!(
 			report.0["benchmarks"]["b"]["head"],
 			json!({ "cycles:u": { "value": 100, "unit": "events", "lower": 90, "upper": 110 } })
+		);
+		// Rounded to five digits, each bound still holds an exact median beside it.
+		let spread = side(&[Measure {
+			spread: Some((408_648.6, 408_649.6)),
+			..Measure::new("instructions:u", 408_649.0, "events")
+		}]);
+		assert_eq!(
+			spread["instructions:u"],
+			json!({ "value": 408_649, "unit": "events", "lower": 408_640.0, "upper": 408_650.0 })
 		);
 	}
 
