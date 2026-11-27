@@ -1,12 +1,46 @@
 //! swole: counts each benchmark's instructions natively with Linux perf counters (`quick`) or
-//! under stock Valgrind (`sim`), one process a job, in parallel, and times each by wall clock with
+//! under stock Valgrind, simulating its caches and branches (`sim`), one process a job, in parallel, and times each by wall clock with
 //! every counter the host allows (`bench`), alone or beside a base commit's.
 
 mod bench;
 mod callgrind;
 mod cargo;
 mod compare;
+#[cfg(target_os = "linux")]
+mod cores;
+/// No host but Linux leases a core.
+#[cfg(not(target_os = "linux"))]
+mod cores {
+	pub enum Reservation {}
+
+	pub struct Spread {
+		pub cpus: Vec<usize>,
+	}
+
+	impl Reservation {
+		pub fn cpu(&self) -> usize {
+			match *self {}
+		}
+
+		pub fn governor(&self) -> &str {
+			match *self {}
+		}
+
+		pub fn spread(&self) -> Result<Spread, String> {
+			match *self {}
+		}
+
+		pub fn describe(&self) -> String {
+			match *self {}
+		}
+	}
+
+	pub fn reserve(_: Option<&crate::perf::Pmu>) -> Result<Option<Reservation>, String> {
+		Ok(None)
+	}
+}
 mod fingerprint;
+mod heap;
 mod metrics;
 #[cfg_attr(
 	not(target_os = "linux"),
@@ -47,8 +81,9 @@ options:
                        benchmark has fails the run
   --allow-missing      with --benchmarks, report each name no benchmark has and measure the
                        rest, failing only when none is there, as a bisect step needs (no <base>)
-  --out <file>         write the headline measure as Kixel Quest's metrics.json: instructions
-                       for quick and sim, time for bench (sim and quick: no <base>)
+  --out <file>         write the headline measures as Kixel Quest's metrics.json: instructions
+                       for quick, instructions and estimated cycles for sim, time for bench,
+                       each beside its heap allocations (sim and quick: no <base>)
   --report <file>      write every measure of every benchmark as JSON
   --jobs <n>           how many jobs run at once (default: every core, or for quick, every core
                        of the PMU it counts on; bench runs one at a time)
@@ -137,7 +172,7 @@ fn cli(args: &[String]) -> Result<(), String> {
 				print!("{}", threaded(&counts));
 				print!("{}", metrics::details(None, &counts.shown(), &BTreeMap::new()));
 				if let Some(out) = &options.out {
-					metrics::File::counts(&counts, counter.measure(&counts.fingerprint)).write(out)?;
+					metrics::File::counts(&counts, &counter)?.write(out)?;
 					eprintln!("swole: wrote {}", out.display());
 				}
 				if let Some(report) = &options.report {
@@ -321,8 +356,11 @@ impl Job {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Measure {
 	pub name: String,
+	/// The median of its samples, or its one value.
 	pub value: f64,
 	pub unit: &'static str,
+	/// The least and most of its samples, when it took several.
+	pub spread: Option<(f64, f64)>,
 }
 
 impl Measure {
@@ -331,6 +369,7 @@ impl Measure {
 			name: name.to_owned(),
 			value,
 			unit,
+			spread: None,
 		}
 	}
 }
@@ -346,7 +385,8 @@ pub(crate) struct Counts {
 	pub spread: BTreeMap<String, (u64, u64)>,
 	/// The benchmarks beside which the process had other threads.
 	pub threaded: BTreeSet<String>,
-	/// Every measure of each benchmark, the headline's among them, when a count takes more.
+	/// Every measure of each benchmark, the headline's among them, each the median of its samples
+	/// with their least and most when it took several.
 	pub details: BTreeMap<String, Vec<Measure>>,
 	/// What each call processes, of each benchmark that declares it.
 	pub throughput: BTreeMap<String, metrics::Throughput>,
@@ -380,12 +420,10 @@ impl Counts {
 		Some(measures)
 	}
 
-	/// Every measure of each benchmark a table shows below the headline counts: of each with
-	/// details or a throughput.
+	/// Every measure of each counted benchmark, as a table shows them below the headline counts.
 	pub(crate) fn shown(&self) -> BTreeMap<String, Vec<Measure>> {
 		self.counts
 			.keys()
-			.filter(|name| self.details.contains_key(*name) || self.throughput.contains_key(*name))
 			.filter_map(|name| Some((name.clone(), self.measures(name)?)))
 			.collect()
 	}
@@ -447,12 +485,24 @@ impl Counter {
 		Ok(counter)
 	}
 
-	/// The headline measure, as `metrics.json` names it: instructions in user space, natively,
-	/// or Valgrind's, which are user space's too.
-	pub(crate) fn measure(&self, fingerprint: &str) -> String {
+	/// The measures `metrics.json` holds, a series each, each by the name a count's details give it
+	/// and the name and unit `metrics.json` gives it under `fingerprint`: instructions in user space,
+	/// natively, or Valgrind's, which are user space's too, beside its estimated cycles.
+	pub(crate) fn series(&self, fingerprint: &str) -> Vec<(&'static str, String, &'static str)> {
 		match self.kind {
-			CounterKind::Valgrind => format!("instructions ({fingerprint})"),
-			CounterKind::Perf { .. } => format!("instructions:u ({fingerprint})"),
+			CounterKind::Valgrind => vec![
+				("instructions", format!("instructions ({fingerprint})"), "instructions"),
+				(
+					callgrind::ESTIMATED,
+					format!("{} ({fingerprint})", callgrind::ESTIMATED),
+					"cycles",
+				),
+			],
+			CounterKind::Perf { .. } => vec![(
+				"instructions:u",
+				format!("instructions:u ({fingerprint})"),
+				"instructions",
+			)],
 		}
 	}
 
@@ -497,8 +547,8 @@ pub(crate) fn threaded(counts: &Counts) -> String {
 		let names: Vec<&str> = counts.threaded.iter().map(String::as_str).collect();
 		// Only sim counts them: quick's and bench's counters fail a benchmark that runs a thread.
 		out += &format!(
-			"\nOther threads ran beside {}, so each count is the median of {SAMPLES}, with their least and most, which \
-			 the scheduler moves.\n",
+			"\nOther threads ran beside {}, so each count and measure is the median of {SAMPLES}, with their least and \
+			 most, which the scheduler moves.\n",
 			names.join(", ")
 		);
 	}
@@ -511,8 +561,8 @@ pub(crate) fn threaded(counts: &Counts) -> String {
 		.collect();
 	if !unwatched.is_empty() {
 		out += &format!(
-			"\nswole cannot see whether other threads ran beside {}, so each count is the median of {SAMPLES}, with \
-			 their least and most.\n",
+			"\nswole cannot see whether other threads ran beside {}, so each count and measure is the median of \
+			 {SAMPLES}, with their least and most.\n",
 			unwatched.join(", ")
 		);
 	}
@@ -521,15 +571,18 @@ pub(crate) fn threaded(counts: &Counts) -> String {
 
 /// The Valgrind every count and the fingerprint's probe run under: Callgrind, counting only
 /// what the hooks bracket, following each exec, so a program a shell or `just` execs is
-/// measured, and leaving the exit code the program's.
+/// measured, leaving the exit code the program's, and simulating caches and branches. It reads
+/// no options from a `.valgrindrc` or `VALGRIND_OPTS`, which the fingerprint never sees.
 fn valgrind() -> Result<Command, String> {
 	let mut command = Command::new(valgrind_path()?);
 	command.args([
+		"--command-line-only=yes",
 		"--tool=callgrind",
 		"--instr-atstart=no",
 		"--trace-children=yes",
 		"--dump-line=no",
 	]);
+	command.args(callgrind::SIMULATION);
 	Ok(command)
 }
 
@@ -631,7 +684,19 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 	});
 	let work = work(dir)?;
 	let all: Vec<&Job> = jobs.iter().collect();
-	let first = run(&all, &work.join("1"), &preload, parallel, counter)?;
+	// The first round also counts each harness benchmark's allocations, in a pass of its own
+	// beside its count, with the same randomness and clock.
+	let heap = heap::library(true)?;
+	let first = run(
+		&all,
+		&work.join("1"),
+		Preloads {
+			count: &preload,
+			heap: heap.as_deref(),
+		},
+		parallel,
+		counter,
+	)?;
 	let mut counts = Counts::none(counter);
 	if let CounterKind::Perf { native, .. } = &counter.kind
 		&& let Some(bench_libc) = fingerprint::require_single_libc(
@@ -645,8 +710,8 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 		counts.fingerprint = resolved.label();
 		counts.host = resolved.describe();
 	}
-	// Each benchmark's samples, and the details of its first.
-	let mut samples: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+	// Each benchmark's samples: its count, and its details.
+	let mut samples: BTreeMap<String, Vec<(u64, Vec<Measure>)>> = BTreeMap::new();
 	for found in first.iter().flatten() {
 		if found.threaded {
 			counts.threaded.insert(found.name.clone());
@@ -654,10 +719,10 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 		if let Some(throughput) = found.throughput {
 			counts.throughput.insert(found.name.clone(), throughput);
 		}
-		if !found.details.is_empty() {
-			counts.details.insert(found.name.clone(), found.details.clone());
-		}
-		if samples.insert(found.name.clone(), vec![found.count]).is_some() {
+		if samples
+			.insert(found.name.clone(), vec![(found.count, found.details.clone())])
+			.is_some()
+		{
 			return Err(format!("two benchmarks are named {}", found.name));
 		}
 	}
@@ -687,7 +752,10 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 			let more = run(
 				&repeated,
 				&work.join((round + 1).to_string()),
-				&preload,
+				Preloads {
+					count: &preload,
+					heap: None,
+				},
 				parallel,
 				counter,
 			)?;
@@ -716,12 +784,29 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 				if found.threaded {
 					counts.threaded.insert(found.name.clone());
 				}
-				samples.entry(found.name.clone()).or_default().push(found.count);
+				samples
+					.entry(found.name.clone())
+					.or_default()
+					.push((found.count, found.details.clone()));
 			}
 		}
 	}
 	std::fs::remove_dir_all(&work).map_err(|e| format!("cannot remove {}: {e}", work.display()))?;
-	for (name, mut taken) in samples {
+	let mut allocs: BTreeMap<String, Vec<Measure>> = first
+		.into_iter()
+		.flatten()
+		.filter_map(|found| match found.allocs {
+			Some(heap::Allocs::Counted(measures)) => Some((found.name, measures)),
+			_ => None,
+		})
+		.collect();
+	for (name, taken) in samples {
+		let mut details = median(&taken).map_err(|err| format!("{name}: {err}"))?;
+		details.extend(allocs.remove(&name).unwrap_or_default());
+		if !details.is_empty() {
+			counts.details.insert(name.clone(), details);
+		}
+		let mut taken: Vec<u64> = taken.into_iter().map(|(count, _)| count).collect();
 		taken.sort_unstable();
 		if taken.len() > 1 {
 			counts.spread.insert(name.clone(), (taken[0], taken[taken.len() - 1]));
@@ -745,6 +830,30 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 		return Err("no benchmark ran".to_owned());
 	}
 	Ok(counts)
+}
+
+/// Each measure of a benchmark's `samples`, the median of its values, with their least and most
+/// when it took more than one, so a measure the scheduler moves reads as its spread, not one draw.
+fn median(samples: &[(u64, Vec<Measure>)]) -> Result<Vec<Measure>, String> {
+	let (first, rest) = samples.split_first().expect("a benchmark counted has a sample");
+	let mut measures = Vec::new();
+	for measure in &first.1 {
+		let mut values = vec![measure.value];
+		for (_, details) in rest {
+			let other = details
+				.iter()
+				.find(|other| other.name == measure.name)
+				.ok_or_else(|| format!("a sample lacks its {}", measure.name))?;
+			values.push(other.value);
+		}
+		values.sort_by(f64::total_cmp);
+		let mut median = Measure::new(&measure.name, values[values.len() / 2], measure.unit);
+		if values.len() > 1 {
+			median.spread = Some((values[0], values[values.len() - 1]));
+		}
+		measures.push(median);
+	}
+	Ok(measures)
 }
 
 /// Fails naming each wanted benchmark `has` says no benchmark is, so a bisect step never
@@ -811,16 +920,25 @@ pub(crate) fn work(dir: &Path) -> Result<PathBuf, String> {
 	unreachable!("some name is free")
 }
 
-/// Runs each job with the library at `preload`, counted by `counter`, `parallel` at once, each
+/// The libraries a round of jobs preloads: the count's, and the allocation pass's, when the round
+/// counts allocations too.
+#[derive(Clone, Copy)]
+struct Preloads<'a> {
+	count: &'a Path,
+	heap: Option<&'a Path>,
+}
+
+/// Runs each job with the libraries `preloads`, counted by `counter`, `parallel` at once, each
 /// in a directory of its own under `work`, and gathers what each measured, in the jobs' order.
 /// Any failure fails the whole and keeps `work` for its output.
 fn run(
 	jobs: &[&Job],
 	work: &Path,
-	preload: &Path,
+	preloads: Preloads,
 	parallel: usize,
 	counter: &Counter,
 ) -> Result<Vec<Vec<Found>>, String> {
+	let preload = preloads.count;
 	let total = jobs.len();
 	let queue = Mutex::new(jobs.iter().enumerate());
 	let done = AtomicUsize::new(0);
@@ -838,10 +956,28 @@ fn run(
 						};
 						let started = Instant::now();
 						let dir = work.join(index.to_string());
-						let result = match &counter.kind {
+						let mut result = match &counter.kind {
 							CounterKind::Valgrind => one(job, &dir, preload),
 							CounterKind::Perf { pmu, passes, .. } => native(job, &dir, preload, pmu, passes),
 						};
+						// A harness job measures its one benchmark, whose allocations its own pass counts.
+						if let (Ok([found]), Some(heap)) = (result.as_deref_mut(), preloads.heap)
+							&& job.expect.is_some()
+							&& !job.codspeed
+						{
+							let pass = heap::Pass {
+								library: heap,
+								padded: true,
+								cpus: match &counter.kind {
+									CounterKind::Perf { pmu, .. } => Some(&pmu.cpus),
+									CounterKind::Valgrind => None,
+								},
+							};
+							match heap::measure(job, pass, &dir) {
+								Ok(allocs) => found.allocs = Some(allocs),
+								Err(err) => result = Err(err),
+							}
+						}
 						let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
 						match &result {
 							Ok(measured) => eprintln!(
@@ -965,14 +1101,23 @@ struct Found {
 	watched: bool,
 	/// The loaded libc identity reported by the benchmark process on Linux.
 	libc: Option<String>,
-	/// Every measure of it, when its count took more than instructions.
+	/// Every measure of it, its count's among them.
 	details: Vec<Measure>,
 	/// What each of its calls processes, as the process that counted it declared.
 	throughput: Option<metrics::Throughput>,
+	/// What its allocation pass found, when the round ran one.
+	allocs: Option<heap::Allocs>,
 }
 
 /// What one job measured, or why it failed.
 type Measured = Result<Vec<Found>, String>;
+
+/// The variable that names the libraries a process loads first: macOS inserts with dyld's.
+const PRELOAD: &str = if cfg!(target_os = "macos") {
+	"DYLD_INSERT_LIBRARIES"
+} else {
+	"LD_PRELOAD"
+};
 
 /// The whole environment `command` launches with, with `preload` first in `LD_PRELOAD`, and when
 /// `padded`, padded to [`LAUNCH`] bytes so a counted process starts at the same stack address.
@@ -991,11 +1136,11 @@ pub(crate) fn environment(
 	}
 	// First, so its randomness and clock stand in front of any other preload's.
 	let mut preloads = preload.as_os_str().to_owned();
-	if let Some(others) = env.get(OsStr::new("LD_PRELOAD")).filter(|others| !others.is_empty()) {
+	if let Some(others) = env.get(OsStr::new(PRELOAD)).filter(|others| !others.is_empty()) {
 		preloads.push(":");
 		preloads.push(others);
 	}
-	env.insert("LD_PRELOAD".into(), preloads);
+	env.insert(PRELOAD.into(), preloads);
 	if padded {
 		let args: Vec<&OsStr> = std::iter::once(command.get_program())
 			.chain(command.get_args())
@@ -1022,7 +1167,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 		let errors = dir.join("stderr");
 		let stderr = std::fs::File::create(&errors).map_err(|e| format!("cannot create {}: {e}", errors.display()))?;
 		let mut command = job.command();
-		perf::launch(&mut command, pmu, pass, true);
+		perf::launch(&mut command, &pmu.cpus, pass, true);
 		let env = environment(&command, preload, label, true)?;
 		command
 			.env_clear()
@@ -1108,6 +1253,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 		libc,
 		details,
 		throughput: throughput.flatten(),
+		allocs: None,
 	}])
 }
 
@@ -1171,14 +1317,15 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 			let pid = name["callgrind.".len()..].split('.').next().unwrap_or_default();
 			preload::check(dir, pid, label)?;
 		}
-		measured.extend(found.into_iter().map(|(name, count)| Found {
+		measured.extend(found.into_iter().map(|(name, costs)| Found {
 			threaded: threads.get(&name) == Some(&true),
 			watched: threads.contains_key(&name),
 			throughput: declared.get(&name).copied(),
 			name,
-			count,
+			count: costs.ir(),
 			libc: None,
-			details: Vec::new(),
+			details: costs.measures(),
+			allocs: None,
 		}));
 	}
 	match &job.expect {

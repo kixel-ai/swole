@@ -4,7 +4,8 @@ Measures each benchmark in one of three modes over the same compiled benchmark t
 writes the measures as Kixel Quest's `metrics.json`, or compares a base commit with the working
 tree:
 
-- `swole sim`, what gates a merge, counts its instructions under stock Valgrind, one Valgrind process a job, in
+- `swole sim`, what gates a merge, counts its instructions and [simulates](#simulated-cycles) its caches and
+  branches under stock Valgrind, one Valgrind process a job, in
   parallel across the host's cores, the same on any x86_64 Linux host that shares its
   [fingerprint](#fingerprints): hosted CI, a self-hosted runner, or an agent's own, with no
   third-party service in the loop. It replaces CodSpeed's runner over the benchmarks as they are
@@ -16,6 +17,9 @@ tree:
 - `swole bench`, what gates a release, [times](#bench) them by wall clock on any Linux or macOS host, alone or paired
   with a base commit's, beside what each process used and every perf counter the host's
   [capabilities](#capabilities) allow.
+
+Each mode also counts each harness benchmark's [heap allocations](#allocations), with no
+privilege, in a pass of its own.
 
 Benchmarks are plain `#[bench]` functions written with [its harness](crates/swole/README.md),
 or for `sim`, CodSpeed's compatibility crates.
@@ -78,7 +82,8 @@ this way.
 Each benchmark is the Callgrind dump its hooks name after it, between `ZERO_STATS` and
 `START_INSTRUMENTATION` before it and `STOP_INSTRUMENTATION` and `DUMP_STATS_AT` after it,
 with Valgrind's `--instr-atstart=no`, so nothing outside a benchmark counts. Its count is the
-dump's `totals` in `Ir`, instructions executed, on every thread. The run fails on a dump with
+dump's `totals` in `Ir`, instructions executed, on every thread, beside its
+[simulated cycles](#simulated-cycles). The run fails on a dump with
 an unknown trigger, a benchmark without `totals` or with zero instructions, two benchmarks of
 one name, a job that fails, and a name `--benchmarks` lists that no benchmark has, so a
 bisect step never reads a suspect it could not count as clean. With `--allow-missing`, `sim` or `quick`
@@ -96,7 +101,9 @@ A harness benchmark beside which the process had another thread, one there when 
 started or ended, or one its call started, which the [preload](#randomness-and-the-clock) sees
 even when it is gone by the call's end, counts what that thread ran meanwhile, which the
 scheduler decides. So `sim` counts each such benchmark's job five times in all, and records the
-median of the five, with their least and most beside it in the table and as `lower_value` and
+median of the five, with their least and most beside it: for every measure, its instructions,
+cache misses, branch mispredicts, and estimated cycles alike, in the tables and as `lower` and
+`upper` in `--report`, and for the instructions and estimated cycles, as `lower_value` and
 `upper_value` in `metrics.json`. So does every benchmark whose threads swole cannot see: those of
 CodSpeed's crates and of a `--program`, whose harness runs every benchmark in one process, and of
 a harness too old to say. A harness benchmark that ran alone counts once: under the preload's
@@ -108,6 +115,42 @@ fork knows, leaves an `unknown callgrind client request` warning in the job's Va
 under `target/swole/jobs-*`, beside its profiles and output. Each run takes a directory of
 its own there, so runs in one tree never read each other's profiles, and removes it when it
 succeeds; a failed run keeps it and names it.
+
+## Simulated cycles
+
+An instruction count misses what costs a real core most: data laid out so it misses the cache,
+and branches it cannot predict. So every count also runs Callgrind's cache and branch simulation
+(`--cache-sim=yes --branch-sim=yes`), with its caches sized outright, as CodSpeed's runner sizes
+them, rather than from the host's CPUID: a 32 KiB, 8-way first level for instructions
+(`--I1=32768,8,64`) and one for data (`--D1=32768,8,64`), and an 8 MiB, 16-way last level
+(`--LL=8388608,16,64`), each of 64-byte lines. Valgrind runs with `--command-line-only=yes`, so a
+`.valgrindrc` or `VALGRIND_OPTS`, which could turn on its hardware prefetch model, never changes a
+count behind the fingerprint's back. Each benchmark reports Callgrind's every event:
+
+| event | measure |
+|---|---|
+| `Ir` | instructions |
+| `Dr`, `Dw` | data reads, data writes |
+| `I1mr`, `D1mr`, `D1mw` | I1 misses, D1 read misses, D1 write misses |
+| `ILmr`, `DLmr`, `DLmw` | LL instruction misses, LL read misses, LL write misses |
+| `Bc`, `Bcm` | conditional branches, conditional mispredicts |
+| `Bi`, `Bim` | indirect branches, indirect mispredicts |
+
+and from them, its estimated cycles: a cycle an instruction, 10 more for each first-level miss,
+which the last level serves, 100 more for each last-level miss, which memory serves, and 20 more
+for each mispredicted branch, whose work the core throws away:
+
+```text
+estimated cycles = Ir + 10 (I1mr + D1mr + D1mw) + 100 (ILmr + DLmr + DLmw) + 20 (Bcm + Bim)
+```
+
+The weights are KCachegrind's classic cycle estimate's, which CodSpeed's documentation describes
+too, plus a mispredict's typical penalty. They model no real core, so a change of a few percent
+says where to look rather than what a host will time: `bench` times. But the simulation is
+deterministic, so a benchmark that runs alone repeats its every event exactly, as it does its
+instructions, and two layouts or branch patterns that run the same instructions part clearly.
+Simulating takes Callgrind two to three times as long as counting alone: 2.2 times, 5.5 s to 12.3 s,
+on a debug build's loop of 20 million loads and stores.
 
 ## Randomness and the clock
 
@@ -162,13 +205,15 @@ Counts compare only within one environment. Valgrind presents a CPU derived from
 and a binary that picks a path by CPU feature, such as glibc's string functions or Rust's
 runtime detection, counts differently on another; so can another Valgrind, and glibc's
 tunables, which mask features under the same CPU; so can another preload, whose code runs
-inside a count and whose seed and clock steer it. So each run fingerprints its environment:
+inside a count and whose seed and clock steer it; so can another simulated cache, and another
+cycle model moves the estimated cycles. So each run fingerprints its environment:
 the architecture, every CPUID leaf a probe reads under the same Valgrind, `GLIBC_TUNABLES` as
-the benchmarks inherit it, `valgrind --version`, and the preload's bytes, hashed into a label such as
+the benchmarks inherit it, `valgrind --version`, the preload's bytes, and the
+[simulation](#simulated-cycles)'s options and cycle model, hashed into a label such as
 `x86_64-3059cd1d9e65`. The measure every count records names it, `instructions
-(x86_64-3059cd1d9e65)`, so counts from two environments never share a Kixel Quest series, and
+(x86_64-3059cd1d9e65)` and `estimated cycles (x86_64-3059cd1d9e65)`, so counts from two environments never share a Kixel Quest series, and
 a hardware change starts a new series instead of reading as a regression. `swole
-fingerprint sim` prints the label, then its inputs on stderr.
+fingerprint sim` prints the label on stdout and its inputs on stderr.
 
 A native measure, `quick`'s count or `bench`'s time, follows the host's own CPU, and the
 counters it reads follow what the host lets swole count. So `quick` and `bench` fingerprint the
@@ -178,11 +223,12 @@ it, how many CPUs the run may use, and everything the [capability probe](#capabi
 core PMU and its counters, and the passes the probe packed them into; on Linux, the mapped libc
 image (by ELF build ID) loaded by the benchmark processes (refusing runs that mix libc builds or
 leave a process's libc unverified) and `GLIBC_TUNABLES`, which pick glibc's string and memory
-routines; and for `quick`, the preload. `swole fingerprint quick` and `swole fingerprint bench`
-run a standalone host probe using the runner's own libc, printing that probe's label and inputs
-on stderr; when a workspace's benchmark targets load a different libc (such as a Nix-packaged
-runner running benchmarks built in a project dev shell), `quick` and `bench` fingerprint the
-benchmark's mapped libc instead, so look up a measurement series by the fingerprint printed by
+routines; for `quick`, the preload; and for `bench`, the cpufreq governor of the
+[core](#cores) it times on. `swole fingerprint quick` and `swole fingerprint bench`
+run a standalone host probe using the runner's own libc and leasing no core, printing that probe's
+label on stdout and its inputs on stderr; when a workspace's benchmark targets load a different libc (such as a
+Nix-packaged runner running benchmarks built in a project dev shell), `quick` and `bench`
+fingerprint the benchmark's mapped libc instead, and `bench` the governor it found, so look up a measurement series by the fingerprint printed by
 the run or recorded in `--out` / `--report`.
 
 Valgrind 3.27.1 on x86_64 presents one fixed Intel CPU, not the host's: an AMD Ryzen 9 9950X
@@ -196,8 +242,8 @@ version moves too, since a new Valgrind can count differently and starts new ser
 
 `swole sim <base>` and `swole quick <base>` count `<base>` and the working tree in one worktree kept under
 `~/.cache/swole` (or `$XDG_CACHE_HOME`), each from the directory there that matches where
-it runs, and print a Markdown table of each benchmark's base, head, and change, then, for `quick`, one
-of every other measure. `swole bench <base>` builds both sides in the same worktree and times
+it runs, and print a Markdown table of each benchmark's base, head, and change, then one of every
+other measure: for `sim`, each [simulated event](#simulated-cycles) and the estimated cycles. `swole bench <base>` builds both sides in the same worktree and times
 them [paired](#bench). One directory
 counts both sides, so a path the build compiles in, such as a panic's location, is the same in
 each and moves neither count. The worktree sits outside the repository, so no
@@ -381,9 +427,8 @@ Beside each time, `bench` reports what the process used over its samples, from `
 Linux and macOS: user and system CPU time, minor and major page faults, and voluntary and
 involuntary context switches, each a call's share, and the process's peak resident memory.
 Each covers a sample's whole, steps and inputs built between calls included, which the clock
-leaves out. Where the host has perf counters, `bench` pins both the timing and counting processes
-to the probed core PMU's CPUs so times and counters measure the same cores on hybrid hosts, and
-counts each side's benchmark with every counter the [probe](#capabilities) found, one process for
+leaves out. Where the host has perf counters, `bench` times and counts on the same
+[core](#cores), and counts each side's benchmark with every counter the [probe](#capabilities) found, one process for
 each pass, each calling the benchmark as many times as a sample did and counting a deterministic
 stratified subset of up to 64 of those calls (the same calls in every pass and on both sides), a
 counter's share of a call. Both the timing and counter processes run under the preload built to
@@ -395,17 +440,90 @@ prints every measure of each benchmark, beside the base's and its change when pa
 `--report` writes them all. A side whose harness predates counters, as a base from before an
 upgrade, says so and has none; one whose harness predates rusage has none of that.
 
+### Cores
+
+On Linux, `bench` leases one physical core once its builds are done and runs every benchmark
+process on that core's first hardware thread swole may run on, so a sample never migrates and a pair's two sides
+run on one core. The lease is an advisory lock on a file in `/dev/shm/swole`, shared by every
+user, which the kernel drops however the run ends: no other `swole bench` uses any hardware
+thread of the core meanwhile, so concurrent runs take disjoint cores and never contend through an
+SMT sibling. A run takes the last free core, leaving the first, where the kernel does most of its
+own work, for last, and when other runs hold them all, waits until any one frees. On a hybrid Intel host it
+takes a performance core, counted by the `cpu_core` PMU, while `quick` counts on the PMU of the
+most CPUs. A benchmark that starts another thread in its first call would have its threads
+serialized on one CPU, so it times on the run's core and every other core no other run leases,
+which it leases until it is counted, and the run says so; a side still running other threads gets
+no perf counters, as above.
+
+The lease keeps other `swole bench` runs off the core, not the host's other processes, which
+the run says unless the kernel excludes the CPU from scheduler load balancing (`isolcpus`, listed in
+`/sys/devices/system/cpu/isolated`); even then a task pinned there may still run on it.
+
+Where swole may write the core's cpufreq policy, and the policy sets no CPU outside the core, a
+run switches the core to the `performance` governor, recording what it changed first in a journal
+beside the lease that only its user may write, and restores the governor and energy preference
+when it exits or a SIGINT, SIGTERM, or SIGHUP ends it; the next run of that user to lease the core
+restores what a run killed outright left. Elsewhere
+it times under the host's governor and says why. Either way the governor it times under enters
+the [fingerprint](#fingerprints), so times under two governors never share a series. sysfs
+attributes take a group and mode, so a host grants its benchmarking group the governors and
+energy preferences at boot:
+
+```bash
+# /etc/tmpfiles.d/swole-cpufreq.conf
+z /sys/devices/system/cpu/cpufreq/policy*/scaling_governor               0664 root wheel -
+z /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference  0664 root wheel -
+```
+
+## Allocations
+
+Every mode counts each benchmark of swole's harness's heap allocations: `alloc_count`, the
+allocations a call makes; `alloc_bytes`, the bytes they ask for; and `peak_live_bytes`, the most
+bytes the call's own allocations hold at once, which a free of a block allocated before the call
+never lowers. They count in a pass of their own, one process that sets the benchmark up and
+calls it once under an interposer of glibc's allocator (`malloc`, `calloc`, `realloc`,
+`reallocarray`, `free`, `posix_memalign`, `aligned_alloc`, `memalign`, `valloc`, `pvalloc`), which
+the harness has count only between the same requests that bracket a count, so neither setup nor
+the call's output's drop counts. A `realloc` counts as an allocation of its new size and a free of
+the old block. No other pass loads the interposer, so its hooks' instructions are in no count,
+cycle, or time. Beside `quick` and `sim`, the pass runs under the [preload](#randomness-and-the-clock)'s
+randomness and clock and a padded launch, as their counts do; beside `bench`, under the host's,
+as its times do. On macOS, `bench` inserts an interposer of libSystem's allocator with
+`DYLD_INSERT_LIBRARIES`; elsewhere but x86_64 Linux, a run has no allocation counts, and says so.
+
+A call no other thread ran beside, as the harness [watches](crates/swole/README.md#how-it-runs),
+counts exactly, the same on every run, but for one whose allocations follow an input the host
+decides. One beside which another thread ran, even one that never allocates, is sampled: the
+interposer counts every thread's allocations and cannot tell whose each was, so the pass runs
+five times and each measure is the median of the five, with their least and most, marked `~` in
+the tables. A compare's change of a sampled measure says whether it is within the spread of the
+two sides' samples or beyond it, and with one side's spread alone, nothing more than its `~`.
+
+A benchmark whose global allocator never reaches glibc's `malloc`, as a `#[global_allocator]`
+that maps memory of its own or a static allocator that defines `malloc` in the executable does,
+has no allocation counts rather than counts of none: the harness first allocates through the
+global allocator under the interposer and, when it sees nothing, says so, and swole names the
+benchmark on stderr. A static executable, which loads no interposer, fails the pass.
+
+`--out` holds the three as `alloc_count (<fingerprint>+<interposer>)` and the rest, the mode's
+fingerprint followed by a hash of the interposer that counted them, since a change to how it
+counts can move them, beside the headline for each benchmark that has them, a sampled one's with its `lower_value` and `upper_value`.
+`--report` marks each as the allocation pass's (`"pass":"allocation"`) and says whether it is
+`sampled`, and adds `alloc_churn`, the bytes a call allocated for each byte of its peak.
+
 ## Output
 
-`--out` writes one measure of each benchmark, its headline, so a run of a large workspace stays
-well within the 1 MiB Kixel Quest reads. `sim --out` and `quick --out` write one sample of the
-run's commit, `quick`'s measure `instructions:u (...)`, and a benchmark counted several times,
-its median with the least and most of its samples:
+`--out` writes only the headline measures of each benchmark, so a run of a large workspace stays
+well within the 1 MiB Kixel Quest reads, and fails a run that would not. `sim --out` and
+`quick --out` write one sample of the run's commit: `sim`'s instructions and estimated cycles,
+`quick`'s `instructions:u (...)`, and for a benchmark counted several times, each measure's median
+with the least and most of its samples:
 
 ```json
-{"samples":[{"metrics":{"benches/varint.rs::varint::encode[1]":{"instructions (x86_64-3059cd1d9e65)":{"value":12345}},
-                        "benches/pool.rs::spawn":{"instructions (x86_64-3059cd1d9e65)":{"value":402614,"lower_value":402137,"upper_value":403005}}}}],
- "units":{"instructions (x86_64-3059cd1d9e65)":"instructions"}}
+{"samples":[{"metrics":{"benches/varint.rs::varint::encode[1]":{"estimated cycles (x86_64-3059cd1d9e65)":{"value":15467},"instructions (x86_64-3059cd1d9e65)":{"value":12345}},
+                        "benches/pool.rs::spawn":{"estimated cycles (x86_64-3059cd1d9e65)":{"value":512330,"lower_value":509914,"upper_value":515102},
+                                                  "instructions (x86_64-3059cd1d9e65)":{"value":402614,"lower_value":402137,"upper_value":403005}}}}],
+ "units":{"estimated cycles (x86_64-3059cd1d9e65)":"cycles","instructions (x86_64-3059cd1d9e65)":"instructions"}}
 ```
 
 `bench --out` writes the working tree's times as the run's own sample, and with a base, the
@@ -420,11 +538,13 @@ base's as a sample naming its commit:
 `--report <file>` writes every measure of every benchmark, by side, as JSON: its
 `schema_version`, the mode, the
 fingerprint and its inputs, the base's commit when there is one, and for each benchmark, each
-side's measures by name, each a `value` and a `unit` (a call's share, for `bench`), whether
+side's measures by name, each a `value` and a `unit` (a call's share, for `bench`), and for one
+counted several times, the `lower` and `upper` of its samples, for `sim` every
+[simulated event](#simulated-cycles) and the estimated cycles, whether
 another thread ran beside it, and for a paired `bench`, the change and its interval. A benchmark
-that declares its [throughput](crates/swole/README.md#throughput) has each count per byte or
-item beside it, such as `instructions:u/byte`, and under `bench` a `throughput` in `bytes/s` or
-`items/s`:
+that declares its [throughput](crates/swole/README.md#throughput) has each count and its
+allocations' per byte or item beside it, such as `estimated cycles/byte` or `instructions:u/byte`,
+and under `bench` a `throughput` in `bytes/s` or `items/s`:
 
 ```json
 {"schema_version":1,"mode":"bench","fingerprint":"x86_64-1a2b3c4d5e6f","host":["arch: x86_64","..."],"base":"<the base's full commit ID>",

@@ -8,17 +8,13 @@ A measured spike determines whether a QEMU TCG plugin (`qemu-user` + `libcache` 
 
 Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
-- ✅ Plan as a deferred m1 research spike rather than blocking `swole sim`'s v1 on custom binary-instrumentation plugins (rejected: building a custom QEMU/DynamoRIO backend before shipping Valgrind `sim`; omitting the spike entirely). Valgrind Callgrind with `--cache-sim=yes --branch-sim=yes`, which [simulated cycles](/quest/m0/sim-cycles.md) pins, runs at 50–100× native cost; this spike tests whether QEMU TCG or DynamoRIO beats it enough to justify maintaining a custom plugin and trigger mechanism.
+- ✅ Plan as a deferred m1 research spike rather than blocking `swole sim`'s v1 on custom binary-instrumentation plugins (rejected: building a custom QEMU/DynamoRIO backend before shipping Valgrind `sim`; omitting the spike entirely). Valgrind Callgrind with `--cache-sim=yes --branch-sim=yes` and pinned cache geometry, as `swole sim` runs it, runs at 50–100× native cost; this spike tests whether QEMU TCG or DynamoRIO beats it enough to justify maintaining a custom plugin and trigger mechanism.
 
 Recommendations for the implementer:
 
 - Prototype the minimum viable bracketed start/stop trigger + instruction/cache counter + per-function attribution on `swole`'s fixture suite (and a representative slice of `moq`'s benches) for QEMU TCG and DynamoRIO.
 - Compare against stock Valgrind Callgrind (`sim-cycles`) on: wall-clock speedup, exact determinism across checkouts/environments/loads, cross-arch support (`aarch64` on `x86_64` for QEMU), branch-mispredict fidelity, call-graph attribution quality, Nix packaging simplicity, and ongoing maintenance burden.
 - Record the measured numbers and go/no-go verdict in `swole`'s docs (and if go, plan the implementation quest as a follow-up).
-
-## Required
-
-- [Deterministic simulated cycles in sim (--cache-sim=yes --branch-sim=yes)](/quest/m0/sim-cycles.md) - establishes the Valgrind cache/branch cycle baseline to beat
 
 ## Hosts
 

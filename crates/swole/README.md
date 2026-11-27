@@ -100,7 +100,8 @@ integer; with args, a function of the case's argument, such as a closure `|n| n`
 called with a clone of it as `setup` is, so each case scales by its own. A count that is zero,
 negative, or over a `u64` fails the run, since such a call processes nothing to divide by.
 swole then reports each count its mode measured per byte or item, such as `instructions/byte`
-under `sim` and each perf counter's under `quick` and `bench`, and under `bench`, which alone
+and `estimated cycles/byte` under `sim` and each perf counter's under `quick` and `bench`, the
+allocations and allocated bytes per byte or item where swole counts them, and under `bench`, which alone
 times natively, a `throughput` in `bytes/s` or `items/s`. A benchmark that declares neither
 reports as it would without.
 
@@ -166,7 +167,8 @@ The requests are x86_64's and aarch64's; elsewhere the harness requests nothing,
 swole fails a job that measured no benchmark.
 
 Run by swole, it prints `swole threaded <name>` for a case beside which the process had another
-thread: one there when its call started or ended, or, under swole's preload, one its call started;
+thread: one there when its call started or ended, or, under swole's preload or its macOS
+interposer, one its call started;
 and `swole alone <name>` for any other, so swole counts a case again under Valgrind when a harness
 too old to watch says neither.
 
@@ -185,3 +187,11 @@ calls it that many times, counting a deterministic stratified subset of up to 64
 (while watching every call for worker threads), and prints `swole calls <n> <name>`, how many its
 counts cover, or a benchmark that times itself once, for that many iterations. See the
 [README](../../README.md#quick).
+
+With `SWOLE_HEAP=1`, under the allocation interposer swole preloads (or on macOS, inserts), it
+first allocates once through the program's global allocator to see that the interposer counts
+it, then sets the case up and calls it once, the interposer counting only from just before the
+call to just after it, and prints `swole allocs <allocations> <bytes> <peak bytes> <name>`, or
+`swole allocs bypassed <name>` when that first allocation never reached the interposer. Without
+the interposer, as in a static executable, it fails. See the
+[README](../../README.md#allocations).

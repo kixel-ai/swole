@@ -25,12 +25,21 @@ fn succeeded(out: &Output) {
 	);
 }
 
-/// The one measure a `metrics.json` records, which must be a time, and the file.
+/// The time a `metrics.json` records, beside each benchmark's allocations where the host counts
+/// them, and the file.
 fn read(path: &Path) -> (String, Value) {
 	let metrics: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
 	let units = metrics["units"].as_object().unwrap();
-	assert_eq!(units.len(), 1);
-	let (measure, unit) = units.iter().next().unwrap();
+	let (measure, unit) = units.iter().find(|(name, _)| name.starts_with("time (")).unwrap();
+	let others: Vec<&str> = units
+		.keys()
+		.filter(|name| *name != measure)
+		.map(|name| name.split(" (").next().unwrap())
+		.collect();
+	assert!(
+		others.is_empty() || others == ["alloc_bytes", "alloc_count", "peak_live_bytes"],
+		"{others:?}"
+	);
 	assert_eq!(unit, "ns");
 	assert!(
 		measure.starts_with(&format!("time ({}-", std::env::consts::ARCH)),
@@ -152,6 +161,18 @@ fn times_each_harness_benchmark() {
 		table.contains("| crates/swole/benches/fixture.rs::sized[2000] | throughput | "),
 		"{table}"
 	);
+	// Each one's allocations, on a host with the interposer: none in a loop alone, exactly, and a
+	// sample's beside another thread.
+	if cfg!(any(
+		all(target_os = "linux", target_arch = "x86_64"),
+		target_os = "macos"
+	)) {
+		assert_eq!(head("alone")["alloc_count"]["value"], 0);
+		assert_eq!(head("alone")["alloc_count"]["sampled"], false);
+		for name in THREADED {
+			assert_eq!(head(name)["alloc_bytes"]["sampled"], true, "{name}");
+		}
+	}
 	let host: Vec<&str> = report["host"]
 		.as_array()
 		.unwrap()
