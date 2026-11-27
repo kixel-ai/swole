@@ -9,9 +9,10 @@ on:
 permissions:
   contents: read
 
+# Runs coalesce: one in progress finishes, so a breakage stays on the commit that caused it, and
+# a newer push replaces a pending one.
 concurrency:
   group: check-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   check:
