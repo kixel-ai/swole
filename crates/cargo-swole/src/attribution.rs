@@ -1,11 +1,11 @@
 //! Where a benchmark's change happened: the functions whose own cost moved most, from the
 //! per-function costs of the Callgrind profiles sim already reads.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 use crate::Counts;
-use crate::callgrind::{Costs, Functions};
+use crate::callgrind::{Costs, Function, Functions};
 
 /// The most functions shown for one measure of one benchmark.
 const MOST: usize = 5;
@@ -28,6 +28,12 @@ pub fn table(before: &Counts, after: &Counts) -> String {
 			continue;
 		};
 		let (base_total, head_total) = (sum(base), sum(head));
+		// A name two objects define is shown with its object, to tell them apart.
+		let mut objects: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+		for function in base.keys().chain(head.keys()) {
+			objects.entry(&function.name).or_default().insert(&function.object);
+		}
+		let ambiguous = |function: &Function| objects[function.name.as_str()].len() > 1;
 		let shown = name.replace('|', "\\|");
 		// A benchmark counted more than once reports the median of its runs, but these functions
 		// are the first run's, which the scheduler may have moved the other way.
@@ -56,7 +62,12 @@ pub fn table(before: &Counts, after: &Counts) -> String {
 					(_, false) => " (not in head)",
 					_ => "",
 				};
-				let function = function.replace('|', "\\|");
+				let qualified = if ambiguous(function) {
+					format!("{} ({})", function.name, function.object)
+				} else {
+					function.name.clone()
+				};
+				let function = qualified.replace('|', "\\|");
 				// A measure the base never had has no share to speak of.
 				let share = if was == 0 {
 					String::new()
@@ -86,12 +97,19 @@ fn sum(functions: &Functions) -> Costs {
 /// The functions that moved measure `index` the way the benchmark did, from `was` to `now`,
 /// with their base and head costs, largest first: at least [`LEAST`] and at most [`MOST`], and
 /// past the least only until they explain the majority of the benchmark's change.
-fn shifted<'a>(base: &'a Functions, head: &'a Functions, index: usize, was: u64, now: u64) -> Vec<(&'a str, u64, u64)> {
-	let value = |functions: &Functions, name: &str| functions.get(name).map_or(0, |costs| costs.counts()[index].1);
-	let names: BTreeSet<&String> = base.keys().chain(head.keys()).collect();
-	let mut moved: Vec<(&str, u64, u64)> = names
+fn shifted<'a>(
+	base: &'a Functions,
+	head: &'a Functions,
+	index: usize,
+	was: u64,
+	now: u64,
+) -> Vec<(&'a Function, u64, u64)> {
+	let value =
+		|functions: &Functions, function: &Function| functions.get(function).map_or(0, |costs| costs.counts()[index].1);
+	let names: BTreeSet<&Function> = base.keys().chain(head.keys()).collect();
+	let mut moved: Vec<(&Function, u64, u64)> = names
 		.into_iter()
-		.map(|name| (name.as_str(), value(base, name), value(head, name)))
+		.map(|function| (function, value(base, function), value(head, function)))
 		// What moved with the benchmark; a function that moved against it only offset some.
 		.filter(|(_, before, after)| if now > was { after > before } else { after < before })
 		.collect();
@@ -111,11 +129,10 @@ fn shifted<'a>(base: &'a Functions, head: &'a Functions, index: usize, was: u64,
 
 #[cfg(test)]
 mod tests {
-	use std::collections::BTreeMap;
-
 	use super::*;
 
-	/// A benchmark's functions, each its instructions, which cost one data read each too.
+	/// A benchmark's functions, each its instructions, which cost a quarter as many data reads. A
+	/// name `function@object` is in that object, else in `bin`.
 	fn functions(costs: &[(&str, u64)]) -> Functions {
 		costs
 			.iter()
@@ -123,7 +140,14 @@ mod tests {
 				let mut costs = Costs::default();
 				costs.0[0] = *ir;
 				costs.0[1] = *ir / 4;
-				((*name).to_owned(), costs)
+				let (name, object) = name.split_once('@').unwrap_or((name, "bin"));
+				(
+					Function {
+						name: name.to_owned(),
+						object: object.to_owned(),
+					},
+					costs,
+				)
 			})
 			.collect()
 	}
@@ -186,6 +210,19 @@ mod tests {
 			5,
 			"{table}"
 		);
+	}
+
+	#[test]
+	fn shows_the_object_of_a_name_two_objects_define() {
+		let (before, after) = sides(
+			&[("decode@liba", 1000), ("decode@libb", 1000), ("main", 10)],
+			&[("decode@liba", 1500), ("decode@libb", 950), ("main", 10)],
+		);
+		let table = table(&before, &after);
+		// Merged by name alone, +500 and -50 would read as +450 of one function.
+		assert!(table.contains("`decode (liba)` | 1000 | 1500 | +500"), "{table}");
+		assert!(!table.contains("libb"), "{table}");
+		assert!(!table.contains("`main"), "{table}");
 	}
 
 	#[test]

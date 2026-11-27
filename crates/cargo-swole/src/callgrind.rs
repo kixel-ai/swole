@@ -124,21 +124,65 @@ pub struct Benchmark {
 	pub functions: Functions,
 }
 
-/// Each function's self cost, by its demangled name, with its recursion levels, which Callgrind
-/// writes as `name'2`, merged.
-pub type Functions = BTreeMap<String, Costs>;
+/// A function a profile names: its demangled name, and the object that defines it, so two
+/// static functions of one name in different libraries stay apart.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Function {
+	pub name: String,
+	/// The object's file name, less the hash Cargo suffixes an executable's with, which another
+	/// build of the same benchmark names differently.
+	pub object: String,
+}
+
+/// Each function's self cost, with its recursion levels, which Callgrind writes as `name'2`, merged.
+pub type Functions = BTreeMap<Function, Costs>;
+
+/// What `path`'s object is called across builds: its file name without a trailing `-` and 16
+/// hex digits.
+fn object(path: &str) -> String {
+	let file = path.rsplit('/').next().unwrap_or(path);
+	match file.rsplit_once('-') {
+		Some((stem, hash)) if hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) => stem.to_owned(),
+		_ => file.to_owned(),
+	}
+}
+
+/// A name written as `(id) name`, `(id)` for one named before, or ` name` outright, which Callgrind
+/// numbers per kind of name in `table`.
+fn named(table: &mut BTreeMap<u64, String>, spec: &str, what: &str) -> Result<String, String> {
+	let spec = spec.trim_start();
+	let Some(rest) = spec.strip_prefix('(') else {
+		return Ok(spec.to_owned());
+	};
+	let (id, name) = rest
+		.split_once(')')
+		.ok_or_else(|| format!("{what}: {spec} is not a name"))?;
+	let id: u64 = id.parse().map_err(|_| format!("{what}: {spec} is not a name"))?;
+	let name = name.trim_start();
+	if name.is_empty() {
+		return table
+			.get(&id)
+			.cloned()
+			.ok_or_else(|| format!("{what}: ({id}) is used before it is named"));
+	}
+	table.insert(id, name.to_owned());
+	Ok(name.to_owned())
+}
 
 /// Reads a part's cost lines into the self cost of each function.
 #[derive(Default)]
 struct Reader {
-	/// The functions Callgrind named so far, by the ID it abbreviates each later mention to.
+	/// The functions and objects Callgrind named so far, by the ID it abbreviates each later mention to.
 	names: BTreeMap<u64, String>,
+	objects: BTreeMap<u64, String>,
+	/// The object whose functions are being read.
+	object: String,
 	/// How many positions lead a cost line (`line`, or `instr line`), from `positions:`.
 	positions: Option<usize>,
 	/// For each count a cost line holds, which of [`EVENTS`] it is, from `events:`.
 	columns: Vec<Option<usize>>,
 	/// The function whose cost lines are being read.
-	current: Option<String>,
+	current: Option<Function>,
 	/// Whether the next cost line is a call's inclusive cost, which is not the caller's own.
 	call: bool,
 	functions: Functions,
@@ -148,35 +192,6 @@ struct Reader {
 }
 
 impl Reader {
-	/// A function named as `(id) name`, `(id)` for one named before, or ` name` outright.
-	fn name(&mut self, spec: &str, what: &str) -> Result<String, String> {
-		let spec = spec.trim_start();
-		let Some(rest) = spec.strip_prefix('(') else {
-			return Ok(spec.to_owned());
-		};
-		let (id, name) = rest
-			.split_once(')')
-			.ok_or_else(|| format!("{what}: {spec} is not a function name"))?;
-		let id: u64 = id
-			.parse()
-			.map_err(|_| format!("{what}: {spec} is not a function name"))?;
-		let name = name.trim_start();
-		if name.is_empty() {
-			return self
-				.names
-				.get(&id)
-				.cloned()
-				.ok_or_else(|| format!("{what}: function ({id}) is used before it is named"));
-		}
-		// A recursion level is a function of its own to Callgrind, `name'2`.
-		let merged = match name.rsplit_once('\'') {
-			Some((base, level)) if !level.is_empty() && level.bytes().all(|b| b.is_ascii_digit()) => base,
-			_ => name,
-		};
-		self.names.insert(id, merged.to_owned());
-		Ok(merged.to_owned())
-	}
-
 	/// Reads one line of a part, or notes why it cannot.
 	fn line(&mut self, line: &str, what: &str) {
 		if self.failed.is_none()
@@ -194,11 +209,27 @@ impl Reader {
 				.split_whitespace()
 				.map(|name| EVENTS.iter().position(|(event, _)| *event == name))
 				.collect();
+		} else if let Some(spec) = line.strip_prefix("ob=") {
+			self.object = object(&named(&mut self.objects, spec, what)?);
+		} else if let Some(spec) = line.strip_prefix("cob=") {
+			// Only to learn the object an ID stands for, since a callee's first mention names it.
+			named(&mut self.objects, spec, what)?;
 		} else if let Some(spec) = line.strip_prefix("fn=") {
-			self.current = Some(self.name(spec, what)?);
+			let name = named(&mut self.names, spec, what)?;
+			// A recursion level is a function of its own to Callgrind, `name'2`.
+			let name = match name.rsplit_once('\'') {
+				Some((base, level)) if !level.is_empty() && level.bytes().all(|b| b.is_ascii_digit()) => {
+					base.to_owned()
+				}
+				_ => name,
+			};
+			self.current = Some(Function {
+				name,
+				object: self.object.clone(),
+			});
 		} else if let Some(spec) = line.strip_prefix("cfn=") {
-			// Only to learn the name an ID stands for, since a callee's first mention names it.
-			self.name(spec, what)?;
+			// Likewise a function.
+			named(&mut self.names, spec, what)?;
 		} else if line.starts_with("calls=") {
 			self.call = true;
 		} else if line.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '+' | '-' | '*')) {
@@ -216,7 +247,7 @@ impl Reader {
 			for (column, count) in self.columns.iter().zip(line.split_whitespace().skip(positions)) {
 				let count = count
 					.parse::<u64>()
-					.map_err(|_| format!("{what}: {count} in {function} is not a count"))?;
+					.map_err(|_| format!("{what}: {count} in {} is not a count", function.name))?;
 				if let Some(column) = column {
 					costs.0[*column] = count;
 				}
@@ -467,12 +498,26 @@ mod tests {
 	fn functions(body: &str, totals: &str) -> String {
 		format!(
 			"{HEADER}positions: line\n{EVENTS_LINE}\npart: 1\ndesc: Trigger: Client Request: a\n\n\
-			 ob=(1) /bench\nfl=(1) f.rs\n{body}\ntotals: {totals}\n"
+			 ob=(1) /out/bench-0123456789abcdef\nfl=(1) f.rs\n{body}\ntotals: {totals}\n"
 		)
 	}
 
-	fn self_of(found: &[Benchmark], function: &str) -> [u64; 2] {
-		let costs = found[0].functions[function];
+	/// The names of the functions, in order, each beside its object.
+	fn names(found: &Benchmark) -> Vec<(&str, &str)> {
+		found
+			.functions
+			.keys()
+			.map(|f| (f.name.as_str(), f.object.as_str()))
+			.collect()
+	}
+
+	/// The instructions and data reads of the function `name` in `object`.
+	fn self_of(found: &[Benchmark], object: &str, name: &str) -> [u64; 2] {
+		let function = Function {
+			name: name.to_owned(),
+			object: object.to_owned(),
+		};
+		let costs = found[0].functions[&function];
 		[costs.ir(), costs.0[1]]
 	}
 
@@ -488,8 +533,8 @@ mod tests {
 		);
 		let found = parse(&text, "p").unwrap();
 		// `main`'s lines under its two mentions add; `*` repeats the position and has no cost.
-		assert_eq!(self_of(&found, "main"), [23, 2]);
-		assert_eq!(self_of(&found, "helper"), [100, 20]);
+		assert_eq!(self_of(&found, "bench", "main"), [23, 2]);
+		assert_eq!(self_of(&found, "bench", "helper"), [100, 20]);
 		assert_eq!(found[0].functions.len(), 2);
 	}
 
@@ -497,11 +542,37 @@ mod tests {
 	fn merges_recursion_levels_and_skips_positions_beyond_line() {
 		let text = functions("fn=(1) f'2\n1 10\n\nfn=(2) f\n1 5\n\nfn=(3) g'x\n1 1\n", "16");
 		let found = parse(&text, "p").unwrap();
-		assert_eq!(found[0].functions.keys().collect::<Vec<_>>(), ["f", "g'x"]);
-		assert_eq!(self_of(&found, "f"), [15, 0]);
+		assert_eq!(names(&found[0]), [("f", "bench"), ("g'x", "bench")]);
+		assert_eq!(self_of(&found, "bench", "f"), [15, 0]);
 		// `positions: instr line`.
 		let text = functions("fn=(1) f\n0x1000 3 7 2\n", "7 2").replace("positions: line", "positions: instr line");
-		assert_eq!(self_of(&parse(&text, "p").unwrap(), "f"), [7, 2]);
+		assert_eq!(self_of(&parse(&text, "p").unwrap(), "bench", "f"), [7, 2]);
+	}
+
+	#[test]
+	fn keeps_same_named_functions_of_different_objects_apart() {
+		let text = functions(
+			"fn=(1) decode\n0 5\n\nob=(2) /lib/libother.so.1\nfn=(1)\n0 7\ncob=(3) /lib/libc.so.6\ncfn=(3) memcpy\ncalls=1 0\n0 90\n\nob=(3)\nfn=(3)\n0 4\n",
+			"16",
+		);
+		let found = parse(&text, "p").unwrap();
+		assert_eq!(
+			names(&found[0]),
+			[
+				("decode", "bench"),
+				("decode", "libother.so.1"),
+				("memcpy", "libc.so.6")
+			]
+		);
+		assert_eq!(self_of(&found, "libother.so.1", "decode")[0], 7);
+	}
+
+	#[test]
+	fn names_an_object_alike_across_builds() {
+		assert_eq!(object("/t/release/deps/x-c40201029a1ad706"), "x");
+		assert_eq!(object("/t/release/deps/my-bench-0123456789ABCDEF"), "my-bench");
+		assert_eq!(object("/lib/libc.so.6"), "libc.so.6");
+		assert_eq!(object("/lib/lib-deadbeef.so"), "lib-deadbeef.so");
 	}
 
 	#[test]
@@ -518,8 +589,8 @@ mod tests {
 			one(3, "Program termination", "fn=(9)\n0 5\n", "5"),
 		]);
 		let found = parse(&text, "p").unwrap();
-		assert_eq!(found[0].functions.keys().collect::<Vec<_>>(), ["a"]);
-		assert_eq!(found[1].functions.keys().collect::<Vec<_>>(), ["b"]);
+		assert_eq!(names(&found[0]), [("a", "")]);
+		assert_eq!(names(&found[1]), [("b", "")]);
 	}
 
 	#[test]
