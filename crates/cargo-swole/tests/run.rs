@@ -815,6 +815,70 @@ fn package(repo: &Path, name: &str, bench: &str, needs: &[&str]) {
 	.unwrap();
 }
 
+/// The library of a package whose benchmark calls `encode` and `decode`, the second spending
+/// `rounds` on each call, neither inlined.
+fn codec(rounds: u64) -> String {
+	format!(
+		"#[inline(never)]\npub fn encode(n: u64) -> u64 {{\n\t(0..n).fold(0, |a, b| std::hint::black_box(a ^ b))\n}}\n\n\
+		 #[inline(never)]\npub fn decode(n: u64) -> u64 {{\n\t(0..n * {rounds}).fold(0, |a, b| std::hint::black_box(a + b))\n}}\n"
+	)
+}
+
+#[test]
+fn names_the_function_whose_work_changed_beside_each_changed_benchmark() {
+	let repo = scratch("compare-functions");
+	let cache = scratch("compare-functions-cache");
+	git(&repo, &["init", "--quiet"]);
+	std::fs::copy(
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+		repo.join("Cargo.lock"),
+	)
+	.unwrap();
+	std::fs::write(
+		repo.join("Cargo.toml"),
+		"[workspace]\nmembers = [\"a\"]\nresolver = \"3\"\n",
+	)
+	.unwrap();
+	package(&repo, "a", "x", &[]);
+	std::fs::write(repo.join("a/src/lib.rs"), codec(1)).unwrap();
+	std::fs::write(
+		repo.join("a/benches/x.rs"),
+		"#[swole::bench]\nfn codec() -> u64 {\n\ta::encode(std::hint::black_box(1000)) + a::decode(std::hint::black_box(1000))\n}\n\n\
+		 #[swole::bench]\nfn steady() -> u64 {\n\ta::encode(std::hint::black_box(1000))\n}\n\n\
+		 fn main() {\n\tswole::main();\n}\n",
+	)
+	.unwrap();
+	git(&repo, &["add", "."]);
+	git(&repo, &["commit", "--quiet", "-m", "base"]);
+	// Only `decode` does more, in a file of the same size, edited as soon as it was committed.
+	std::fs::write(repo.join("a/src/lib.rs"), codec(3)).unwrap();
+	let out = Command::new(env!("CARGO_BIN_EXE_swole"))
+		.args(["sim", "HEAD"])
+		.current_dir(&repo)
+		.env("XDG_CACHE_HOME", &cache)
+		.env(
+			"CARGO_TARGET_DIR",
+			Path::new(env!("CARGO_TARGET_TMPDIR")).join("compare-functions-target"),
+		)
+		.env("CARGO_NET_OFFLINE", "true")
+		.output()
+		.unwrap();
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	let stdout = String::from_utf8(out.stdout).unwrap();
+	let (_, shifted) = stdout
+		.split_once("Functions behind each change")
+		.unwrap_or_else(|| panic!("{stdout}"));
+	let rows: Vec<&str> = shifted.lines().filter(|row| row.contains("| instructions |")).collect();
+	// The first function of the changed benchmark is the helper, with a rise of its own cost.
+	assert!(
+		rows.first()
+			.is_some_and(|row| row.contains("codec") && row.contains("`a::decode`")),
+		"{shifted}"
+	);
+	assert!(!shifted.contains("`a::encode`"), "{shifted}");
+	assert!(!shifted.contains("| steady"), "{shifted}");
+}
+
 #[test]
 fn compares_a_selection_only_one_side_has() {
 	let repo = scratch("compare-select");

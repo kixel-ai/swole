@@ -243,7 +243,10 @@ version moves too, since a new Valgrind can count differently and starts new ser
 `swole sim <base>` and `swole quick <base>` count `<base>` and the working tree in one worktree kept under
 `~/.cache/swole` (or `$XDG_CACHE_HOME`), each from the directory there that matches where
 it runs, and print a Markdown table of each benchmark's base, head, and change, then one of every
-other measure: for `sim`, each [simulated event](#simulated-cycles) and the estimated cycles. `swole bench <base>` builds both sides in the same worktree and times
+other measure: for `sim`, each [simulated event](#simulated-cycles) and the estimated cycles. `sim` then names,
+for each measure of each changed benchmark, the three to five functions whose own cost moved it most, from the
+Callgrind profiles it already reads (the first run's, marked when the benchmark ran beside other threads), with an
+added or removed function marked. `swole bench <base>` builds both sides in the same worktree and times
 them [paired](#bench). One directory
 counts both sides, so a path the build compiles in, such as a panic's location, is the same in
 each and moves neither count. The worktree sits outside the repository, so no
