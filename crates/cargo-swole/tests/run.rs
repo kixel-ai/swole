@@ -50,7 +50,11 @@ unsafe extern "C" {
 /// more, as many as std's random `HashMap` seed and the clock choose. One whose name starts
 /// with `abstimer` first arms a timer at an absolute time, repeating every 2^64 ns and more,
 /// which the kernel takes though the span overflows a count of nanoseconds. One whose name
-/// starts with `cwd` runs as many more as its working directory's path has bytes.
+/// starts with `cwd` runs as many more as its working directory's path has bytes. One whose name
+/// starts with `seq` or `stride` instead reads that many words of a 1 MiB buffer, one after
+/// another or a cache line apart, and one whose name starts with `sorted` or `shuffled` branches
+/// on that many bits, about half of them set, all set first or in a fixed pseudorandom order, so each
+/// pair runs the same instructions but for its caches' or branch predictor's hits.
 #[test]
 #[ignore = "the program the other tests count"]
 fn fixture() {
@@ -89,12 +93,43 @@ fn fixture() {
 			};
 			assert_eq!(armed, 0, "the kernel takes the setting");
 		}
+		let words = vec![1u64; 1 << 17];
+		let step = std::hint::black_box(if name.starts_with("stride") { 8 } else { 1 });
+		// xorshift64's top bit, from a fixed seed.
+		let mut state = 0x9e37_79b9_7f4a_7c15u64;
+		let mut bits: Vec<u8> = (0..iterations)
+			.map(|_| {
+				state ^= state << 13;
+				state ^= state >> 7;
+				state ^= state << 17;
+				(state >> 63) as u8
+			})
+			.collect();
+		if name.starts_with("sorted") {
+			bits.sort_unstable_by(|a, b| b.cmp(a));
+		}
+		// Read before counting starts: comparing names counts as their addresses fall.
+		let reads = name.starts_with("seq") || name.starts_with("stride");
+		let branches = name.starts_with("sorted") || name.starts_with("shuffled");
 		request(ZERO_STATS, 0);
 		request(START_INSTRUMENTATION, 0);
 		let mut sum = 0u64;
-		for i in 0..iterations {
-			sum = std::hint::black_box(sum.wrapping_add(i));
+		if reads {
+			for i in 0..iterations as usize {
+				sum = sum.wrapping_add(words[(i * step) & (words.len() - 1)]);
+			}
+		} else if branches {
+			for &bit in &bits {
+				if std::hint::black_box(bit) != 0 {
+					sum = std::hint::black_box(sum + 1);
+				}
+			}
+		} else {
+			for i in 0..iterations {
+				sum = std::hint::black_box(sum.wrapping_add(i));
+			}
 		}
+		std::hint::black_box(sum);
 		request(STOP_INSTRUMENTATION, 0);
 		let name = std::ffi::CString::new(name).expect("no NUL");
 		request(DUMP_STATS_AT, name.as_ptr() as u64);
@@ -143,10 +178,13 @@ fn counts_each_benchmark_a_program_brackets() {
 	let metrics: serde_json::Value =
 		serde_json::from_str(&std::fs::read_to_string(dir.join("metrics.json")).unwrap()).unwrap();
 	let units = metrics["units"].as_object().unwrap();
-	assert_eq!(units.len(), 1);
-	let (measure, unit) = units.iter().next().unwrap();
+	assert_eq!(units.len(), 2);
+	let (measure, unit) = units.iter().find(|(name, _)| name.starts_with("instructions")).unwrap();
 	assert_eq!(unit, "instructions");
 	assert!(measure.starts_with("instructions (x86_64-"), "{measure}");
+	let (cycles, unit) = units.iter().find(|(name, _)| name.starts_with("estimated")).unwrap();
+	assert_eq!(unit, "cycles");
+	assert_eq!(cycles, &measure.replace("instructions", "estimated cycles"));
 	let count = |name: &str| {
 		metrics["samples"][0]["metrics"][name][measure]["value"]
 			.as_u64()
@@ -164,6 +202,58 @@ fn counts_each_benchmark_a_program_brackets() {
 		std::fs::read(dir.join("metrics.json")).unwrap(),
 		std::fs::read(dir.join("again.json")).unwrap()
 	);
+}
+
+/// Callgrind's cache and branch simulation tells apart what its instructions alone cannot: a pair
+/// of benchmarks that run the same instructions, but miss the cache or mispredict a branch on
+/// every iteration in one and seldom in the other, and estimates the cycles each takes, the same
+/// in every sample and every run.
+#[test]
+fn simulates_caches_and_branches_exactly() {
+	let dir = scratch("simulated");
+	const N: f64 = 10_000.0;
+	let benches = "seq=10000,stride=10000,sorted=10000,shuffled=10000";
+	let report = |name: &str| {
+		let out = bench(&dir, benches, "", &["--report", name]);
+		assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+		std::fs::read_to_string(dir.join(name)).unwrap()
+	};
+	let text = report("one.json");
+	assert_eq!(text, report("two.json"), "a second run counts otherwise");
+	let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+	assert!(
+		report["host"].as_array().unwrap().iter().any(|line| line
+			.as_str()
+			.unwrap()
+			.starts_with("simulation: --cache-sim=yes --branch-sim=yes --I1=")),
+		"{}",
+		report["host"]
+	);
+	let value = |bench: &str, measure: &str| {
+		let measured = &report["benchmarks"][bench]["head"][measure];
+		// A program's benchmarks count five times, each the same.
+		assert_eq!(measured["lower"], measured["upper"], "{bench} {measure}: {measured}");
+		assert_eq!(measured["lower"], measured["value"], "{bench} {measure}: {measured}");
+		measured["value"]
+			.as_f64()
+			.unwrap_or_else(|| panic!("{bench} has no {measure}: {report}"))
+	};
+	let near = |a: f64, b: f64| (a - b).abs() / b < 0.01;
+	for (fast, slow, event) in [
+		("seq", "stride", "D1 read misses"),
+		("sorted", "shuffled", "conditional mispredicts"),
+	] {
+		let ir = (value(fast, "instructions"), value(slow, "instructions"));
+		assert!(near(ir.0, ir.1), "{fast} {slow}: {ir:?} instructions");
+		let missed = (value(fast, event), value(slow, event));
+		assert!(
+			missed.0 < N / 7.0 && missed.1 > N / 3.0,
+			"{fast} {slow}: {missed:?} {event}"
+		);
+		let cycles = (value(fast, "estimated cycles"), value(slow, "estimated cycles"));
+		// A debug build's dozens of instructions an iteration dilute what a miss adds.
+		assert!(cycles.1 > 1.1 * cycles.0, "{fast} {slow}: {cycles:?} estimated cycles");
+	}
 }
 
 #[test]
@@ -293,7 +383,11 @@ fn counts_each_harness_benchmark_alone_without_its_setup() {
 	);
 	let count = |name: &str| {
 		let measures = metrics[&format!("{file}{name}")].as_object().unwrap();
-		measures.values().next().unwrap()["value"].as_u64().unwrap()
+		let (_, instructions) = measures
+			.iter()
+			.find(|(measure, _)| measure.starts_with("instructions ("))
+			.unwrap();
+		instructions["value"].as_u64().unwrap()
 	};
 	let alone = count("alone");
 	assert!(alone > 1000, "{alone}");
@@ -667,7 +761,7 @@ fn compares_a_selection_only_one_side_has() {
 	assert!(out.status.success(), "{err}");
 	assert!(err.contains("HEAD has nothing the cargo args select"), "{err}");
 	let table = String::from_utf8(out.stdout).unwrap();
-	assert_eq!(table.lines().count(), 3, "{table}");
+	assert_eq!(table.lines().take_while(|line| !line.is_empty()).count(), 3, "{table}");
 	assert!(row(&table, "b").ends_with("| added |"), "{table}");
 
 	// So does a manifest only the head has.
@@ -676,7 +770,7 @@ fn compares_a_selection_only_one_side_has() {
 	assert!(out.status.success(), "{err}");
 	assert!(err.contains("HEAD has no --manifest-path b/Cargo.toml"), "{err}");
 	let table = String::from_utf8(out.stdout).unwrap();
-	assert_eq!(table.lines().count(), 3, "{table}");
+	assert_eq!(table.lines().take_while(|line| !line.is_empty()).count(), 3, "{table}");
 	assert!(row(&table, "b").ends_with("| added |"), "{table}");
 
 	// So does the directory of a package only the head has, even once a run left the head's
@@ -686,7 +780,7 @@ fn compares_a_selection_only_one_side_has() {
 		let err = String::from_utf8_lossy(&out.stderr);
 		assert!(out.status.success(), "{err}");
 		let table = String::from_utf8(out.stdout).unwrap();
-		assert_eq!(table.lines().count(), 3, "{table}");
+		assert_eq!(table.lines().take_while(|line| !line.is_empty()).count(), 3, "{table}");
 		assert!(row(&table, "b").ends_with("| added |"), "{table}");
 	}
 

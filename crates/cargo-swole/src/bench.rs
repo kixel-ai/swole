@@ -710,10 +710,13 @@ fn table(times: &BTreeMap<String, Times>, paired: bool) -> String {
 /// The times as a `metrics.json`: the working tree's as the run's own commit's, and the base's,
 /// when there is one, as its commit's.
 fn file(times: &BTreeMap<String, Times>, host: &str, base: Option<&str>) -> metrics::File {
-	let values = |side: fn(&Times) -> Option<f64>| -> BTreeMap<String, metrics::Point> {
+	let measure = format!("time ({host})");
+	let values = |side: fn(&Times) -> Option<f64>| -> BTreeMap<String, BTreeMap<String, metrics::Point>> {
 		times
 			.iter()
-			.filter_map(|(name, times)| side(times).map(|time| (name.clone(), number(time).into())))
+			.filter_map(|(name, times)| {
+				side(times).map(|time| (name.clone(), BTreeMap::from([(measure.clone(), number(time).into())])))
+			})
 			.collect()
 	};
 	let mut samples = Vec::new();
@@ -728,8 +731,7 @@ fn file(times: &BTreeMap<String, Times>, host: &str, base: Option<&str>) -> metr
 		values: values(Times::head),
 	});
 	metrics::File {
-		measure: format!("time ({host})"),
-		unit: UNIT,
+		units: BTreeMap::from([(measure, UNIT)]),
 		samples,
 	}
 }
