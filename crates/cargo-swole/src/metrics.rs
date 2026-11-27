@@ -416,15 +416,17 @@ pub fn table(counts: &Counts) -> String {
 pub const SAMPLED: &str = "~";
 
 /// A change from `base` to `head`, each a value and the least and most of its samples when
-/// sampled, as a table shows it: none from an exact base of zero, and from a sampled one, the
-/// absolute change and the least and most its spreads allow. A sampled value moves within its
+/// sampled, as a table shows it: none from an exact base of zero, and from a sampled base whose
+/// spread holds zero, the absolute change and the least and most its spreads allow. A sampled value moves within its
 /// samples' spread, so the change between two says whether their spreads overlap; with one side's
 /// spread alone, it gives no verdict and is marked sampled.
 pub fn change(
 	(base, base_spread): (f64, Option<(f64, f64)>),
 	(head, head_spread): (f64, Option<(f64, f64)>),
 ) -> String {
-	let change = if base != 0.0 {
+	// A base that may be zero has no percentage change, only an absolute one.
+	let maybe_zero = base == 0.0 || base_spread.is_some_and(|(least, most)| least <= 0.0 && 0.0 <= most);
+	let change = if !maybe_zero {
 		format!("{:+.2}%", (head - base) / base * 100.0)
 	} else if base_spread.is_some() || head_spread.is_some() {
 		// No percentage grows from zero, but a sampled zero still moves by some amount.
@@ -838,6 +840,10 @@ mod tests {
 			"+2 (+1 to +3) (beyond spread)"
 		);
 		assert_eq!(change((0.0, None), (2.0, None)), "");
+		assert_eq!(
+			change((1.0, Some((0.0, 2.0))), (2.0, Some((1.0, 3.0)))),
+			"~+1 (-1 to +3) (within spread)"
+		);
 		// A report gives each measure's spread, or with none to hold it, the count's.
 		sampled.details.remove("b");
 		let report = report(&sampled, None, &sim(), None);

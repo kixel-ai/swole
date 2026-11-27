@@ -187,6 +187,9 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 		// Whether another thread first ran after the first call, which picks the CPUs, so both
 		// sides time and count again over the wider ones rather than serialized on one.
 		let mut widen = false;
+		// Each side that saw another thread on the narrow attempt, which the wider one counts as
+		// threaded even if its conditional worker happens not to run there.
+		let mut saw_worker = [false; 2];
 		let libcs_before = libcs.len();
 		let (timed, declared, own, watched) = loop {
 			let dir = work.join(if widen {
@@ -290,11 +293,13 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					)
 				}
 			};
+			let timed_threaded = [timed_threaded[0] || saw_worker[0], timed_threaded[1] || saw_worker[1]];
 			let mut watched = true;
 			for (i, (side, job)) in [(Which::Base, &base), (Which::Head, &head)].into_iter().enumerate() {
 				let Some(job) = job else { continue };
 				if timed_threaded[i] {
 					threaded.insert(name.clone());
+					saw_worker[i] = true;
 				}
 				let mut measures = match (perf, &preload) {
 					(Some(_), Some(_)) if timed_threaded[i] && !inherits[i] => {
@@ -321,6 +326,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 								if every_thread {
 									threaded.insert(name.clone());
 									every.insert(name.clone());
+									saw_worker[i] = true;
 								}
 								measures
 							}
@@ -330,6 +336,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 							}
 							Counted::TooOld => {
 								threaded.insert(name.clone());
+								saw_worker[i] = true;
 								watched = false;
 								Vec::new()
 							}
