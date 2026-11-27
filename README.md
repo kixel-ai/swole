@@ -477,8 +477,8 @@ the sampling as its clock starts and stops it as the clock stops, so setup, step
 built between calls stay out of a profile as they stay out of a time, and neither the times nor
 the counters share a process with it. swole resolves each sample's instruction pointer against
 the executable or library mapped there, by the symbols and line tables `bench` builds every
-benchmark with (`debug = "limited"` and `strip = "none"` in `profile.bench`, or the profile
-`--profile` picks, which leave the code it times as it is), and names the
+benchmark with (rustc's `-Cdebuginfo=limited -Cstrip=none`, after its Cargo profile's own flags,
+which leave both the code it times and what Cargo tells build scripts as they are), and names the
 innermost function inlined there that is not Rust's standard library's, whose generic helpers
 count as the code that called them; a sample in the kernel counts as `[kernel]`. A table under
 the measures prints the three to five functions whose sampled self cycles a call (`~`), on every

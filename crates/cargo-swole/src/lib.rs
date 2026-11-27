@@ -641,11 +641,14 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 	let mut jobs = if options.programs.is_empty() {
 		cargo::jobs(
 			dir,
-			&options.cargo,
-			if strict {
-				cargo::Lacking::Nothing
-			} else {
-				cargo::Lacking::Targets
+			&cargo::Build {
+				args: &options.cargo,
+				lacking: if strict {
+					cargo::Lacking::Nothing
+				} else {
+					cargo::Lacking::Targets
+				},
+				rustflags: &[],
 			},
 		)?
 	} else {

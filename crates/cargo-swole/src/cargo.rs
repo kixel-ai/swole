@@ -225,12 +225,22 @@ pub enum Lacking {
 	Counted,
 }
 
-/// Builds the benchmark targets of the workspace in `dir`, passing `args` to `cargo bench`,
-/// and lists the benchmarks each runs as a job, one benchmark a process, failing on what it
-/// may not be `lacking`.
-pub fn jobs(dir: &Path, args: &[String], lacking: Lacking) -> Result<Vec<Job>, String> {
+/// How to build a workspace's benchmarks.
+pub struct Build<'a> {
+	/// What to pass `cargo bench`.
+	pub args: &'a [String],
+	/// What the workspace may lack and still list its benchmarks.
+	pub lacking: Lacking,
+	/// Flags rustc takes after the profile's own, beside the cfg CodSpeed's crates take.
+	pub rustflags: &'a [&'a str],
+}
+
+/// Builds the benchmark targets of the workspace in `dir` as `how` says, and lists the
+/// benchmarks each runs as a job, one benchmark a process, failing on what it may not lack.
+pub fn jobs(dir: &Path, how: &Build) -> Result<Vec<Job>, String> {
+	let (args, lacking) = (how.args, how.lacking);
 	let root = codspeed_root(&workspace_root(dir, args)?)?;
-	let targets = build(dir, args)?;
+	let targets = build(dir, args, how.rustflags)?;
 	if targets.is_empty() {
 		if lacking == Lacking::Nothing {
 			return Err("cargo built no benchmark target".to_owned());
@@ -651,7 +661,7 @@ pub fn manifest_path(args: &[String]) -> Option<&str> {
 /// Builds every benchmark target with CodSpeed's cfg, as `cargo codspeed build` does, and
 /// returns each with how Cargo launches it: `cargo bench` runs each through this executable as
 /// its runner, which records the launch rather than running it.
-fn build(dir: &Path, args: &[String]) -> Result<Vec<(Target, Launch)>, String> {
+fn build(dir: &Path, args: &[String], rustflags: &[&str]) -> Result<Vec<(Target, Launch)>, String> {
 	let exe = crate::perf::helper()?;
 	let exe = exe.to_str().ok_or("swole's own path is not UTF-8")?;
 	// A launch's environment holds whatever secrets the caller exported, so it goes to a
@@ -689,15 +699,18 @@ fn build(dir: &Path, args: &[String]) -> Result<Vec<(Target, Launch)>, String> {
 	// Cargo takes one source of rustflags and ignores the rest, so the cfg joins the flags the
 	// environment sets, or else is the only flags there are: a config that sets its own is
 	// refused before anything builds, rather than one source silently replacing another.
+	// Rustc takes the last of a codegen flag given twice, so these follow the profile's.
+	let ours: Vec<&str> = std::iter::once(CFG).chain(rustflags.iter().copied()).collect();
 	if let Ok(flags) = std::env::var("CARGO_ENCODED_RUSTFLAGS") {
+		let ours = ours.join("\x1f");
 		let flags = if flags.is_empty() {
-			CFG.to_owned()
+			ours
 		} else {
-			format!("{flags}\x1f{CFG}")
+			format!("{flags}\x1f{ours}")
 		};
 		cargo.env("CARGO_ENCODED_RUSTFLAGS", flags);
 	} else if let Ok(flags) = std::env::var("RUSTFLAGS") {
-		cargo.env("RUSTFLAGS", format!("{flags} {CFG}"));
+		cargo.env("RUSTFLAGS", format!("{flags} {}", ours.join(" ")));
 	} else {
 		if let Some(source) = configured(dir, args, &env, Key::Rustflags)? {
 			return Err(format!(
@@ -705,7 +718,7 @@ fn build(dir: &Path, args: &[String]) -> Result<Vec<(Target, Launch)>, String> {
 				 set RUSTFLAGS to the flags the build needs, and swole adds the cfg to them"
 			));
 		}
-		cargo.env("CARGO_ENCODED_RUSTFLAGS", CFG);
+		cargo.env("CARGO_ENCODED_RUSTFLAGS", ours.join("\x1f"));
 	}
 	eprintln!("swole: building benchmarks in {}", dir.display());
 	let mut child = cargo.spawn().map_err(|e| format!("cannot run cargo: {e}"))?;

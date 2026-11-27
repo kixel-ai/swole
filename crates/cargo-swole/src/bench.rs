@@ -117,7 +117,14 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				checkout.short(),
 				checkout.dir.display()
 			);
-			let jobs = cargo::jobs(&checkout.dir, &symbols(&cargo), Lacking::Counted)?;
+			let jobs = cargo::jobs(
+				&checkout.dir,
+				&cargo::Build {
+					args: &cargo,
+					lacking: Lacking::Counted,
+					rustflags: SYMBOLS,
+				},
+			)?;
 			// A base from before a rewrite to swole has only CodSpeed's benchmarks,
 			// which a time leaves out, so every benchmark of the head times alone.
 			let (codspeed, jobs): (Vec<Job>, Vec<Job>) = jobs.into_iter().partition(|job| job.codspeed);
@@ -147,7 +154,14 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 			} else {
 				Lacking::Nothing
 			};
-			by_name(cargo::jobs(Path::new("."), &symbols(&cargo), lacking)?)
+			by_name(cargo::jobs(
+				Path::new("."),
+				&cargo::Build {
+					args: &cargo,
+					lacking,
+					rustflags: SYMBOLS,
+				},
+			)?)
 		}
 		None => {
 			eprintln!("swole: the working tree has nothing the cargo args select, so times none");
@@ -524,33 +538,11 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	Ok(())
 }
 
-/// `cargo`'s args, having Cargo build each benchmark with the symbols and line tables a profile
-/// names inlined functions by, which leave the code it times as it is, kept whatever the profile
-/// it builds with, `bench` unless `--profile` picks another, or one it inherits strips.
-fn symbols(cargo: &[String]) -> Vec<String> {
-	let mut profile = "bench";
-	let mut args = cargo.iter();
-	while let Some(arg) = args.next() {
-		// Cargo's own args end where the benchmark's begin.
-		if arg == "--" {
-			break;
-		}
-		if arg == "--profile" {
-			profile = args.next().map_or(profile, String::as_str);
-		} else if let Some(name) = arg.strip_prefix("--profile=") {
-			profile = name;
-		}
-	}
-	[
-		"--config".to_owned(),
-		format!("profile.{profile}.debug=\"limited\""),
-		"--config".to_owned(),
-		format!("profile.{profile}.strip=\"none\""),
-	]
-	.into_iter()
-	.chain(cargo.iter().cloned())
-	.collect()
-}
+/// The rustc flags each benchmark builds with in `bench`: the symbols and line tables a profile
+/// names inlined functions by, which leave the code it times as it is, kept whatever its Cargo
+/// profile strips. As flags rather than the profile's settings, they leave what Cargo tells build
+/// scripts of the profile, such as `DEBUG`, as it is.
+const SYMBOLS: &[&str] = &["-Cdebuginfo=limited", "-Cstrip=none"];
 
 /// The CPUs `name`'s processes spread over in place of the reserved CPU, when another thread ran
 /// beside its first call, which one CPU would serialize.
@@ -1540,22 +1532,6 @@ impl Side for Process {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn keeps_symbols_in_the_profile_cargo_builds_with() {
-		let args = |args: &[&str]| symbols(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
-		assert_eq!(args(&[])[1], "profile.bench.debug=\"limited\"");
-		assert_eq!(args(&["--profile", "release"])[3], "profile.release.strip=\"none\"");
-		assert_eq!(
-			args(&["--profile=fast", "-p", "x"])[1],
-			"profile.fast.debug=\"limited\""
-		);
-		// What follows `--` is the benchmark's, not Cargo's.
-		assert_eq!(
-			args(&["--", "--profile", "release"])[1],
-			"profile.bench.debug=\"limited\""
-		);
-	}
 
 	/// A side whose samples take what `nanos` says an iteration takes, given the sample's index,
 	/// and `step` nanoseconds more an iteration untimed, recording each request in a log shared
