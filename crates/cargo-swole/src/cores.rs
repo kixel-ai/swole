@@ -10,7 +10,7 @@
 //! Where swole may write the core's cpufreq policy, it switches it to the `performance` governor
 //! for the run, recording what it changed first in a journal beside the lease that only the run's
 //! user may write, and restores it on exit or on SIGINT, SIGTERM, or SIGHUP; the next run of that
-//! user, or of root, to lease the core restores what a run killed outright left behind.
+//! user to lease the core restores what a run killed outright left behind.
 
 use std::fs::File;
 use std::io::Write;
@@ -374,18 +374,18 @@ fn recover(sys: &Path, core: &[usize], journal: &Path) -> Result<(), String> {
 		fn geteuid() -> u32;
 	}
 	let read = |e: std::io::Error| format!("cannot read {}: {e}", journal.display());
-	match std::fs::symlink_metadata(journal) {
-		Ok(meta) if meta.is_file() => {}
+	// SAFETY: takes no arguments.
+	let euid = unsafe { geteuid() };
+	// Only a journal the run's own user wrote is replayed, so no other user steers what it writes,
+	// and the run can remove what it replays. The owner is checked before opening, since another
+	// user's journal may not be readable.
+	let owner = match std::fs::symlink_metadata(journal) {
+		Ok(meta) if meta.is_file() => meta.uid(),
 		Ok(_) => return Err(format!("{} is no journal swole wrote", journal.display())),
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
 		Err(e) => return Err(read(e)),
-	}
-	let mut file = File::open(journal).map_err(read)?;
-	// Only the run's own user, or root, may have written the journal, so no user swole may not
-	// change cpufreq for steers what it writes there.
-	// SAFETY: takes no arguments.
-	let trusted = [0, unsafe { geteuid() }].contains(&file.metadata().map_err(read)?.uid());
-	if !trusted {
+	};
+	if owner != euid {
 		eprintln!(
 			"swole: another user's swole run was killed with core {}'s governor changed, which its journal {} \
 			 records and that user's next run restores",
@@ -393,6 +393,12 @@ fn recover(sys: &Path, core: &[usize], journal: &Path) -> Result<(), String> {
 			journal.display()
 		);
 		return Ok(());
+	}
+	// Whoever owns the lease directory may swap the journal since, so the opened file must still be
+	// the run's own.
+	let mut file = File::open(journal).map_err(read)?;
+	if file.metadata().map_err(read)?.uid() != euid {
+		return Err(format!("{} changed owner while swole read it", journal.display()));
 	}
 	let mut record = String::new();
 	std::io::Read::read_to_string(&mut file, &mut record).map_err(read)?;

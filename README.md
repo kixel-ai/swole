@@ -416,8 +416,8 @@ the run says unless the kernel isolates the CPU (`isolcpus`, listed in
 Where swole may write the core's cpufreq policy, and the policy sets no CPU outside the core, a
 run switches the core to the `performance` governor, recording what it changed first in a journal
 beside the lease that only its user may write, and restores the governor and energy preference
-when it exits or a SIGINT, SIGTERM, or SIGHUP ends it; the next run of that user, or of root, to
-lease the core restores what a run killed outright left. Elsewhere
+when it exits or a SIGINT, SIGTERM, or SIGHUP ends it; the next run of that user to lease the core
+restores what a run killed outright left. Elsewhere
 it times under the host's governor and says why. Either way the governor it times under enters
 the [fingerprint](#fingerprints), so times under two governors never share a series. sysfs
 attributes take a group and mode, so a host grants its benchmarking group the governors and
