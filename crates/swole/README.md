@@ -149,7 +149,8 @@ runs that benchmark alone, which swole sets on each job. It takes no arguments b
 Cargo's own `--bench` and `--quiet`; swole's `--benchmarks` chooses benchmarks.
 
 With `SWOLE_TIME=1` as well, it sets that benchmark up and then times it, a sample for
-each iteration count a line of stdin holds, printing `swole sample <nanoseconds>` on a
+each iteration count a line of stdin holds, printing its `swole throughput` line, if any, before
+the first, and `swole sample <nanoseconds>` on a
 line of its own after each, until stdin ends, after a `swole rusage` line of what the process
 used over the sample: user and system CPU nanoseconds, peak resident bytes, minor and major page
 faults, and voluntary and involuntary context switches. swole drives it so, and reads a

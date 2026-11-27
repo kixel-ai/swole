@@ -297,9 +297,6 @@ pub(crate) struct Job {
 	expect: Option<String>,
 	/// Whether it runs a benchmark of CodSpeed's crates, which only Valgrind counts.
 	codspeed: bool,
-	/// What each call of its benchmark processes, as its target's listing declared it, which
-	/// bench, timing natively as the listing runs, divides by.
-	throughput: Option<metrics::Throughput>,
 }
 
 impl Job {
@@ -609,7 +606,6 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 				command: shell(program, dir),
 				expect: None,
 				codspeed: false,
-				throughput: None,
 			})
 			.collect()
 	};

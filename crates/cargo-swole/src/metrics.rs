@@ -20,7 +20,7 @@ const MEASURE_LIMIT: usize = 64;
 const SCHEMA_VERSION: u64 = 1;
 
 /// What a harness target prints before what each call of a benchmark processes.
-const THROUGHPUT: &str = "swole throughput ";
+pub const THROUGHPUT: &str = "swole throughput ";
 
 /// What each call of a benchmark processes, as its `#[bench(bytes = ..)]` or `items` declares.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,20 +46,30 @@ impl Throughput {
 	pub fn declared(stdout: &str) -> Result<BTreeMap<String, Self>, String> {
 		let mut declared = BTreeMap::new();
 		for rest in stdout.lines().filter_map(|line| line.strip_prefix(THROUGHPUT)) {
-			let malformed = || format!("a harness target printed {THROUGHPUT}{rest}, which no harness prints");
-			let mut fields = rest.splitn(3, ' ');
-			let (Some(unit), Some(amount), Some(name)) = (fields.next(), fields.next(), fields.next()) else {
-				return Err(malformed());
-			};
-			let throughput = Self::parse(unit, amount).ok_or_else(malformed)?;
-			if declared
-				.insert(name.to_owned(), throughput)
-				.is_some_and(|other| other != throughput)
-			{
-				return Err(format!("a harness target declared two throughputs of {name}"));
-			}
+			let (name, throughput) = Self::record(rest)?;
+			Self::agree(&mut declared, name, throughput)?;
 		}
 		Ok(declared)
+	}
+
+	/// The benchmark and throughput a `swole throughput ` line declares after its prefix.
+	pub fn record(rest: &str) -> Result<(&str, Self), String> {
+		let malformed = || format!("a harness target printed {THROUGHPUT}{rest}, which no harness prints");
+		let mut fields = rest.splitn(3, ' ');
+		let (Some(unit), Some(amount), Some(name)) = (fields.next(), fields.next(), fields.next()) else {
+			return Err(malformed());
+		};
+		Ok((name, Self::parse(unit, amount).ok_or_else(malformed)?))
+	}
+
+	/// Records `throughput` as `name`'s in `declared`, failing if it already holds another.
+	pub fn agree(declared: &mut BTreeMap<String, Self>, name: &str, throughput: Self) -> Result<(), String> {
+		match declared.insert(name.to_owned(), throughput) {
+			Some(other) if other != throughput => {
+				Err(format!("{name} declared two throughputs, {other:?} and {throughput:?}"))
+			}
+			_ => Ok(()),
+		}
 	}
 
 	/// How many times what `base`'s calls each process this one's do, when both count the same
@@ -520,6 +530,15 @@ mod tests {
 				Measure::new("estimated cycles/item", 200.0, "cycles/item"),
 			]
 		);
+		let declared =
+			Throughput::declared("own\nswole throughput bytes 8 a[1 2]\nswole throughput bytes 8 a[1 2]\n").unwrap();
+		assert_eq!(declared, BTreeMap::from([("a[1 2]".to_owned(), Throughput::Bytes(8))]));
+		let two = Throughput::declared("swole throughput bytes 8 a\nswole throughput items 8 a\n");
+		assert!(two.unwrap_err().contains("two throughputs"));
+		for bad in ["bytes 0 a", "bits 8 a", "bytes -1 a", "bytes 8"] {
+			let err = Throughput::declared(&format!("swole throughput {bad}\n")).unwrap_err();
+			assert!(err.contains("which no harness prints"), "{bad}: {err}");
+		}
 		assert_eq!(Throughput::parse("bytes", "0"), None);
 		assert_eq!(Throughput::parse("items", "7"), Some(Throughput::Items(7)));
 		assert_eq!(shown(2048e6, "bytes/s"), "1.91 GiB/s");

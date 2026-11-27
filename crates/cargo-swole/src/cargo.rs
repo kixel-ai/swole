@@ -1,9 +1,8 @@
 //! A Cargo workspace's benchmarks, written with swole's harness or CodSpeed's
 //! compatibility crates.
 //!
-//! A harness target runs each benchmark once, printing `swole ran <name>` after it, and
-//! before that `swole throughput <bytes|items> <n> <name>` for one that declares what each call
-//! processes, or with `SWOLE_BENCH` set to a name, that benchmark alone.
+//! A harness target runs each benchmark once, printing `swole ran <name>` after it, or
+//! with `SWOLE_BENCH` set to a name, that benchmark alone.
 //!
 //! Built with `--cfg codspeed`, as `cargo codspeed build` builds them, a target of CodSpeed's
 //! crates runs each benchmark once around CodSpeed's instrument hooks, printing
@@ -19,7 +18,6 @@ use std::process::{Command, Stdio};
 use serde_json::Value;
 
 use crate::Job;
-use crate::metrics::Throughput;
 
 /// The cfg CodSpeed's compatibility crates take to run each benchmark once around its hooks.
 const CFG: &str = "--cfg=codspeed";
@@ -252,12 +250,7 @@ pub fn jobs(dir: &Path, args: &[String], lacking: Lacking) -> Result<Vec<Job>, S
 	let mut seen = BTreeSet::new();
 	let mut jobs = Vec::new();
 	for ((target, launch), listed) in targets.iter().zip(listed) {
-		let Some(Listed {
-			harness,
-			names,
-			mut throughput,
-		}) = listed?
-		else {
+		let Some((harness, names)) = listed? else {
 			return Err(format!(
 				"benchmark target {} ran no benchmark through swole, nor through CodSpeed's \
 				 compatibility crates, built with --cfg=codspeed (which a config's target rustflags would drop): \
@@ -288,7 +281,6 @@ pub fn jobs(dir: &Path, args: &[String], lacking: Lacking) -> Result<Vec<Job>, S
 			jobs.push(Job {
 				label: name.clone(),
 				command,
-				throughput: throughput.remove(&name),
 				expect: Some(name),
 				codspeed: harness == Harness::CodSpeed,
 			});
@@ -802,18 +794,9 @@ fn bench(message: &Value) -> Result<Option<Target>, String> {
 	Ok(Some(Target { name, executable }))
 }
 
-/// What a target is written with and the benchmarks it runs, as it names them when nothing
-/// measures it.
-#[derive(Debug, PartialEq)]
-struct Listed {
-	harness: Harness,
-	names: Vec<String>,
-	/// What each call processes, of each benchmark that declares it.
-	throughput: BTreeMap<String, Throughput>,
-}
-
-/// What `target` is written with and the benchmarks it runs, or `None` when it ran none.
-fn list(target: &Target, launch: &Launch, root: &Path) -> Result<Option<Listed>, String> {
+/// What `target` is written with and the benchmarks it runs, as it names them when nothing
+/// measures it, or `None` when it ran none.
+fn list(target: &Target, launch: &Launch, root: &Path) -> Result<Option<(Harness, Vec<String>)>, String> {
 	let out = launch
 		.command(&target.executable, root)
 		.env("CODSPEED_PROCESS_ISOLATION", "false")
@@ -837,7 +820,7 @@ fn list(target: &Target, launch: &Launch, root: &Path) -> Result<Option<Listed>,
 /// What a target's output says it is written with, and the benchmarks it ran unmeasured, or
 /// `None` when it ran none. A target of CodSpeed's crates that skipped every benchmark it has
 /// runs none, but is still CodSpeed's.
-fn ran(stdout: &str) -> Result<Option<Listed>, String> {
+fn ran(stdout: &str) -> Result<Option<(Harness, Vec<String>)>, String> {
 	let names = |prefix: &str| -> Vec<String> {
 		stdout
 			.lines()
@@ -845,31 +828,16 @@ fn ran(stdout: &str) -> Result<Option<Listed>, String> {
 			.map(str::to_owned)
 			.collect()
 	};
-	let (names, codspeed) = (names(HARNESS_RAN), names(CODSPEED_CHECKED));
+	let (harness, codspeed) = (names(HARNESS_RAN), names(CODSPEED_CHECKED));
 	// A benchmark's own `Skipping:` line is not CodSpeed's, which follows CodSpeed's header.
 	let starts = |prefix: &str| stdout.lines().any(|line| line.starts_with(prefix));
 	let is_codspeed = !codspeed.is_empty() || (starts(CODSPEED_HARNESS) && starts(CODSPEED_SKIPPED));
-	let harness = match (names.is_empty(), is_codspeed) {
-		(true, false) => return Ok(None),
-		(false, false) => Harness::Swole,
-		(true, true) => {
-			return Ok(Some(Listed {
-				harness: Harness::CodSpeed,
-				names: codspeed,
-				throughput: BTreeMap::new(),
-			}));
-		}
-		(false, true) => return Err("it ran benchmarks through both swole and CodSpeed's crates".to_owned()),
-	};
-	let throughput = Throughput::declared(stdout)?;
-	if let Some(name) = throughput.keys().find(|name| !names.contains(name)) {
-		return Err(format!("it declared a throughput of {name}, which it did not run"));
+	match (harness.is_empty(), is_codspeed) {
+		(true, false) => Ok(None),
+		(false, false) => Ok(Some((Harness::Swole, harness))),
+		(true, true) => Ok(Some((Harness::CodSpeed, codspeed))),
+		(false, true) => Err("it ran benchmarks through both swole and CodSpeed's crates".to_owned()),
 	}
-	Ok(Some(Listed {
-		harness,
-		names,
-		throughput,
-	}))
 }
 
 #[cfg(test)]
@@ -878,49 +846,24 @@ mod tests {
 
 	#[test]
 	fn lists_each_benchmark_a_target_ran() {
-		let names = |out: &str| ran(out).unwrap().map(|listed| (listed.harness, listed.names));
 		let out = "Harness: codspeed-criterion-compat v6.0.0\nChecked: benches/a.rs::g::f[1]\nSkipping: benches/a.rs::c (CodSpeed doesn't support custom iterations)\nChecked: benches/a.rs::g::h\n";
-		let (harness, listed) = names(out).unwrap();
+		let (harness, names) = ran(out).unwrap().unwrap();
 		assert_eq!(harness, Harness::CodSpeed);
-		assert_eq!(listed, ["benches/a.rs::g::f[1]", "benches/a.rs::g::h"]);
+		assert_eq!(names, ["benches/a.rs::g::f[1]", "benches/a.rs::g::h"]);
 		let out = "a benchmark's own line\nswole ran benches/a.rs::f[1]\nswole ran benches/a.rs::m::g\nlast time swole ran this benchmark\n";
-		let (harness, listed) = names(out).unwrap();
+		let (harness, names) = ran(out).unwrap().unwrap();
 		assert_eq!(harness, Harness::Swole);
-		assert_eq!(listed, ["benches/a.rs::f[1]", "benches/a.rs::m::g"]);
-		assert_eq!(names("Harness: codspeed-criterion-compat v6.0.0\n"), None);
+		assert_eq!(names, ["benches/a.rs::f[1]", "benches/a.rs::m::g"]);
+		assert_eq!(ran("Harness: codspeed-criterion-compat v6.0.0\n").unwrap(), None);
 		let skipped = "Harness: codspeed-criterion-compat v6.0.0\nSkipping: benches/a.rs::c (CodSpeed doesn't support custom iterations)\n";
-		assert_eq!(names(skipped), Some((Harness::CodSpeed, Vec::new())));
+		assert_eq!(ran(skipped).unwrap(), Some((Harness::CodSpeed, Vec::new())));
 		let own = "Skipping: a warm-up\nswole ran benches/a.rs::f\n";
-		assert_eq!(names(own), Some((Harness::Swole, vec!["benches/a.rs::f".to_owned()])));
+		assert_eq!(
+			ran(own).unwrap(),
+			Some((Harness::Swole, vec!["benches/a.rs::f".to_owned()]))
+		);
 		let both = "swole ran benches/a.rs::f\nChecked: benches/a.rs::g\n";
 		assert!(ran(both).unwrap_err().contains("both"));
-	}
-
-	#[test]
-	fn reads_what_each_call_of_a_benchmark_processes() {
-		let out = "swole throughput bytes 1024 benches/a.rs::f[a b]\nswole ran benches/a.rs::f[a b]\n\
-		           swole throughput items 3 benches/a.rs::g\nswole ran benches/a.rs::g\nswole ran benches/a.rs::h\n";
-		let listed = ran(out).unwrap().unwrap();
-		assert_eq!(
-			listed.throughput,
-			BTreeMap::from([
-				("benches/a.rs::f[a b]".to_owned(), Throughput::Bytes(1024)),
-				("benches/a.rs::g".to_owned(), Throughput::Items(3)),
-			])
-		);
-		for bad in [
-			"swole throughput bytes 0 benches/a.rs::f\n",
-			"swole throughput bits 8 benches/a.rs::f\n",
-			"swole throughput bytes -1 benches/a.rs::f\n",
-			"swole throughput bytes 8\n",
-		] {
-			let out = format!("{bad}swole ran benches/a.rs::f\n");
-			assert!(ran(&out).unwrap_err().contains("which no harness prints"), "{bad}");
-		}
-		let other = "swole throughput bytes 8 benches/a.rs::other\nswole ran benches/a.rs::f\n";
-		assert!(ran(other).unwrap_err().contains("which it did not run"));
-		let two = "swole throughput bytes 8 benches/a.rs::f\nswole throughput items 8 benches/a.rs::f\nswole ran benches/a.rs::f\n";
-		assert!(ran(two).unwrap_err().contains("two throughputs"));
 	}
 
 	#[test]

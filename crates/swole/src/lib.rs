@@ -138,7 +138,18 @@ fn run() -> Result<(), String> {
 	}
 	if timed {
 		let (name, case) = cases.pop_first().expect("one case is left");
-		return serve(&name, (case.build)(), std::io::stdin().lock(), std::io::stdout(), true);
+		let throughput = case.throughput.as_ref().and_then(|throughput| {
+			let n = throughput.amount?;
+			Some(format!("\n{THROUGHPUT}{} {n} {name}", throughput.unit))
+		});
+		return serve(
+			&name,
+			(case.build)(),
+			throughput.unwrap_or_default(),
+			std::io::stdin().lock(),
+			std::io::stdout(),
+			true,
+		);
 	}
 	let counters = split(COUNTERS)?;
 	let warm = number(ITERATIONS)?;
@@ -292,6 +303,8 @@ fn number(key: &str) -> Result<Option<u64>, String> {
 fn serve(
 	name: &str,
 	mut sampler: Box<dyn __private::Sampler>,
+	// What each call processes, a line before the first sample's, or nothing.
+	mut throughput: String,
 	commands: impl BufRead,
 	mut out: impl Write,
 	watch_threads: bool,
@@ -320,6 +333,7 @@ fn serve(
 		};
 		#[cfg(not(all(unix, target_pointer_width = "64")))]
 		let used = "";
+		let throughput = std::mem::take(&mut throughput);
 		let libc_line = if watch_threads && !reported_libc {
 			reported_libc = true;
 			libc()?.map_or_else(String::new, |libc| format!("\n{LIBC}{libc}"))
@@ -339,7 +353,7 @@ fn serve(
 		};
 		// One write, which takes stdout's lock once, so a thread the benchmark left printing
 		// cannot write between the records.
-		write!(out, "{libc_line}{threaded_line}{used}\n{SAMPLE}{nanos}\n")
+		write!(out, "{throughput}{libc_line}{threaded_line}{used}\n{SAMPLE}{nanos}\n")
 			.and_then(|()| out.flush())
 			.map_err(|e| format!("cannot write a sample: {e}"))?;
 	}
@@ -1331,9 +1345,13 @@ mod tests {
 		let sampler = kept_timed((), |_: &mut (), iterations: Iterations| {
 			Duration::from_nanos(10 * iterations.get())
 		});
-		serve("a", sampler, "1\n4\n".as_bytes(), &mut out, false).unwrap();
+		let throughput = format!("\n{THROUGHPUT}bytes 8 a");
+		serve("a", sampler, throughput, "1\n4\n".as_bytes(), &mut out, false).unwrap();
 		let out = String::from_utf8(out).unwrap();
-		let lines: Vec<&str> = out.lines().filter(|line| !line.is_empty()).collect();
+		// What each call processes comes once, before the first sample.
+		let rest = out.strip_prefix("\nswole throughput bytes 8 a\n").unwrap();
+		assert!(!rest.contains(THROUGHPUT), "{out}");
+		let lines: Vec<&str> = rest.lines().filter(|line| !line.is_empty()).collect();
 		#[cfg(all(unix, target_pointer_width = "64"))]
 		{
 			assert_eq!(lines.len(), 4, "{out}");
@@ -1349,7 +1367,7 @@ mod tests {
 		#[cfg(not(all(unix, target_pointer_width = "64")))]
 		assert_eq!(lines, ["swole sample 10", "swole sample 40"]);
 		for bad in ["0\n", "x\n", " 1\n"] {
-			let err = serve("a", nothing(), bad.as_bytes(), Vec::new(), false).unwrap_err();
+			let err = serve("a", nothing(), String::new(), bad.as_bytes(), Vec::new(), false).unwrap_err();
 			assert!(err.contains("cannot sample"), "{bad:?}: {err}");
 		}
 	}

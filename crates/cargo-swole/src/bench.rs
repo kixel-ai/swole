@@ -159,7 +159,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 		let base = before.as_mut().and_then(|jobs| jobs.remove(&name));
 		let head = after.remove(&name);
 		let pmu = perf.map(|perf| &perf.pmu);
-		let (timed, iterations, used, timed_threaded) = match (&base, &head) {
+		let (timed, iterations, used, timed_threaded, declared) = match (&base, &head) {
 			(Some(base), Some(head)) => {
 				let mut base = Process::spawn(base, pmu, preload.as_deref(), &dir.join("base"))?;
 				let mut head = Process::spawn(head, pmu, preload.as_deref(), &dir.join("head"))?;
@@ -168,6 +168,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				let head_threaded = head.threaded || pairs.iter().any(|(_, h)| h.threaded);
 				libcs.push((format!("{name} (base)"), base.libc.take()));
 				libcs.push((format!("{name} (head)"), head.libc.take()));
+				let declared = [base.throughput, head.throughput];
 				base.finish()?;
 				head.finish()?;
 				let nanos: Vec<(u64, u64)> = pairs.iter().map(|(b, h)| (b.nanos, h.nanos)).collect();
@@ -179,6 +180,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					iterations,
 					[base_used, head_used],
 					[base_threaded, head_threaded],
+					declared,
 				)
 			}
 			(base, head) => {
@@ -191,6 +193,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				let (iterations, samples) = alone(&mut process)?;
 				let side_threaded = process.threaded || samples.iter().any(|sample| sample.threaded);
 				libcs.push((name.clone(), process.libc.take()));
+				let declared = process.throughput;
 				process.finish()?;
 				let nanos: Vec<u64> = samples.iter().map(|sample| sample.nanos).collect();
 				let timed = Times::alone(side, iterations, &nanos).map_err(|err| format!("{name}: {err}"))?;
@@ -208,6 +211,11 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					} else {
 						[false, side_threaded]
 					},
+					if side == Which::Base {
+						[declared, None]
+					} else {
+						[None, declared]
+					},
 				)
 			}
 		};
@@ -220,7 +228,8 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 			} else {
 				match (perf, &preload) {
 					(Some(perf), Some(preload)) => {
-						let (counted, count_libc) = count(job, perf, preload, iterations, &dir.join(side.name()))?;
+						let (counted, count_libc) =
+							count(job, perf, preload, iterations, declared[i], &dir.join(side.name()))?;
 						libcs.push((format!("{name} ({} counters)", side.name()), count_libc));
 						match counted {
 							Counted::Measures(measures) => measures,
@@ -244,7 +253,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				measures.extend(used.measures(*calls * iterations));
 			}
 			// What derives from the side's time and counts, per what each of its calls processes.
-			if let (Some(throughput), Some(time)) = (job.throughput, [timed.base(), timed.head()][i]) {
+			if let (Some(throughput), Some(time)) = (declared[i], [timed.base(), timed.head()][i]) {
 				let mut all = vec![Measure::new("time", time, UNIT)];
 				all.extend(measures.iter().cloned());
 				measures.extend(throughput.measures(&all));
@@ -255,11 +264,8 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 		}
 		// A paired rate changes as the work each call does over the paired time ratio, which the
 		// time's own change is, rather than as its sides' medians do.
-		if let (Times::Both { ratio, .. }, Some(base), Some(head)) = (
-			&timed,
-			base.as_ref().and_then(|job| job.throughput),
-			head.as_ref().and_then(|job| job.throughput),
-		) && let Some(scale) = head.scale(base)
+		if let (Times::Both { ratio, .. }, [Some(base), Some(head)]) = (&timed, declared)
+			&& let Some(scale) = head.scale(base)
 		{
 			rates.insert(name.clone(), scale / ratio.value - 1.0);
 		}
@@ -337,13 +343,16 @@ enum Counted {
 	Unwatched,
 }
 
-/// Counts `job`'s benchmark with each of `perf`'s passes, in a process of its own for each under
+/// Counts `job`'s benchmark with each of `perf`'s passes, which must declare `throughput` as its
+/// timing did, in a process of its own for each under
 /// the library at `preload`, over `iterations` calls, its output under `dir`.
 fn count(
 	job: &Job,
 	perf: &perf::Perf,
 	preload: &Path,
 	iterations: u64,
+	// What each call processes, as the timed process declared it, which each pass must too.
+	throughput: Option<metrics::Throughput>,
 	dir: &Path,
 ) -> Result<(Counted, Option<String>), String> {
 	let mut values = Vec::new();
@@ -378,6 +387,15 @@ fn count(
 		}
 		let path = dir.join("stdout");
 		let text = crate::printed(&path)?;
+		let declared = metrics::Throughput::declared(&text).map_err(|err| format!("{}: {err}", job.label))?;
+		let declared = job.expect.as_ref().and_then(|name| declared.get(name).copied());
+		if declared.is_some() && declared != throughput {
+			return Err(format!(
+				"{} declared another throughput counting than timing; its output is in {}",
+				job.label,
+				dir.display()
+			));
+		}
 		let readings = perf::readings(&text, pass.len()).map_err(|err| format!("{}: {err}", job.label))?;
 		match readings.as_slice() {
 			[] => {
@@ -813,6 +831,8 @@ struct Process {
 	threaded: bool,
 	/// The loaded libc identity reported by this benchmark process on Linux.
 	libc: Option<String>,
+	/// What each call processes, as this process declared it.
+	throughput: Option<metrics::Throughput>,
 }
 
 impl Process {
@@ -854,6 +874,7 @@ impl Process {
 			log: file("stdout")?,
 			threaded: false,
 			libc: None,
+			throughput: None,
 		};
 		let first = process.sample(1)?;
 		process.threaded |= first.threaded;
@@ -973,6 +994,23 @@ impl Side for Process {
 				self.libc = Some(resolved);
 				continue;
 			}
+			if let Some(rest) = line
+				.strip_prefix(metrics::THROUGHPUT.as_bytes())
+				.and_then(|rest| rest.strip_suffix(b"\n"))
+			{
+				let rest = String::from_utf8_lossy(rest);
+				let (name, declared) =
+					metrics::Throughput::record(&rest).map_err(|err| format!("{}: {err}", self.label))?;
+				if name != self.label || self.throughput.is_some_and(|before| before != declared) {
+					return Err(format!(
+						"{}: declared {} {rest}",
+						self.label,
+						metrics::THROUGHPUT.trim_end()
+					));
+				}
+				self.throughput = Some(declared);
+				continue;
+			}
 			if line.starts_with(perf::THREADED.as_bytes()) {
 				threaded = true;
 				continue;
@@ -1026,7 +1064,6 @@ mod tests {
 			command,
 			expect: None,
 			codspeed: false,
-			throughput: None,
 		};
 		let mut process = Process::spawn(&job, None, None, &dir).unwrap();
 		assert_eq!(process.sample(7).unwrap().nanos, 7);
