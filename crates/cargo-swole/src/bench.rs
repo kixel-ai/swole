@@ -245,9 +245,15 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				}
 			};
 			if let Some(heap) = &heap
-				&& let crate::heap::Allocs::Counted(allocs) =
-					crate::heap::measure(job, heap, false, &dir.join(side.name()))?
-			{
+				&& let crate::heap::Allocs::Counted(allocs) = crate::heap::measure(
+					job,
+					crate::heap::Pass {
+						library: heap,
+						padded: false,
+						pmu,
+					},
+					&dir.join(side.name()),
+				)? {
 				measures.extend(allocs);
 			}
 			if let Some((used, calls)) = &used[i] {
@@ -729,6 +735,7 @@ fn file(
 ) -> Result<metrics::File, String> {
 	let measure = format!("time ({host})");
 	let mut units = BTreeMap::from([(measure.clone(), UNIT)]);
+	let allocs_label = crate::heap::fingerprint(host, false);
 	let mut values = |side: fn(&Times) -> Option<f64>,
 	                  details: &BTreeMap<String, Vec<Measure>>|
 	 -> Result<BTreeMap<String, BTreeMap<String, metrics::Point>>, String> {
@@ -737,7 +744,7 @@ fn file(
 			let Some(time) = side(times) else { continue };
 			let mut measures = BTreeMap::from([(measure.clone(), number(time).into())]);
 			let allocs = details.get(name).map(Vec::as_slice).unwrap_or_default();
-			for (series, unit, found) in crate::heap::series(allocs, host) {
+			for (series, unit, found) in crate::heap::series(allocs, &allocs_label) {
 				units.insert(series.clone(), unit);
 				measures.insert(series, metrics::Point::of(found)?);
 			}
@@ -1205,7 +1212,10 @@ mod tests {
 		);
 		assert!(json["samples"][1].get("commit").is_none());
 		// Each side's allocations beside its time, and no other measure.
-		let allocs = "alloc_count (x86_64-0123456789ab)";
+		let allocs = &format!(
+			"alloc_count ({})",
+			crate::heap::fingerprint("x86_64-0123456789ab", false)
+		);
 		assert_eq!(json["units"][allocs], "allocations");
 		assert_eq!(json["units"].as_object().unwrap().len(), 2);
 		assert_eq!(json["samples"][1]["metrics"]["a"][allocs]["value"], 3);

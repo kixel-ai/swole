@@ -47,14 +47,25 @@ pub fn library(shimmed: bool) -> Result<Option<PathBuf>, String> {
 	built.then(|| crate::preload::heap(shimmed)).transpose()
 }
 
-/// Counts `job`'s benchmark's allocations under the interposer at `library`, its launch padded as
-/// a count's when `padded`, each run's output under `dir`.
-pub fn measure(job: &Job, library: &Path, padded: bool, dir: &Path) -> Result<Allocs, String> {
+/// How an allocation pass launches, as the pass beside it does.
+#[derive(Clone, Copy)]
+pub struct Pass<'a> {
+	/// The interposer, from [`library`].
+	pub library: &'a Path,
+	/// Whether the launch is padded, as a count's.
+	pub padded: bool,
+	/// The PMU whose CPUs the pass beside it runs on, if any, so a benchmark that sizes its work by
+	/// the CPUs it may use allocates for the same work.
+	pub pmu: Option<&'a perf::Pmu>,
+}
+
+/// Counts `job`'s benchmark's allocations as `pass` launches, each run's output under `dir`.
+pub fn measure(job: &Job, pass: Pass, dir: &Path) -> Result<Allocs, String> {
 	let name = job.expect.as_deref().expect("a harness job names its benchmark");
 	let mut runs = Vec::new();
 	for run in 1..=SAMPLES {
 		let dir = dir.join(format!("heap-{run}"));
-		let (counted, threaded) = match once(job, library, padded, &dir, name)? {
+		let (counted, threaded) = match once(job, pass, &dir, name)? {
 			Some(Record::Counted(counted, threaded)) => (counted, threaded),
 			Some(Record::Bypassed) => {
 				eprintln!(
@@ -91,7 +102,7 @@ enum Record {
 }
 
 /// One run of the pass, or `None` from a harness too old to count allocations.
-fn once(job: &Job, library: &Path, padded: bool, dir: &Path, name: &str) -> Result<Option<Record>, String> {
+fn once(job: &Job, pass: Pass, dir: &Path, name: &str) -> Result<Option<Record>, String> {
 	std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 	let file = |name: &str| {
 		std::fs::File::create(dir.join(name)).map_err(|e| format!("cannot create {}: {e}", dir.join(name).display()))
@@ -101,7 +112,10 @@ fn once(job: &Job, library: &Path, padded: bool, dir: &Path, name: &str) -> Resu
 		.env(HEAP, "1")
 		.env_remove(perf::COUNTERS)
 		.env_remove(perf::ITERATIONS);
-	let env = crate::environment(&command, library, &job.label, padded)?;
+	if let Some(pmu) = pass.pmu {
+		perf::pin_command(&mut command, pmu);
+	}
+	let env = crate::environment(&command, pass.library, &job.label, pass.padded)?;
 	let status = command
 		.env_clear()
 		.envs(env)
@@ -206,8 +220,15 @@ pub fn label(measures: &[Measure], side: &mut Map<String, Value>) {
 	}
 }
 
+/// The label of allocation counts taken beside a measure of `fingerprint`, with the interposer's
+/// hash after it, since how the interposer counts can move them as the mode's environment does
+/// its own: the shimmed one's beside a count, else the one beside a time.
+pub fn fingerprint(fingerprint: &str, shimmed: bool) -> String {
+	format!("{fingerprint}+{}", crate::preload::heap_hash(shimmed))
+}
+
 /// The allocation measures among a benchmark's `measures`, each by the name `metrics.json` gives
-/// it under `fingerprint`, with its unit.
+/// it under `fingerprint`, from [`fingerprint`], with its unit.
 pub fn series<'a>(measures: &'a [Measure], fingerprint: &str) -> Vec<(String, &'static str, &'a Measure)> {
 	MEASURES
 		.iter()

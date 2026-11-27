@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 mod allocs;
 
-use allocs::{allocated, freed};
+use allocs::{allocated, freed, kept};
 
 // libSystem's, which a `no_std` library links by name.
 #[link(name = "System")]
@@ -72,11 +72,13 @@ unsafe extern "C" fn counted_calloc(n: usize, size: usize) -> *mut c_void {
 /// `GlobalAlloc::realloc` replaces one layout with another; macOS resizes a block to nothing by
 /// freeing it for a new, minimal one.
 unsafe extern "C" fn counted_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
+	// Uncounted first, since once the allocator frees it another thread may take its address.
+	let old = freed(ptr);
 	// SAFETY: the caller's arguments, as it passed them.
 	let moved = unsafe { realloc(ptr, size) };
 	// A failed resize leaves the block as it was.
-	if !ptr.is_null() && !moved.is_null() {
-		freed(ptr);
+	if moved.is_null() {
+		kept(ptr, old);
 	}
 	allocated(moved, size);
 	moved
@@ -84,15 +86,15 @@ unsafe extern "C" fn counted_realloc(ptr: *mut c_void, size: usize) -> *mut c_vo
 
 /// `realloc`, but freeing the block when the resize fails.
 unsafe extern "C" fn counted_reallocf(ptr: *mut c_void, size: usize) -> *mut c_void {
+	let _ = freed(ptr);
 	// SAFETY: the caller's arguments, as it passed them.
 	let moved = unsafe { reallocf(ptr, size) };
-	freed(ptr);
 	allocated(moved, size);
 	moved
 }
 
 unsafe extern "C" fn counted_free(ptr: *mut c_void) {
-	freed(ptr);
+	let _ = freed(ptr);
 	// SAFETY: the caller's argument, as it passed it.
 	unsafe { free(ptr) }
 }

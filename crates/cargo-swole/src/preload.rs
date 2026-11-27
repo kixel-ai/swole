@@ -57,6 +57,11 @@ pub fn heap(shimmed: bool) -> Result<PathBuf, String> {
 	}
 }
 
+/// The hash of the library [`heap`] writes, which the allocation series' names hold.
+pub fn heap_hash(shimmed: bool) -> String {
+	digest(if shimmed { HEAP } else { HEAP_THREADS })
+}
+
 fn write(name: &str, library: &[u8]) -> Result<PathBuf, String> {
 	if library.is_empty() {
 		return Err("swole's preload is built for x86_64 Linux alone, where it counts".to_owned());

@@ -470,8 +470,9 @@ has no allocation counts rather than counts of none: the harness first allocates
 global allocator under the interposer and, when it sees nothing, says so, and swole names the
 benchmark on stderr. A static executable, which loads no interposer, fails the pass.
 
-`--out` holds the three as `alloc_count (<fingerprint>)` and the rest, beside the headline,
-for each benchmark that has them, a sampled one's with its `lower_value` and `upper_value`.
+`--out` holds the three as `alloc_count (<fingerprint>+<interposer>)` and the rest, the mode's
+fingerprint followed by a hash of the interposer that counted them, since a change to how it
+counts can move them, beside the headline for each benchmark that has them, a sampled one's with its `lower_value` and `upper_value`.
 `--report` marks each as the allocation pass's (`"pass":"allocation"`) and says whether it is
 `sampled`, and adds `alloc_churn`, the bytes a call allocated for each byte of its peak.
 

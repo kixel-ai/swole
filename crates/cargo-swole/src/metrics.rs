@@ -61,6 +61,7 @@ impl File {
 	pub fn counts(counts: &Counts, counter: &Counter) -> Result<Self, String> {
 		let series = counter.series(&counts.fingerprint);
 		let mut units = BTreeMap::new();
+		let allocs = crate::heap::fingerprint(&counts.fingerprint, true);
 		let mut values = BTreeMap::new();
 		for (name, details) in &counts.details {
 			let mut measures = BTreeMap::new();
@@ -71,7 +72,7 @@ impl File {
 					.ok_or_else(|| format!("{name} has no {detail}"))?;
 				measures.insert(measure.clone(), Point::of(found)?);
 			}
-			for (series, unit, found) in crate::heap::series(details, &counts.fingerprint) {
+			for (series, unit, found) in crate::heap::series(details, &allocs) {
 				units.insert(series.clone(), unit);
 				measures.insert(series, Point::of(found)?);
 			}
@@ -490,7 +491,7 @@ mod tests {
 			.unwrap()
 			.extend([Measure::new("alloc_count", 2.0, "allocations"), peak]);
 		let json: Value = serde_json::from_str(&File::counts(&counts, &sim()).unwrap().json().unwrap()).unwrap();
-		let fp = "x86_64-0123456789ab";
+		let fp = crate::heap::fingerprint("x86_64-0123456789ab", true);
 		assert_eq!(json["units"][format!("alloc_count ({fp})")], "allocations");
 		assert_eq!(json["units"][format!("peak_live_bytes ({fp})")], "bytes");
 		assert!(json["units"].get(format!("alloc_bytes ({fp})")).is_none());

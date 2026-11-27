@@ -422,8 +422,19 @@ fn counts_allocations_as_a_global_allocator_does() {
 		"{table}"
 	);
 	let metrics: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(metrics).unwrap()).unwrap();
-	let fingerprint = report["fingerprint"].as_str().unwrap();
-	assert_eq!(metrics["units"][format!("alloc_count ({fingerprint})")], "allocations");
+	// Named by the run's fingerprint and the interposer's hash.
+	let (series, unit) = metrics["units"]
+		.as_object()
+		.unwrap()
+		.iter()
+		.find(|(series, _)| series.starts_with("alloc_count ("))
+		.unwrap();
+	assert_eq!(unit, "allocations");
+	let fingerprint = series.strip_prefix("alloc_count (").unwrap().strip_suffix(')').unwrap();
+	assert!(
+		fingerprint.starts_with(&format!("{}+", report["fingerprint"].as_str().unwrap())),
+		"{fingerprint}"
+	);
 	let point = |name: &str| {
 		metrics["samples"][0]["metrics"][format!("{file}{name}")][format!("peak_live_bytes ({fingerprint})")].clone()
 	};

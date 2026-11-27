@@ -895,7 +895,15 @@ fn run(
 							&& job.expect.is_some()
 							&& !job.codspeed
 						{
-							match heap::measure(job, heap, true, &dir) {
+							let pass = heap::Pass {
+								library: heap,
+								padded: true,
+								pmu: match &counter.kind {
+									CounterKind::Perf { pmu, .. } => Some(pmu),
+									CounterKind::Valgrind => None,
+								},
+							};
+							match heap::measure(job, pass, &dir) {
 								Ok(allocs) => found.allocs = Some(allocs),
 								Err(err) => result = Err(err),
 							}

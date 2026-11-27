@@ -185,13 +185,23 @@ pub fn allocated(ptr: *mut c_void, size: usize) {
 	PEAK.fetch_max(live, Relaxed);
 }
 
-/// Uncounts the block at `ptr`, when counting allocated it.
-pub fn freed(ptr: *mut c_void) {
+/// Uncounts the block at `ptr`, when counting allocated it, returning its size, before the
+/// allocator frees it: once freed, another thread may be handed the same address.
+pub fn freed(ptr: *mut c_void) -> Option<u64> {
 	if ptr.is_null() || !COUNTING.load(Relaxed) {
-		return;
+		return None;
 	}
-	if let Some(size) = locked(|table| table.remove(ptr as usize)) {
-		LIVE.fetch_sub(size, Relaxed);
+	let size = locked(|table| table.remove(ptr as usize))?;
+	LIVE.fetch_sub(size, Relaxed);
+	Some(size)
+}
+
+/// Counts again the block at `ptr` of `size` bytes, which [`freed`] uncounted, when the allocator
+/// did not free it after all, as a failed `realloc` does not.
+pub fn kept(ptr: *mut c_void, size: Option<u64>) {
+	if let Some(size) = size {
+		locked(|table| table.insert(ptr as usize, size));
+		LIVE.fetch_add(size, Relaxed);
 	}
 }
 
