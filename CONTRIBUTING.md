@@ -17,5 +17,5 @@ Have at least these sections:
 
 # Landing
 
-A PR lands once CI's `check` job and its local `quest review` rounds pass; queue the reviewed head with `quest merge --squash --land <reviewed head's full SHA> <pr>`.
+A PR lands once `just ci` and its `quest review` rounds pass locally, since CI runs no checks on pull requests; queue the reviewed head with `quest merge --squash --land <reviewed head's full SHA> <pr>`.
 The admin bypass of `main`'s rulesets is for emergencies.
