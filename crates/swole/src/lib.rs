@@ -80,11 +80,26 @@ const ALONE: &str = "swole alone ";
 /// What a run swole measures natively prints before the benchmark process's loaded libc identity.
 const LIBC: &str = "swole libc ";
 
+/// The variable that, set to `1`, has the one benchmark `SWOLE_BENCH` names call once with swole's
+/// allocation interposer counting over the call, and print what it counted.
+const HEAP: &str = "SWOLE_HEAP";
+
+/// What a count of heap allocations prints before the allocations, their bytes, the most bytes
+/// live at once, and the benchmark's name; or before `bypassed` and the name, when the program's
+/// global allocator never reaches the interposer.
+const ALLOCS: &str = "swole allocs ";
+
 #[cfg(target_os = "linux")]
 mod perf;
 
 #[cfg(all(unix, target_pointer_width = "64"))]
 mod rusage;
+
+#[cfg(unix)]
+mod heap;
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 /// Runs every benchmark the program's `#[bench]` functions declare, or only the one
 /// `SWOLE_BENCH` names, each counted alone under Valgrind and once natively, or timed when
@@ -142,6 +157,19 @@ fn run() -> Result<(), String> {
 	if counters.is_some() && !watched {
 		return Err(format!("{COUNTERS} counts one benchmark, which {ONLY} names"));
 	}
+	let heap = match std::env::var_os(HEAP) {
+		None => None,
+		Some(value) if value == "1" => Some(hooks()?),
+		Some(value) => return Err(format!("{HEAP} is {}, not 1", value.to_string_lossy())),
+	};
+	if heap.is_some() && (!watched || counters.is_some()) {
+		return Err(format!(
+			"{HEAP} counts the allocations of one benchmark, which {ONLY} names, in a pass of its own, without \
+			 {COUNTERS}"
+		));
+	}
+	// Whether the program's allocations reach the interposer, found once, before any case.
+	let reaches = heap.as_ref().map(Hooks::reaches);
 	if warm.is_some() && counters.is_none() {
 		return Err(format!(
 			"{ITERATIONS} counts with perf counters, which {COUNTERS} has swole open"
@@ -153,7 +181,10 @@ fn run() -> Result<(), String> {
 		// per-call getrusage syscalls when `SWOLE_ITERATIONS` is set.
 		let counting = counters.is_some();
 		let record_usage = counting && warm.is_none();
-		let meter = __private::Meter::new(&name, counters.take(), watched, record_usage)?;
+		let mut meter = __private::Meter::new(&name, counters.take(), watched, record_usage)?;
+		if reaches == Some(true) {
+			meter.heap = heap;
+		}
 		let mut sampler = (case.build)();
 		if warm.is_some() {
 			// Counted as bench times it: after the samples that warm it up, uncounted, one call
@@ -198,6 +229,15 @@ fn run() -> Result<(), String> {
 		if let Some(usage) = watch.usage {
 			record(format_args!("{RUSAGE}{usage}"))?;
 		}
+		if reaches == Some(false) {
+			record(format_args!("{ALLOCS}bypassed {name}"))?;
+		}
+		if let Some(allocs) = watch.allocs {
+			record(format_args!(
+				"{ALLOCS}{} {} {} {name}",
+				allocs.count, allocs.bytes, allocs.peak
+			))?;
+		}
 		if let Some(values) = watch.counted {
 			let values: Vec<String> = values.iter().map(u64::to_string).collect();
 			if warm.is_some() {
@@ -227,6 +267,33 @@ fn open((hardware, software): (usize, usize)) -> Result<Counters, String> {
 	Counters::inherited(hardware, software)
 }
 
+/// The allocation interposer's controls, which swole preloaded.
+#[cfg(unix)]
+fn hooks() -> Result<Hooks, String> {
+	Hooks::find()
+}
+
+/// Elsewhere swole preloads no interposer.
+#[cfg(not(unix))]
+fn hooks() -> Result<Hooks, String> {
+	Err(format!("{HEAP}: swole's allocation interposer is Unix's"))
+}
+
+#[cfg(unix)]
+use heap::Hooks;
+
+/// Elsewhere there is no interposer to count with.
+#[cfg(not(unix))]
+#[derive(Clone, Copy)]
+enum Hooks {}
+
+#[cfg(not(unix))]
+impl Hooks {
+	fn reaches(&self) -> bool {
+		match *self {}
+	}
+}
+
 /// Elsewhere swole opens none.
 #[cfg(not(target_os = "linux"))]
 fn open(_: (usize, usize)) -> Result<Counters, String> {
@@ -240,7 +307,9 @@ use perf::Counters;
 fn started() -> Option<u64> {
 	#[cfg(target_os = "linux")]
 	return perf::started();
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(target_os = "macos")]
+	return macos::started();
+	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 	None
 }
 
@@ -248,7 +317,9 @@ fn started() -> Option<u64> {
 fn threads() -> Result<usize, String> {
 	#[cfg(target_os = "linux")]
 	return perf::threads();
-	#[cfg(not(target_os = "linux"))]
+	#[cfg(target_os = "macos")]
+	return macos::threads();
+	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 	Ok(1)
 }
 
@@ -506,6 +577,8 @@ pub mod __private {
 	pub struct Meter {
 		name: CString,
 		counters: Option<crate::Counters>,
+		/// The allocation interposer, when the meter has it count over each call.
+		pub(crate) heap: Option<crate::Hooks>,
 		/// What the case's calls used and whether other threads ran, when swole runs it.
 		watch: Option<RefCell<Watching>>,
 	}
@@ -518,6 +591,11 @@ pub mod __private {
 		pub usage: Option<String>,
 		/// Each perf counter's value, when they count.
 		pub counted: Option<Vec<u64>>,
+		/// What the allocation interposer counted, when it counts.
+		#[cfg(unix)]
+		pub allocs: Option<crate::heap::Counted>,
+		#[cfg(not(unix))]
+		pub allocs: Option<std::convert::Infallible>,
 	}
 
 	/// What a meter has seen so far.
@@ -559,7 +637,12 @@ pub mod __private {
 					error: None,
 				})
 			});
-			Ok(Self { name, counters, watch })
+			Ok(Self {
+				name,
+				counters,
+				heap: None,
+				watch,
+			})
 		}
 
 		/// Zeroes the counts and starts counting.
@@ -574,11 +657,21 @@ pub mod __private {
 			if let Some(counters) = &self.counters {
 				counters.start();
 			}
+			// Last, so nothing the meter does itself, such as listing the process's threads,
+			// counts as the call's.
+			#[cfg(unix)]
+			if let Some(heap) = &self.heap {
+				heap.start();
+			}
 		}
 
 		/// Stops counting and dumps the count under the case's name.
 		#[inline(always)]
 		pub fn stop(&self) {
+			#[cfg(unix)]
+			if let Some(heap) = &self.heap {
+				heap.stop();
+			}
 			#[cfg(target_os = "linux")]
 			if let Some(counters) = &self.counters {
 				counters.stop();
@@ -610,6 +703,7 @@ pub mod __private {
 					threaded: None,
 					usage: None,
 					counted: None,
+					allocs: None,
 				});
 			};
 			let mut watch = watch.into_inner();
@@ -630,10 +724,15 @@ pub mod __private {
 			};
 			#[cfg(not(target_os = "linux"))]
 			let counted = self.counters.map(|counters| match counters {});
+			#[cfg(unix)]
+			let allocs = self.heap.map(|heap| heap.read());
+			#[cfg(not(unix))]
+			let allocs = self.heap.map(|heap| match heap {});
 			Ok(Watched {
 				threaded: Some(watch.threaded),
 				usage,
 				counted,
+				allocs,
 			})
 		}
 	}
