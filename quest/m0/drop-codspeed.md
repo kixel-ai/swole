@@ -13,4 +13,3 @@ Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2, [kixel-ai/rust2
 ## Waiting
 
 - moq-dev/moq: its Criterion benches rewritten to swole's `#[bench]`, its `quest/m9/bench-harness.md`; check `codspeed-criterion-compat` and `criterion` are gone from `Cargo.lock` on moq's `main`.
-- kixel-ai/rind: its Criterion benches rewritten to swole's `#[bench]`, its `quest/m2/bench/harness.md`; check `codspeed-criterion-compat` and `criterion` are gone from `Cargo.lock` on rind's `main`.
