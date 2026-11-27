@@ -391,6 +391,9 @@ pub fn shown(value: f64, unit: &str) -> String {
 		format!("{value}")
 	} else if value.abs() >= 100.0 {
 		format!("{value:.1}")
+	} else if value != 0.0 && value.abs() < 0.001 {
+		// A per-byte count of a large input, which fixed decimals would show as zero.
+		format!("{value:.2e}")
 	} else {
 		format!("{value:.3}")
 	};
@@ -709,6 +712,8 @@ mod tests {
 		assert_eq!(shown(12.0, "bytes/s"), "12.00 B/s");
 		assert_eq!(shown(1.5e6, "items/s"), "1.50 M items/s");
 		assert_eq!(shown(4.0, "events/byte"), "4 events/byte");
+		assert_eq!(shown(1.0 / 16384.0, "allocations/byte"), "6.10e-5 allocations/byte");
+		assert_eq!(shown(0.0, "allocations/byte"), "0 allocations/byte");
 	}
 
 	#[test]

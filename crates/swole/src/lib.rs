@@ -260,11 +260,12 @@ fn run() -> Result<(), String> {
 			}
 			record(format_args!("{COUNTED}{} {name}", values.join(" ")))?;
 		}
+		// What each call processes is a measurement's input, not listing noise, so `--quiet` keeps
+		// it. `cases` refused any amount but a positive one.
+		if let Some(__private::Throughput { unit, amount: Some(n) }) = &case.throughput {
+			record(format_args!("{THROUGHPUT}{unit} {n} {name}"))?;
+		}
 		if !quiet {
-			// `cases` refused any amount but a positive one.
-			if let Some(__private::Throughput { unit, amount: Some(n) }) = &case.throughput {
-				record(format_args!("{THROUGHPUT}{unit} {n} {name}"))?;
-			}
 			record(format_args!("{RAN}{name}"))?;
 		}
 	}
