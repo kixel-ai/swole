@@ -16,15 +16,16 @@ concurrency:
 
 jobs:
   check:
-    # x86_64, where the tests count under Valgrind. The host's runner exposes its PMU, so the
-    # quick and bench tests assert their perf counters instead of accepting a host without them.
-    runs-on: [self-hosted, swole-ci]
+    # x86_64, where the tests count under Valgrind; hosted, which costs a public repository
+    # nothing. Its VM exposes no perf counters, which the perf test accepts, saying so.
+    runs-on: ubuntu-24.04
     # Backstop a hang instead of holding the runner for the 6-hour default.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: ./.github/actions/nix
       # Dependencies are a small part of the build, but the tests' fixtures build in target
       # directories of their own under it. Only main saves, so a pull request reads the cache
       # and can't write what later runs build on.
@@ -40,10 +41,6 @@ jobs:
         env:
           # A fresh checkout rebuilds swole itself whole, so incremental state is only cache weight.
           CARGO_INCREMENTAL: 0
-          # Fail, not skip, a perf assertion on a host that lost its counters.
-          SWOLE_REQUIRE_PMU: 1
-          # Print the tests' own note that each perf assertion ran, passing or not.
-          RUST_TEST_NOCAPTURE: 1
       - if: github.ref == 'refs/heads/main' && steps.cargo.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

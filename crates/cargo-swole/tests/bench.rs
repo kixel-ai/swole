@@ -9,10 +9,6 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 
-/// Set where the host has a PMU, as CI's self-hosted runner does: a host without perf counters
-/// fails instead of skipping their assertions.
-const REQUIRE_PMU: &str = "SWOLE_REQUIRE_PMU";
-
 fn scratch(name: &str) -> PathBuf {
 	let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
 	let _ = std::fs::remove_dir_all(&dir);
@@ -148,7 +144,6 @@ fn times_each_harness_benchmark() {
 		.map(|line| line.as_str().unwrap())
 		.collect();
 	if host.iter().any(|line| line.starts_with("perf: tier")) {
-		eprintln!("perf counters: asserting bench's counts");
 		// A benchmark beside which another thread ran keeps its time, but no counters, which read
 		// the calling thread alone, and the note under the table names it.
 		for name in THREADED {
@@ -185,10 +180,6 @@ fn times_each_harness_benchmark() {
 			assert!((alone - timed).abs() < 300.0, "{alone} {timed}");
 		}
 	} else {
-		assert!(
-			std::env::var_os(REQUIRE_PMU).is_none(),
-			"{REQUIRE_PMU} is set, but host has no perf counters: {host:?}"
-		);
 		assert!(head("alone").get("instructions:u").is_none());
 	}
 }

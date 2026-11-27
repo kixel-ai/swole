@@ -11,10 +11,6 @@ use std::process::{Command, Output};
 /// The benchmarks the fixture runs, `name=iterations` comma-separated, when it is the program.
 const FIXTURE: &str = "SWOLE_FIXTURE";
 
-/// Set where the host has a PMU, as CI's self-hosted runner does: a perf assertion that would
-/// skip for lack of one fails instead, so a runner that lost its counters cannot pass quietly.
-const REQUIRE_PMU: &str = "SWOLE_REQUIRE_PMU";
-
 /// Callgrind's client request codes, from valgrind/callgrind.h.
 const BASE: u64 = (b'C' as u64) << 24 | (b'T' as u64) << 16;
 const DUMP_STATS_AT: u64 = BASE + 3;
@@ -407,7 +403,7 @@ fn single_threaded(dir: &Path) -> PathBuf {
 
 /// On a host that exposes perf counters, they count what Valgrind does on the calling thread,
 /// and fail a benchmark that runs another; on one that exposes none, as a hosted CI runner, the
-/// run fails, saying so, unless `SWOLE_REQUIRE_PMU` says the host has one.
+/// run fails, saying so.
 #[test]
 fn counts_with_perf_counters_what_valgrind_does() {
 	let dir = scratch("quick-single");
@@ -420,10 +416,6 @@ fn counts_with_perf_counters_what_valgrind_does() {
 		let err = String::from_utf8_lossy(&out.stderr);
 		assert!(!out.status.success(), "{err}");
 		if err.contains("quick counts with perf counters, and") {
-			assert!(
-				std::env::var_os(REQUIRE_PMU).is_none(),
-				"{REQUIRE_PMU} is set, but: {err}"
-			);
 			return;
 		}
 		assert!(
@@ -432,7 +424,6 @@ fn counts_with_perf_counters_what_valgrind_does() {
 			"{name}: {err}"
 		);
 	}
-	eprintln!("perf counters: asserting quick against Valgrind");
 	let list = single_threaded(&dir);
 	let list = list.to_str().unwrap();
 	let out = harness(&["quick", "--benchmarks", list]);
@@ -705,10 +696,6 @@ fn compares_a_selection_only_one_side_has() {
 	if out.status.success() {
 		assert!(row(&String::from_utf8(out.stdout).unwrap(), "b").ends_with("| added |"));
 	} else {
-		assert!(
-			std::env::var_os(REQUIRE_PMU).is_none(),
-			"{REQUIRE_PMU} is set, but: {err}"
-		);
 		assert!(err.contains("quick counts with perf counters, and"), "{err}");
 	}
 
