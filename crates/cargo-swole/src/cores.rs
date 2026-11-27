@@ -44,6 +44,8 @@ pub struct Reservation {
 	candidates: Vec<usize>,
 	/// Where the leases of `cores` are.
 	leases: PathBuf,
+	/// The kernel's CPUs, as `/sys/devices/system/cpu` describes them.
+	sys: PathBuf,
 	/// Whether the kernel keeps the CPU out of scheduler load balancing (`isolcpus`).
 	isolated: bool,
 	governor: Governor,
@@ -95,6 +97,9 @@ impl Reservation {
 		for core in self.cores.iter().filter(|core| **core != self.core) {
 			let file = open(&self.leases, core)?;
 			if lock(&file).map_err(|e| format!("cannot lease core {}: {e}", core[0]))? {
+				// A killed run's changed governor would otherwise outlive this run on a core it
+				// never times on, since a run leases such a core last.
+				recover(&self.sys, core, &self.leases.join(format!("core{}.restore", core[0])))?;
 				spread.cpus.extend(core);
 				spread.leases.push(file);
 			}
@@ -183,6 +188,7 @@ fn reserve_in(sys: &Path, leases: &Path, candidates: &[usize]) -> Result<Reserva
 		cores,
 		candidates: candidates.to_owned(),
 		leases: leases.to_owned(),
+		sys: sys.to_owned(),
 		isolated,
 		governor,
 		restore,
@@ -458,15 +464,11 @@ fn tune(sys: &Path, core: &[usize], cpu: usize, journal: &Path) -> Result<(Gover
 			.map_err(|e| format!("cannot read {}: {e}", path.display()))
 	};
 	let policies = policies_of(sys, core)?;
-	if policies.is_empty() {
-		return Ok((Governor::Absent, None));
-	}
-	// The timing CPU's own policy names the governor kept, since its siblings' may differ.
+	// The timing CPU's own policy names the governor kept, since its siblings' may differ; without
+	// one, as in a restricted sysfs view, the run leaves its siblings' alone too.
 	let own = sys.join(format!("cpu{cpu}/cpufreq"));
-	if !own.exists() {
-		return Err(format!(
-			"CPU {cpu} has no cpufreq policy though its core's other CPUs do"
-		));
+	if policies.is_empty() || !own.exists() {
+		return Ok((Governor::Absent, None));
 	}
 	let governor = read(&own.join(TUNED[0]))?;
 	let kept = |why: String| -> Result<(Governor, Option<Box<Restore>>), String> {
@@ -789,6 +791,36 @@ mod tests {
 			(governor(&sys, 0), governor(&sys, 1)),
 			("powersave".into(), "powersave".into())
 		);
+	}
+
+	#[test]
+	fn a_spread_restores_what_a_killed_run_left() {
+		let _arms = ARMS.lock().unwrap();
+		let dir = scratch("spread-recover");
+		let sys = sys(&dir, 2, 1, "powersave");
+		let leases = dir.join("leases");
+		// A run killed on core 0, which a run leases last.
+		let mut killed = reserve_in(&sys, &leases, &[0]).unwrap();
+		signals::disarm();
+		killed.restore.take().unwrap();
+		drop(killed);
+		assert_eq!(governor(&sys, 0), PERFORMANCE);
+		let next = reserve_in(&sys, &leases, &[0, 1]).unwrap();
+		assert_eq!(next.cpu, 1);
+		assert_eq!(next.spread().unwrap().cpus, [0, 1]);
+		assert_eq!(governor(&sys, 0), "powersave");
+		assert!(!leases.join("core0.restore").exists());
+	}
+
+	#[test]
+	fn times_without_a_governor_where_the_cpu_has_no_policy() {
+		let dir = scratch("no-policy");
+		let sys = sys(&dir, 1, 2, "powersave");
+		std::fs::remove_file(sys.join("cpu0/cpufreq")).unwrap();
+		let reservation = reserve_in(&sys, &dir.join("leases"), &[0, 1]).unwrap();
+		assert_eq!(reservation.cpu, 0);
+		assert_eq!(reservation.governor(), "none");
+		assert_eq!(governor(&sys, 1), "powersave");
 	}
 
 	#[test]
