@@ -4,7 +4,8 @@ Measures each benchmark in one of three modes over the same compiled benchmark t
 writes the measures as Kixel Quest's `metrics.json`, or compares a base commit with the working
 tree:
 
-- `swole sim`, what gates a merge, counts its instructions under stock Valgrind, one Valgrind process a job, in
+- `swole sim`, what gates a merge, counts its instructions and [simulates](#simulated-cycles) its caches and
+  branches under stock Valgrind, one Valgrind process a job, in
   parallel across the host's cores, the same on any x86_64 Linux host that shares its
   [fingerprint](#fingerprints): hosted CI, a self-hosted runner, or an agent's own, with no
   third-party service in the loop. It replaces CodSpeed's runner over the benchmarks as they are
@@ -78,7 +79,8 @@ this way.
 Each benchmark is the Callgrind dump its hooks name after it, between `ZERO_STATS` and
 `START_INSTRUMENTATION` before it and `STOP_INSTRUMENTATION` and `DUMP_STATS_AT` after it,
 with Valgrind's `--instr-atstart=no`, so nothing outside a benchmark counts. Its count is the
-dump's `totals` in `Ir`, instructions executed, on every thread. The run fails on a dump with
+dump's `totals` in `Ir`, instructions executed, on every thread, beside its
+[simulated cycles](#simulated-cycles). The run fails on a dump with
 an unknown trigger, a benchmark without `totals` or with zero instructions, two benchmarks of
 one name, a job that fails, and a name `--benchmarks` lists that no benchmark has, so a
 bisect step never reads a suspect it could not count as clean. With `--allow-missing`, `sim` or `quick`
@@ -97,7 +99,8 @@ started or ended, or one its call started, which the [preload](#randomness-and-t
 even when it is gone by the call's end, counts what that thread ran meanwhile, which the
 scheduler decides. So `sim` counts each such benchmark's job five times in all, and records the
 median of the five, with their least and most beside it in the table and as `lower_value` and
-`upper_value` in `metrics.json`. So does every benchmark whose threads swole cannot see: those of
+`upper_value` in `metrics.json`, for its instructions, cache misses, branch mispredicts, and
+estimated cycles alike. So does every benchmark whose threads swole cannot see: those of
 CodSpeed's crates and of a `--program`, whose harness runs every benchmark in one process, and of
 a harness too old to say. A harness benchmark that ran alone counts once: under the preload's
 randomness and clock it repeats exactly, but for an input the host decides, such as the order a
@@ -108,6 +111,40 @@ fork knows, leaves an `unknown callgrind client request` warning in the job's Va
 under `target/swole/jobs-*`, beside its profiles and output. Each run takes a directory of
 its own there, so runs in one tree never read each other's profiles, and removes it when it
 succeeds; a failed run keeps it and names it.
+
+## Simulated cycles
+
+An instruction count misses what costs a real core most: data laid out so it misses the cache,
+and branches it cannot predict. So every count also runs Callgrind's cache and branch simulation
+(`--cache-sim=yes --branch-sim=yes`), with its caches sized outright, as CodSpeed's runner sizes
+them, rather than from the host's CPUID: a 32 KiB, 8-way first level for instructions
+(`--I1=32768,8,64`) and one for data (`--D1=32768,8,64`), and an 8 MiB, 16-way last level
+(`--LL=8388608,16,64`), each of 64-byte lines. Each benchmark reports Callgrind's every event:
+
+| event | measure |
+|---|---|
+| `Ir` | instructions |
+| `Dr`, `Dw` | data reads, data writes |
+| `I1mr`, `D1mr`, `D1mw` | I1 misses, D1 read misses, D1 write misses |
+| `ILmr`, `DLmr`, `DLmw` | LL instruction misses, LL read misses, LL write misses |
+| `Bc`, `Bcm` | conditional branches, conditional mispredicts |
+| `Bi`, `Bim` | indirect branches, indirect mispredicts |
+
+and from them, its estimated cycles: a cycle an instruction, 10 more for each first-level miss,
+which the last level serves, 100 more for each last-level miss, which memory serves, and 20 more
+for each mispredicted branch, whose work the core throws away:
+
+```text
+estimated cycles = Ir + 10 (I1mr + D1mr + D1mw) + 100 (ILmr + DLmr + DLmw) + 20 (Bcm + Bim)
+```
+
+The weights are KCachegrind's classic cycle estimate's, which CodSpeed's documentation describes
+too, plus a mispredict's typical penalty. They model no real core, so a change of a few percent
+says where to look rather than what a host will time: `bench` times. But the simulation is
+deterministic, so a benchmark that runs alone repeats its every event exactly, as it does its
+instructions, and two layouts or branch patterns that run the same instructions part clearly.
+Simulating takes Callgrind two to three times as long as counting alone: 2.2 times, 5.5 s to 12.3 s,
+on a debug build's loop of 20 million loads and stores.
 
 ## Randomness and the clock
 
@@ -162,11 +199,13 @@ Counts compare only within one environment. Valgrind presents a CPU derived from
 and a binary that picks a path by CPU feature, such as glibc's string functions or Rust's
 runtime detection, counts differently on another; so can another Valgrind, and glibc's
 tunables, which mask features under the same CPU; so can another preload, whose code runs
-inside a count and whose seed and clock steer it. So each run fingerprints its environment:
+inside a count and whose seed and clock steer it; so can another simulated cache, and another
+cycle model moves the estimated cycles. So each run fingerprints its environment:
 the architecture, every CPUID leaf a probe reads under the same Valgrind, `GLIBC_TUNABLES` as
-the benchmarks inherit it, `valgrind --version`, and the preload's bytes, hashed into a label such as
+the benchmarks inherit it, `valgrind --version`, the preload's bytes, and the
+[simulation](#simulated-cycles)'s options and cycle model, hashed into a label such as
 `x86_64-3059cd1d9e65`. The measure every count records names it, `instructions
-(x86_64-3059cd1d9e65)`, so counts from two environments never share a Kixel Quest series, and
+(x86_64-3059cd1d9e65)` and `estimated cycles (x86_64-3059cd1d9e65)`, so counts from two environments never share a Kixel Quest series, and
 a hardware change starts a new series instead of reading as a regression. `swole
 fingerprint sim` prints the label, then its inputs on stderr.
 
@@ -397,15 +436,17 @@ upgrade, says so and has none; one whose harness predates rusage has none of tha
 
 ## Output
 
-`--out` writes one measure of each benchmark, its headline, so a run of a large workspace stays
-well within the 1 MiB Kixel Quest reads. `sim --out` and `quick --out` write one sample of the
-run's commit, `quick`'s measure `instructions:u (...)`, and a benchmark counted several times,
-its median with the least and most of its samples:
+`--out` writes only the headline measures of each benchmark, so a run of a large workspace stays
+well within the 1 MiB Kixel Quest reads, and fails a run that would not. `sim --out` and
+`quick --out` write one sample of the run's commit: `sim`'s instructions and estimated cycles,
+`quick`'s `instructions:u (...)`, and for a benchmark counted several times, each measure's median
+with the least and most of its samples:
 
 ```json
-{"samples":[{"metrics":{"benches/varint.rs::varint::encode[1]":{"instructions (x86_64-3059cd1d9e65)":{"value":12345}},
-                        "benches/pool.rs::spawn":{"instructions (x86_64-3059cd1d9e65)":{"value":402614,"lower_value":402137,"upper_value":403005}}}}],
- "units":{"instructions (x86_64-3059cd1d9e65)":"instructions"}}
+{"samples":[{"metrics":{"benches/varint.rs::varint::encode[1]":{"estimated cycles (x86_64-3059cd1d9e65)":{"value":15467},"instructions (x86_64-3059cd1d9e65)":{"value":12345}},
+                        "benches/pool.rs::spawn":{"estimated cycles (x86_64-3059cd1d9e65)":{"value":512330,"lower_value":509914,"upper_value":515102},
+                                                  "instructions (x86_64-3059cd1d9e65)":{"value":402614,"lower_value":402137,"upper_value":403005}}}}],
+ "units":{"estimated cycles (x86_64-3059cd1d9e65)":"cycles","instructions (x86_64-3059cd1d9e65)":"instructions"}}
 ```
 
 `bench --out` writes the working tree's times as the run's own sample, and with a base, the
@@ -419,7 +460,9 @@ base's as a sample naming its commit:
 
 `--report <file>` writes every measure of every benchmark, by side, as JSON: the mode, the
 fingerprint and its inputs, the base's commit when there is one, and for each benchmark, each
-side's measures by name, each a `value` and a `unit` (a call's share, for `bench`), whether
+side's measures by name, each a `value` and a `unit` (a call's share, for `bench`), and for one
+counted several times, the `lower` and `upper` of its samples, for `sim` every
+[simulated event](#simulated-cycles) and the estimated cycles, whether
 another thread ran beside it, and for a paired `bench`, the change and its interval:
 
 ```json

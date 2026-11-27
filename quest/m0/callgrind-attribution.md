@@ -12,7 +12,7 @@ Decided 2026-11-25 (maintainer, `/quest-plan` in kixel-ai/rust2):
 
 Recommendations for the implementer:
 
-- Extend `callgrind.rs` to parse function definitions (`fn=(id) name`, `ob=(id)`, `fl=(id)`), self costs, and call-entry inclusive costs (`cfn=...`, `calls=...`), handling Callgrind's name compression (`(id)`) and demangling Rust symbols (`rustc-demangle`), reading every event column the dump's `events:` line names rather than only `Ir`, so [simulated cycles](/quest/m0/sim-cycles.md)' cache and branch events attribute too.
+- Extend `callgrind.rs` to parse function definitions (`fn=(id) name`, `ob=(id)`, `fl=(id)`), self costs, and call-entry inclusive costs (`cfn=...`, `calls=...`), handling Callgrind's name compression (`(id)`) and demangling Rust symbols (`rustc-demangle`), reading every column of `callgrind::EVENTS` (the cache and branch events `sim` simulates, as `callgrind::Costs` already reads them from each dump's `totals:`) by the dump's `events:` line, so a change in estimated cycles attributes too.
 - Diff per-function self and inclusive deltas between `<base>` and head for each benchmark that moved, ranking the largest contributors to the net delta and attributing added/removed functions cleanly.
 - Keep output concise and readable in Markdown: show the top 3–5 functions explaining the majority of each changed benchmark's delta, omitting unchanged benchmarks.
 - Verify with unit tests on synthetic multi-function Callgrind profiles (compressed IDs, inlined/called frames, added/removed symbols) and an end-to-end integration test comparing two commits where one helper function does extra work and confirming the compare output names that exact function.
