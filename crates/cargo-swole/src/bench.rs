@@ -137,6 +137,12 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 		return Err("no benchmark ran".to_owned());
 	}
 	let (mut before, mut after) = (before, after);
+	// Each side's allocations, counted in a pass of their own under the interposer alone, which
+	// needs no privilege, so they keep the host's clock and randomness as its times do.
+	let heap = crate::heap::library(false)?;
+	if heap.is_none() {
+		eprintln!("swole: no allocation counts, since swole's allocation interposer is x86_64 Linux's");
+	}
 	let work = work(Path::new("."))?;
 	let mut coin = Coin::seeded();
 	let mut times = BTreeMap::new();
@@ -238,6 +244,12 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					}
 				}
 			};
+			if let Some(heap) = &heap
+				&& let crate::heap::Allocs::Counted(allocs) =
+					crate::heap::measure(job, heap, false, &dir.join(side.name()))?
+			{
+				measures.extend(allocs);
+			}
 			if let Some((used, calls)) = &used[i] {
 				measures.extend(used.measures(*calls * iterations));
 			}
@@ -283,7 +295,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	print!("{}", metrics::details(paired.then_some(base_details), head_details));
 	let sha = checkout.as_ref().map(|checkout| checkout.sha.as_str());
 	if let Some(out) = &options.out {
-		file(&times, &host, sha).write(out)?;
+		file(&times, &details, &host, sha)?.write(out)?;
 		eprintln!("swole: wrote {}", out.display());
 	}
 	if let Some(path) = &options.report {
@@ -707,33 +719,44 @@ fn table(times: &BTreeMap<String, Times>, paired: bool) -> String {
 	out
 }
 
-/// The times as a `metrics.json`: the working tree's as the run's own commit's, and the base's,
-/// when there is one, as its commit's.
-fn file(times: &BTreeMap<String, Times>, host: &str, base: Option<&str>) -> metrics::File {
+/// The times, and each side's allocations from `details`, as a `metrics.json`: the working tree's
+/// as the run's own commit's, and the base's, when there is one, as its commit's.
+fn file(
+	times: &BTreeMap<String, Times>,
+	details: &[BTreeMap<String, Vec<Measure>>; 2],
+	host: &str,
+	base: Option<&str>,
+) -> Result<metrics::File, String> {
 	let measure = format!("time ({host})");
-	let values = |side: fn(&Times) -> Option<f64>| -> BTreeMap<String, BTreeMap<String, metrics::Point>> {
-		times
-			.iter()
-			.filter_map(|(name, times)| {
-				side(times).map(|time| (name.clone(), BTreeMap::from([(measure.clone(), number(time).into())])))
-			})
-			.collect()
+	let mut units = BTreeMap::from([(measure.clone(), UNIT)]);
+	let mut values = |side: fn(&Times) -> Option<f64>,
+	                  details: &BTreeMap<String, Vec<Measure>>|
+	 -> Result<BTreeMap<String, BTreeMap<String, metrics::Point>>, String> {
+		let (allocs_units, mut allocs) = crate::heap::series(details, host);
+		units.extend(allocs_units);
+		let mut values = BTreeMap::new();
+		for (name, times) in times {
+			let Some(time) = side(times) else { continue };
+			let mut measures = BTreeMap::from([(measure.clone(), number(time).into())]);
+			for (series, found) in allocs.remove(name).unwrap_or_default() {
+				measures.insert(series, metrics::Point::of(&found)?);
+			}
+			values.insert(name.clone(), measures);
+		}
+		Ok(values)
 	};
 	let mut samples = Vec::new();
 	if let Some(base) = base {
 		samples.push(metrics::Sample {
 			commit: Some(base.to_owned()),
-			values: values(Times::base),
+			values: values(Times::base, &details[0])?,
 		});
 	}
 	samples.push(metrics::Sample {
 		commit: None,
-		values: values(Times::head),
+		values: values(Times::head, &details[1])?,
 	});
-	metrics::File {
-		units: BTreeMap::from([(measure, UNIT)]),
-		samples,
-	}
+	Ok(metrics::File { units, samples })
 }
 
 /// Every measure of each benchmark, its time and the change's interval among them, as `--report`

@@ -2,7 +2,8 @@
 //! hands the process a fixed-seed stream for randomness and a clock that advances only as the
 //! process reads it and waits, so a count repeats; and the same library built to count the
 //! threads a process starts alone, for `bench`'s counting passes, which keep the host's clock and
-//! randomness, as its timing does.
+//! randomness, as its timing does; and each of them also counting heap allocations, for the
+//! allocation pass beside each.
 
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,12 @@ const LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/preload.so"));
 
 /// The library built to count threads alone.
 const THREADS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/threads.so"));
+
+/// The whole library, also counting heap allocations, for `quick`'s and `sim`'s allocation pass.
+const HEAP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heap.so"));
+
+/// The library built to count threads alone, also counting heap allocations, for `bench`'s.
+const HEAP_THREADS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heap-threads.so"));
 
 /// What the library logs to Valgrind once it loads: preload.rs's `MARKER`, which a test keeps the
 /// same.
@@ -38,6 +45,16 @@ pub fn install() -> Result<PathBuf, String> {
 /// Writes the library that counts threads alone, as [`install`] writes the whole one.
 pub fn threads() -> Result<PathBuf, String> {
 	write("threads", THREADS)
+}
+
+/// Writes the library that also counts heap allocations, the whole one when `shimmed`, else the
+/// one that counts threads alone, as [`install`] writes the whole one.
+pub fn heap(shimmed: bool) -> Result<PathBuf, String> {
+	if shimmed {
+		write("heap", HEAP)
+	} else {
+		write("heap-threads", HEAP_THREADS)
+	}
 }
 
 fn write(name: &str, library: &[u8]) -> Result<PathBuf, String> {

@@ -36,6 +36,19 @@ pub struct Point {
 	pub spread: Option<(Number, Number)>,
 }
 
+impl Point {
+	/// A count's point: its value, and the least and most of its samples when it took several.
+	pub fn of(measure: &Measure) -> Result<Self, String> {
+		Ok(Self {
+			value: whole(measure.value)?,
+			spread: measure
+				.spread
+				.map(|(least, most)| Ok::<_, String>((whole(least)?, whole(most)?)))
+				.transpose()?,
+		})
+	}
+}
+
 impl From<Number> for Point {
 	fn from(value: Number) -> Self {
 		Self { value, spread: None }
@@ -44,9 +57,10 @@ impl From<Number> for Point {
 
 impl File {
 	/// `counts` as one sample of the run's own commit: each series `counter` writes, of each
-	/// benchmark.
+	/// benchmark, and its allocations, when it has them.
 	pub fn counts(counts: &Counts, counter: &Counter) -> Result<Self, String> {
 		let series = counter.series(&counts.fingerprint);
+		let (mut units, mut allocs) = crate::heap::series(&counts.details, &counts.fingerprint);
 		let mut values = BTreeMap::new();
 		for (name, details) in &counts.details {
 			let mut measures = BTreeMap::new();
@@ -55,21 +69,16 @@ impl File {
 					.iter()
 					.find(|found| found.name == *detail)
 					.ok_or_else(|| format!("{name} has no {detail}"))?;
-				measures.insert(
-					measure.clone(),
-					Point {
-						value: whole(found.value)?,
-						spread: found
-							.spread
-							.map(|(least, most)| Ok::<_, String>((whole(least)?, whole(most)?)))
-							.transpose()?,
-					},
-				);
+				measures.insert(measure.clone(), Point::of(found)?);
+			}
+			for (series, found) in allocs.remove(name).unwrap_or_default() {
+				measures.insert(series, Point::of(&found)?);
 			}
 			values.insert(name.clone(), measures);
 		}
+		units.extend(series.into_iter().map(|(_, measure, unit)| (measure, unit)));
 		Ok(Self {
-			units: series.into_iter().map(|(_, measure, unit)| (measure, unit)).collect(),
+			units,
 			samples: vec![Sample { commit: None, values }],
 		})
 	}
@@ -191,6 +200,7 @@ pub fn side(measures: &[Measure]) -> Value {
 		}
 		side.insert(measure.name.clone(), value);
 	}
+	crate::heap::label(measures, &mut side);
 	Value::Object(side)
 }
 
@@ -293,13 +303,14 @@ pub fn details(before: Option<&BTreeMap<String, Vec<Measure>>>, after: &BTreeMap
 			fn find<'a>(side: &'a [Measure], name: &str) -> Option<&'a Measure> {
 				side.iter().find(|m| m.name == name)
 			}
+			// A sampled measure, the median of its samples, is marked as one.
 			let cell = |found: Option<&Measure>| match found {
 				Some(Measure {
 					value,
 					spread: Some((least, most)),
 					..
 				}) => format!(
-					"{} ({} to {})",
+					"~{} ({} to {})",
 					shown(*value, unit),
 					shown(*least, unit),
 					shown(*most, unit)
@@ -309,12 +320,27 @@ pub fn details(before: Option<&BTreeMap<String, Vec<Measure>>>, after: &BTreeMap
 			};
 			match base {
 				Some(base) => {
-					let change = match (
-						find(base, measure).map(|m| m.value),
-						find(head, measure).map(|m| m.value),
-					) {
-						(Some(b), Some(a)) if b != 0.0 => format!("{:+.2}%", (a - b) / b * 100.0),
-						(Some(_), Some(_)) => String::new(),
+					let change = match (find(base, measure), find(head, measure)) {
+						(Some(b), Some(a)) => {
+							let change = if b.value != 0.0 {
+								format!("{:+.2}%", (a.value - b.value) / b.value * 100.0)
+							} else {
+								String::new()
+							};
+							// A sampled measure moves within its samples' spread, so a change compares
+							// against it; with one side's spread alone, it has no verdict.
+							match (b.spread, a.spread) {
+								(None, None) => change,
+								(Some((b_least, b_most)), Some((a_least, a_most))) => {
+									if a_least <= b_most && b_least <= a_most {
+										format!("~{change} (within spread)")
+									} else {
+										format!("{change} (beyond spread)")
+									}
+								}
+								_ => format!("~{change}"),
+							}
+						}
 						(None, Some(_)) => "added".to_owned(),
 						(Some(_), None) => "removed".to_owned(),
 						(None, None) => unreachable!("every measure comes from one side"),

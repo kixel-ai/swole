@@ -4,6 +4,16 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Each library swole embeds, and the cfgs it is built with: the whole library; the one that only
+/// counts threads; and each of them also counting heap allocations, for the allocation pass beside
+/// a count (`quick`'s and `sim`'s) and beside a time (`bench`'s).
+const LIBRARIES: [(&str, &[&str]); 4] = [
+	("preload.so", &[]),
+	("threads.so", &["--cfg=threads"]),
+	("heap.so", &["--cfg=heap"]),
+	("heap-threads.so", &["--cfg=heap", "--cfg=threads"]),
+];
+
 fn main() {
 	println!("cargo::rerun-if-changed=preload.rs");
 	let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
@@ -11,13 +21,13 @@ fn main() {
 	if target != "x86_64-unknown-linux-gnu" {
 		// Only x86_64 Linux is fingerprinted, which fails the run first; an empty library
 		// keeps the runner building elsewhere, as its unit tests do.
-		std::fs::write(out.join("preload.so"), []).expect("OUT_DIR is writable");
-		std::fs::write(out.join("threads.so"), []).expect("OUT_DIR is writable");
+		for (name, _) in LIBRARIES {
+			std::fs::write(out.join(name), []).expect("OUT_DIR is writable");
+		}
 		return;
 	}
 	let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-	// The whole library, and the one that only counts threads, built with `--cfg threads`.
-	for (name, cfg) in [("preload.so", None), ("threads.so", Some("--cfg=threads"))] {
+	for (name, cfgs) in LIBRARIES {
 		let status = Command::new(&rustc)
 			.args([
 				"--crate-type=cdylib",
@@ -34,7 +44,7 @@ fn main() {
 				"--target",
 				&target,
 			])
-			.args(cfg)
+			.args(cfgs)
 			.arg("-o")
 			.arg(out.join(name))
 			.arg("preload.rs")
