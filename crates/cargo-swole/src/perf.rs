@@ -38,7 +38,10 @@ const CALLS: &str = "swole calls ";
 pub const LIBC: &str = "swole libc ";
 
 /// Where the kernel lists its PMUs.
-const PMUS: &str = "/sys/bus/event_source/devices";
+pub const PMUS: &str = "/sys/bus/event_source/devices";
+
+/// The core PMU of a hybrid Intel host's performance cores, which a `bench` times on.
+pub const PERFORMANCE: &str = "cpu_core";
 
 /// The most counters of one kind the probe tries to fit in a group, more than any PMU holds.
 const MOST_SLOTS: usize = 32;
@@ -246,7 +249,7 @@ impl Perf {
 			}
 			None => return Err("this kernel has no perf events".to_owned()),
 		};
-		let pmu = Pmu::find()?;
+		let pmu = Pmu::find(quick)?;
 		let cpus = pmu.cpus.clone();
 		// Pinned as a job is, since a PMU of a hybrid host counts only on its own CPUs.
 		std::thread::scope(|scope| {
@@ -494,10 +497,11 @@ fn refused(err: &std::io::Error) -> String {
 }
 
 impl Pmu {
-	/// The core PMU of the most CPUs swole may run on. On a host whose CPUs are of several kinds,
-	/// such as Intel's P- and E-cores, each kind has its own PMU, which counts only on its CPUs.
+	/// The core PMU of the most CPUs swole may run on, or for a `bench`, which times on one
+	/// core, the performance cores' when swole may run on one. On a host whose CPUs are of several
+	/// kinds, such as Intel's P- and E-cores, each kind has its own PMU, which counts only on its CPUs.
 	#[cfg(target_os = "linux")]
-	fn find() -> Result<Self, String> {
+	fn find(quick: bool) -> Result<Self, String> {
 		let allowed = allowed()?;
 		let mut cores = Vec::new();
 		let entries = std::fs::read_dir(PMUS).map_err(|e| format!("cannot list {PMUS}: {e}"))?;
@@ -526,6 +530,14 @@ impl Pmu {
 		}
 		// The most CPUs, then the first name, so a host always picks the same one.
 		cores.sort_by(|a, b| b.cpus.len().cmp(&a.cpus.len()).then(a.name.cmp(&b.name)));
+		if !quick
+			&& let Some(i) = cores
+				.iter()
+				.position(|pmu| pmu.name == PERFORMANCE && !pmu.cpus.is_empty())
+		{
+			let performance = cores.remove(i);
+			cores.insert(0, performance);
+		}
 		let single = Path::new(PMUS).join("cpu");
 		let pmu = match cores.len() {
 			0 => Pmu {
@@ -548,13 +560,12 @@ impl Pmu {
 	}
 }
 
-/// Pins `command` to `pmu`'s CPUs just before it `exec`s, so timing and counters measure the same
-/// cores on hybrid hosts.
-pub fn pin_command(command: &mut std::process::Command, pmu: &Pmu) {
+/// Pins `command` to `cpus` just before it `exec`s.
+pub fn pin_command(command: &mut std::process::Command, cpus: &[usize]) {
 	#[cfg(target_os = "linux")]
 	{
 		use std::os::unix::process::CommandExt;
-		let mask = mask(&pmu.cpus);
+		let mask = mask(cpus);
 		// SAFETY: between fork and exec it makes only one system call, which allocates nothing.
 		unsafe {
 			command.pre_exec(move || {
@@ -566,18 +577,19 @@ pub fn pin_command(command: &mut std::process::Command, pmu: &Pmu) {
 		}
 	}
 	#[cfg(not(target_os = "linux"))]
-	let _ = (command, pmu);
+	let _ = (command, cpus);
 }
 
-/// Has `command` run on `pmu`'s CPUs, at the addresses of its last run when `fixed`, and open
-/// `pass`'s counters on itself just before it `exec`s, telling the harness how many.
-pub fn launch(command: &mut std::process::Command, pmu: &Pmu, pass: &Pass, fixed: bool) {
+/// Has `command` run on `cpus`, which the PMU counting `pass` must count on, at the addresses of
+/// its last run when `fixed`, and open `pass`'s counters on itself just before it `exec`s, telling
+/// the harness how many.
+pub fn launch(command: &mut std::process::Command, cpus: &[usize], pass: &Pass, fixed: bool) {
 	let hardware = pass.hardware();
 	command.env(COUNTERS, format!("{hardware}+{}", pass.len() - hardware));
 	#[cfg(target_os = "linux")]
 	{
 		use std::os::unix::process::CommandExt;
-		let mask = mask(&pmu.cpus);
+		let mask = mask(cpus);
 		// Each event's attributes, and whether it leads its group, built before the fork.
 		let attrs: Vec<(Attr, bool)> = pass
 			.groups
@@ -610,7 +622,7 @@ pub fn launch(command: &mut std::process::Command, pmu: &Pmu, pass: &Pass, fixed
 		}
 	}
 	#[cfg(not(target_os = "linux"))]
-	let _ = (command, pmu, fixed);
+	let _ = (command, cpus, fixed);
 }
 
 /// What one benchmark's count read: its counters' values in the order of its pass, what the
@@ -918,7 +930,7 @@ fn read(path: &Path) -> Result<String, String> {
 }
 
 /// The CPUs a list such as `0-7,16` names.
-fn cpus(list: &str) -> Result<Vec<usize>, String> {
+pub fn cpus(list: &str) -> Result<Vec<usize>, String> {
 	let mut cpus = Vec::new();
 	for range in list.trim().split(',').filter(|range| !range.is_empty()) {
 		let number = |n: &str| n.parse::<usize>().map_err(|_| format!("{list:?} is no CPU list"));
@@ -1150,7 +1162,7 @@ fn mask(cpus: &[usize]) -> Vec<u64> {
 
 /// The CPUs swole may run on.
 #[cfg(target_os = "linux")]
-fn allowed() -> Result<Vec<usize>, String> {
+pub fn allowed() -> Result<Vec<usize>, String> {
 	let mut mask = [0u64; 64];
 	// SAFETY: the mask is as large as it says.
 	if unsafe { sched_getaffinity(0, size_of_val(&mask), mask.as_mut_ptr()) } != 0 {

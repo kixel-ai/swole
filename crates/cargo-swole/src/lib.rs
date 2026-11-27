@@ -6,6 +6,7 @@ mod bench;
 mod callgrind;
 mod cargo;
 mod compare;
+mod cores;
 mod fingerprint;
 mod metrics;
 #[cfg_attr(
@@ -980,7 +981,7 @@ fn native(job: &Job, dir: &Path, preload: &Path, pmu: &perf::Pmu, passes: &[perf
 		let errors = dir.join("stderr");
 		let stderr = std::fs::File::create(&errors).map_err(|e| format!("cannot create {}: {e}", errors.display()))?;
 		let mut command = job.command();
-		perf::launch(&mut command, pmu, pass, true);
+		perf::launch(&mut command, &pmu.cpus, pass, true);
 		let env = environment(&command, preload, label, true)?;
 		command
 			.env_clear()
