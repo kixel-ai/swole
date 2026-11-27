@@ -137,6 +137,7 @@ fn vec() -> (usize, Counted) {
 
 /// Boxes, half of them kept past the call, so its peak is not what it ends holding.
 #[bench]
+#[allow(clippy::vec_box, reason = "each box is an allocation of its own")]
 fn boxes() -> (Vec<Box<[u8; 100]>>, Counted) {
 	counted("boxes", || {
 		let mut kept = Vec::with_capacity(8);

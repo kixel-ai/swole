@@ -732,14 +732,14 @@ fn file(
 	let mut values = |side: fn(&Times) -> Option<f64>,
 	                  details: &BTreeMap<String, Vec<Measure>>|
 	 -> Result<BTreeMap<String, BTreeMap<String, metrics::Point>>, String> {
-		let (allocs_units, mut allocs) = crate::heap::series(details, host);
-		units.extend(allocs_units);
 		let mut values = BTreeMap::new();
 		for (name, times) in times {
 			let Some(time) = side(times) else { continue };
 			let mut measures = BTreeMap::from([(measure.clone(), number(time).into())]);
-			for (series, found) in allocs.remove(name).unwrap_or_default() {
-				measures.insert(series, metrics::Point::of(&found)?);
+			let allocs = details.get(name).map(Vec::as_slice).unwrap_or_default();
+			for (series, unit, found) in crate::heap::series(allocs, host) {
+				units.insert(series.clone(), unit);
+				measures.insert(series, metrics::Point::of(found)?);
 			}
 			values.insert(name.clone(), measures);
 		}
@@ -1182,7 +1182,18 @@ mod tests {
 			 | new\\|x | - | 12.35 ms | added |  |\n"
 		);
 		let base = "c".repeat(40);
-		let json = file(&times, "x86_64-0123456789ab", Some(&base)).json().unwrap();
+		let mut details: [BTreeMap<String, Vec<Measure>>; 2] = Default::default();
+		details[1].insert(
+			"a".to_owned(),
+			vec![
+				Measure::new("alloc_count", 3.0, "allocations"),
+				Measure::new("user time", 1.5, "ns"),
+			],
+		);
+		let json = file(&times, &details, "x86_64-0123456789ab", Some(&base))
+			.unwrap()
+			.json()
+			.unwrap();
 		let json: serde_json::Value = serde_json::from_str(&json).unwrap();
 		let measure = "time (x86_64-0123456789ab)";
 		assert_eq!(json["units"][measure], "ns");
@@ -1193,6 +1204,12 @@ mod tests {
 			serde_json::json!({ "value": 2000.0 })
 		);
 		assert!(json["samples"][1].get("commit").is_none());
+		// Each side's allocations beside its time, and no other measure.
+		let allocs = "alloc_count (x86_64-0123456789ab)";
+		assert_eq!(json["units"][allocs], "allocations");
+		assert_eq!(json["units"].as_object().unwrap().len(), 2);
+		assert_eq!(json["samples"][1]["metrics"]["a"][allocs]["value"], 3);
+		assert!(json["samples"][0]["metrics"]["a"].get(allocs).is_none());
 		assert_eq!(json["samples"][1]["metrics"]["new|x"][measure]["value"], 12_346_000.0);
 		assert!(json["samples"][1]["metrics"].get("gone").is_none());
 	}

@@ -3,7 +3,6 @@
 //! stay out of every other measure. A call beside which another thread ran is sampled: the pass
 //! repeats, and each measure is the median of its repeats, with their least and most.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -208,28 +207,16 @@ pub fn label(measures: &[Measure], side: &mut Map<String, Value>) {
 	}
 }
 
-/// The allocation measures of each benchmark of `details` that has them, as `metrics.json` names
-/// them under `fingerprint`, with their units.
-pub fn series(
-	details: &BTreeMap<String, Vec<Measure>>,
-	fingerprint: &str,
-) -> (BTreeMap<String, &'static str>, BTreeMap<String, Vec<(String, Measure)>>) {
-	let mut units = BTreeMap::new();
-	let mut values = BTreeMap::new();
-	for (benchmark, measures) in details {
-		let mut found = Vec::new();
-		for (name, unit) in MEASURES {
-			if let Some(measure) = measures.iter().find(|measure| measure.name == name) {
-				let series = format!("{name} ({fingerprint})");
-				units.insert(series.clone(), unit);
-				found.push((series, measure.clone()));
-			}
-		}
-		if !found.is_empty() {
-			values.insert(benchmark.clone(), found);
-		}
-	}
-	(units, values)
+/// The allocation measures among a benchmark's `measures`, each by the name `metrics.json` gives
+/// it under `fingerprint`, with its unit.
+pub fn series<'a>(measures: &'a [Measure], fingerprint: &str) -> Vec<(String, &'static str, &'a Measure)> {
+	MEASURES
+		.iter()
+		.filter_map(|&(name, unit)| {
+			let measure = measures.iter().find(|measure| measure.name == name)?;
+			Some((format!("{name} ({fingerprint})"), unit, measure))
+		})
+		.collect()
 }
 
 #[cfg(test)]

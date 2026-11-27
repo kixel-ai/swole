@@ -60,7 +60,7 @@ impl File {
 	/// benchmark, and its allocations, when it has them.
 	pub fn counts(counts: &Counts, counter: &Counter) -> Result<Self, String> {
 		let series = counter.series(&counts.fingerprint);
-		let (mut units, mut allocs) = crate::heap::series(&counts.details, &counts.fingerprint);
+		let mut units = BTreeMap::new();
 		let mut values = BTreeMap::new();
 		for (name, details) in &counts.details {
 			let mut measures = BTreeMap::new();
@@ -71,8 +71,9 @@ impl File {
 					.ok_or_else(|| format!("{name} has no {detail}"))?;
 				measures.insert(measure.clone(), Point::of(found)?);
 			}
-			for (series, found) in allocs.remove(name).unwrap_or_default() {
-				measures.insert(series, Point::of(&found)?);
+			for (series, unit, found) in crate::heap::series(details, &counts.fingerprint) {
+				units.insert(series.clone(), unit);
+				measures.insert(series, Point::of(found)?);
 			}
 			values.insert(name.clone(), measures);
 		}
@@ -426,7 +427,7 @@ mod tests {
 		assert_eq!(
 			details(None, &counts.details),
 			"\n| benchmark | measure | value |\n|---|---|---:|\n| a | instructions | 10 |\n\
-			 | a | estimated cycles | 30 (27 to 33) |\n| a | data reads | 1 |\n"
+			 | a | estimated cycles | ~30 (27 to 33) |\n| a | data reads | 1 |\n"
 		);
 		let report = report(&counts, None, &sim(), None);
 		assert_eq!(
@@ -456,6 +457,50 @@ mod tests {
 			 | gone | cycles:u | 1 | - | removed |\n| gone | user time | 1.500 ns | - | removed |\n"
 		);
 		assert_eq!(details(None, &BTreeMap::new()), "");
+
+		// A sampled measure's change compares against both sides' spreads, and with one side's
+		// alone, has no verdict.
+		let sampled = |value: f64, spread: Option<(f64, f64)>| {
+			let mut measure = Measure::new("alloc_count", value, "allocations");
+			measure.spread = spread;
+			BTreeMap::from([("a".to_owned(), vec![measure])])
+		};
+		let change = |base, head| details(Some(&base), &head).lines().last().unwrap().to_owned();
+		assert_eq!(
+			change(sampled(10.0, Some((8.0, 12.0))), sampled(11.0, Some((11.0, 13.0)))),
+			"| a | alloc_count | ~10 allocations (8 allocations to 12 allocations) | ~11 allocations (11 allocations to \
+			 13 allocations) | ~+10.00% (within spread) |"
+		);
+		assert!(
+			change(sampled(10.0, Some((8.0, 12.0))), sampled(20.0, Some((19.0, 21.0))))
+				.ends_with("| +100.00% (beyond spread) |")
+		);
+		assert!(change(sampled(10.0, None), sampled(20.0, Some((19.0, 21.0)))).ends_with("| ~+100.00% |"));
+		assert!(change(sampled(10.0, None), sampled(20.0, None)).ends_with("| +100.00% |"));
+	}
+
+	#[test]
+	fn writes_allocations_beside_the_headline_where_a_benchmark_has_them() {
+		let mut counts = counts(&[("a", 10), ("b", 20)]);
+		let mut peak = Measure::new("peak_live_bytes", 64.0, "bytes");
+		peak.spread = Some((32.0, 64.0));
+		counts
+			.details
+			.get_mut("a")
+			.unwrap()
+			.extend([Measure::new("alloc_count", 2.0, "allocations"), peak]);
+		let json: Value = serde_json::from_str(&File::counts(&counts, &sim()).unwrap().json().unwrap()).unwrap();
+		let fp = "x86_64-0123456789ab";
+		assert_eq!(json["units"][format!("alloc_count ({fp})")], "allocations");
+		assert_eq!(json["units"][format!("peak_live_bytes ({fp})")], "bytes");
+		assert!(json["units"].get(format!("alloc_bytes ({fp})")).is_none());
+		let a = &json["samples"][0]["metrics"]["a"];
+		assert_eq!(a[format!("alloc_count ({fp})")], json!({ "value": 2 }));
+		assert_eq!(
+			a[format!("peak_live_bytes ({fp})")],
+			json!({ "value": 64, "lower_value": 32, "upper_value": 64 })
+		);
+		assert_eq!(json["samples"][0]["metrics"]["b"].as_object().unwrap().len(), 2);
 	}
 
 	#[test]
