@@ -10,13 +10,10 @@ The cooperative lease from [kixel-ai/swole#14](https://github.com/kixel-ai/swole
 
 Recommendations for the implementer:
 
-- Prefer CPUs in `/sys/devices/system/cpu/isolated` (`isolcpus=` or a cgroup v2 `cpuset` isolated partition), leasing those first, since an unprivileged process may still set its affinity onto them. The PMU probe's CPU list currently filters by `sched_getaffinity`, which leaves isolated CPUs out, so the candidate list must read them separately.
+- Prefer CPUs in `/sys/devices/system/cpu/isolated` (`isolcpus=`), leasing those first, since an unprivileged process may still set its affinity onto them. Check whether the run's `sched_getaffinity` and cpuset include them rather than assuming either way, since the PMU probe's CPU list filters by affinity.
 - Fail loudly when a host isolates CPUs that `bench` cannot use, such as CPUs the run's own cpuset excludes, rather than silently falling back to a shared core.
 - Verify with the same A/A `swole bench HEAD` on the fixture, under load, isolated against shared, and record the interval change in the PR.
 
-## Waiting
+Decided 2026-11-27 (maintainer, /quest-run): ✅ keep this follow-up (rejected: drop).
 
-- Maintainer: How should benchmark hosts set cores aside for `swole bench`, given that unprivileged swole cannot evict other processes and the user manager on this host delegates no `cpuset` controller?
-  - `isolcpus` on the kernel command line (Recommended) - for example the last two physical cores (`isolcpus=domain,managed_irq,14,15,30,31`); the scheduler places nothing there unless asked, and swole needs no privilege to pin onto them; changing it takes a reboot, and those cores are lost to builds
-  - cgroup v2 isolated partition - `systemctl set-property` with `AllowedCPUs` on `system.slice` and `user.slice`, plus a root-owned slice for benchmarks; this needs a privileged helper to place `swole bench` in that slice, but can change without a reboot
-  - Keep the cooperative lease alone - no host setup, at the cost of the residual noise measured above
+Decided 2026-11-27 (maintainer, /quest-run): hosts set cores aside with ✅ `isolcpus` on the kernel command line, for example the last two physical cores (`isolcpus=domain,managed_irq,14,15,30,31`) (rejected: a cgroup v2 isolated partition with a privileged helper; the cooperative lease only). Discover them from `/sys/devices/system/cpu/isolated`; a cgroup partition, which that file does not list, is out of scope.

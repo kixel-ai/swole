@@ -210,7 +210,7 @@ the benchmarks inherit it, `valgrind --version`, the preload's bytes, and the
 `x86_64-3059cd1d9e65`. The measure every count records names it, `instructions
 (x86_64-3059cd1d9e65)` and `estimated cycles (x86_64-3059cd1d9e65)`, so counts from two environments never share a Kixel Quest series, and
 a hardware change starts a new series instead of reading as a regression. `swole
-fingerprint sim` prints the label, then its inputs on stderr.
+fingerprint sim` prints the label on stdout and its inputs on stderr.
 
 A native measure, `quick`'s count or `bench`'s time, follows the host's own CPU, and the
 counters it reads follow what the host lets swole count. So `quick` and `bench` fingerprint the
@@ -223,7 +223,7 @@ leave a process's libc unverified) and `GLIBC_TUNABLES`, which pick glibc's stri
 routines; for `quick`, the preload; and for `bench`, the cpufreq governor of the
 [core](#cores) it times on. `swole fingerprint quick` and `swole fingerprint bench`
 run a standalone host probe using the runner's own libc and leasing no core, printing that probe's
-label and inputs on stderr; when a workspace's benchmark targets load a different libc (such as a
+label on stdout and its inputs on stderr; when a workspace's benchmark targets load a different libc (such as a
 Nix-packaged runner running benchmarks built in a project dev shell), `quick` and `bench`
 fingerprint the benchmark's mapped libc instead, and `bench` the governor it found, so look up a measurement series by the fingerprint printed by
 the run or recorded in `--out` / `--report`.
@@ -440,7 +440,7 @@ upgrade, says so and has none; one whose harness predates rusage has none of tha
 ### Cores
 
 On Linux, `bench` leases one physical core once its builds are done and runs every benchmark
-process on that core's first hardware thread, so a sample never migrates and a pair's two sides
+process on that core's first hardware thread swole may run on, so a sample never migrates and a pair's two sides
 run on one core. The lease is an advisory lock on a file in `/dev/shm/swole`, shared by every
 user, which the kernel drops however the run ends: no other `swole bench` uses any hardware
 thread of the core meanwhile, so concurrent runs take disjoint cores and never contend through an
@@ -448,12 +448,13 @@ SMT sibling. A run takes the last free core, leaving the first, where the kernel
 own work, for last, and when other runs hold them all, waits until any one frees. On a hybrid Intel host it
 takes a performance core, counted by the `cpu_core` PMU, while `quick` counts on the PMU of the
 most CPUs. A benchmark that starts another thread in its first call would have its threads
-serialized on one CPU, so it times and counts on the run's core and every other core no other
-run leases, which it leases until it is counted, and the run says so.
+serialized on one CPU, so it times on the run's core and every other core no other run leases,
+which it leases until it is counted, and the run says so; a side still running other threads gets
+no perf counters, as above.
 
 The lease keeps other `swole bench` runs off the core, not the host's other processes, which
-the run says unless the kernel isolates the CPU (`isolcpus`, listed in
-`/sys/devices/system/cpu/isolated`).
+the run says unless the kernel excludes the CPU from scheduler load balancing (`isolcpus`, listed in
+`/sys/devices/system/cpu/isolated`); even then a task pinned there may still run on it.
 
 Where swole may write the core's cpufreq policy, and the policy sets no CPU outside the core, a
 run switches the core to the `performance` governor, recording what it changed first in a journal

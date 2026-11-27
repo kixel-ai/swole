@@ -40,9 +40,11 @@ pub struct Reservation {
 	core: Vec<usize>,
 	/// Every core the run may time on, its own among them, each its hardware threads.
 	cores: Vec<Vec<usize>>,
+	/// The CPUs swole may run on, which a spread stays within though it leases whole cores.
+	candidates: Vec<usize>,
 	/// Where the leases of `cores` are.
 	leases: PathBuf,
-	/// Whether the kernel keeps other processes off the CPU.
+	/// Whether the kernel keeps the CPU out of scheduler load balancing (`isolcpus`).
 	isolated: bool,
 	governor: Governor,
 	/// What to write back on drop, before the lease's lock is released.
@@ -97,6 +99,7 @@ impl Reservation {
 				spread.leases.push(file);
 			}
 		}
+		spread.cpus.retain(|cpu| self.candidates.contains(cpu));
 		spread.cpus.sort_unstable();
 		Ok(spread)
 	}
@@ -104,7 +107,7 @@ impl Reservation {
 	/// What the run holds, in a line.
 	pub fn describe(&self) -> String {
 		let others = if self.isolated {
-			"which the kernel isolates from other processes"
+			"which the kernel keeps out of scheduler load balancing"
 		} else {
 			"which other processes may still share"
 		};
@@ -173,11 +176,12 @@ fn reserve_in(sys: &Path, leases: &Path, candidates: &[usize]) -> Result<Reserva
 		Ok(list) => perf::cpus(&list)?.contains(&cpu),
 		Err(_) => false,
 	};
-	let (governor, restore) = tune(sys, &core, &journal)?;
+	let (governor, restore) = tune(sys, &core, cpu, &journal)?;
 	Ok(Reservation {
 		cpu,
 		core,
 		cores,
+		candidates: candidates.to_owned(),
 		leases: leases.to_owned(),
 		isolated,
 		governor,
@@ -446,18 +450,25 @@ fn recover(sys: &Path, core: &[usize], journal: &Path) -> Result<(), String> {
 
 /// Sets `performance` on every cpufreq policy of `core`, recording in `journal` what each held
 /// first, where every one is the core's alone and swole may write it: the governor the run times
-/// under, and what to restore.
-fn tune(sys: &Path, core: &[usize], journal: &Path) -> Result<(Governor, Option<Box<Restore>>), String> {
+/// under on `cpu`, and what to restore.
+fn tune(sys: &Path, core: &[usize], cpu: usize, journal: &Path) -> Result<(Governor, Option<Box<Restore>>), String> {
 	let read = |path: &Path| {
 		std::fs::read_to_string(path)
 			.map(|text| text.trim().to_owned())
 			.map_err(|e| format!("cannot read {}: {e}", path.display()))
 	};
 	let policies = policies_of(sys, core)?;
-	let Some(first) = policies.first() else {
+	if policies.is_empty() {
 		return Ok((Governor::Absent, None));
-	};
-	let governor = read(&first.join(TUNED[0]))?;
+	}
+	// The timing CPU's own policy names the governor kept, since its siblings' may differ.
+	let own = sys.join(format!("cpu{cpu}/cpufreq"));
+	if !own.exists() {
+		return Err(format!(
+			"CPU {cpu} has no cpufreq policy though its core's other CPUs do"
+		));
+	}
+	let governor = read(&own.join(TUNED[0]))?;
 	let kept = |why: String| -> Result<(Governor, Option<Box<Restore>>), String> {
 		Ok((
 			Governor::Kept {
@@ -722,6 +733,20 @@ mod tests {
 	}
 
 	#[test]
+	fn keeps_to_the_cpus_swole_may_run_on() {
+		let dir = scratch("eligible");
+		let sys = sys(&dir, 2, 2, "performance");
+		// CPU 3's sibling 1 holds another governor, under a policy shared with another core, which
+		// swole keeps but CPU 3 never times under.
+		std::fs::write(sys.join("cpufreq/policy1/scaling_governor"), "powersave\n").unwrap();
+		std::fs::write(sys.join("cpufreq/policy1/related_cpus"), "0 1\n").unwrap();
+		let only = reserve_in(&sys, &dir.join("leases"), &[3, 2]).unwrap();
+		assert_eq!((only.cpu, &only.core), (3, &vec![1, 3]));
+		assert_eq!(only.spread().unwrap().cpus, [2, 3]);
+		assert_eq!(only.governor(), PERFORMANCE);
+	}
+
+	#[test]
 	fn sets_performance_and_restores_it_on_drop() {
 		let _arms = ARMS.lock().unwrap();
 		let dir = scratch("governor");
@@ -754,8 +779,8 @@ mod tests {
 		assert_eq!(governor(&sys, 0), PERFORMANCE);
 		// Killed outright: the lock goes with its file, and nothing restores.
 		let mut killed = killed;
-		killed.restore.take().unwrap();
 		signals::disarm();
+		killed.restore.take().unwrap();
 		drop(killed);
 		let next = reserve_in(&sys, &leases, &[0, 1]).unwrap();
 		assert!(matches!(&next.governor, Governor::Set { was } if was == "powersave"));
