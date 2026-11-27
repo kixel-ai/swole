@@ -13,6 +13,10 @@ mod cores;
 mod cores {
 	pub enum Reservation {}
 
+	pub struct Spread {
+		pub cpus: Vec<usize>,
+	}
+
 	impl Reservation {
 		pub fn cpu(&self) -> usize {
 			match *self {}
@@ -22,7 +26,7 @@ mod cores {
 			match *self {}
 		}
 
-		pub fn spread(&self) -> Result<Vec<usize>, String> {
+		pub fn spread(&self) -> Result<Spread, String> {
 			match *self {}
 		}
 

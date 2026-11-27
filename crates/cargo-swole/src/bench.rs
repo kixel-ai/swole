@@ -168,6 +168,8 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 		let dir = work.join(index.to_string());
 		let base = before.as_mut().and_then(|jobs| jobs.remove(&name));
 		let head = after.remove(&name);
+		// The other cores a threaded benchmark spreads over, leased until it is timed and counted.
+		let spreading;
 		let (timed, iterations, used, timed_threaded, cpus) = match (&base, &head) {
 			(Some(base), Some(head)) => {
 				let spawn = |cpus: Option<&[usize]>| -> Result<(Process, Process), String> {
@@ -178,10 +180,11 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				};
 				let mut cpus = exclusive.clone();
 				let (mut base, mut head) = spawn(cpus.as_deref())?;
-				if let Some(spread) = spread(reservation.as_ref(), &name, base.threaded || head.threaded)? {
+				spreading = spread(reservation.as_ref(), &name, base.threaded || head.threaded)?;
+				if let Some(spread) = &spreading {
 					base.finish()?;
 					head.finish()?;
-					cpus = Some(spread);
+					cpus = Some(spread.cpus.clone());
 					(base, head) = spawn(cpus.as_deref())?;
 				}
 				let (iterations, pairs) = paired(&mut base, &mut head, &mut coin)?;
@@ -211,9 +214,10 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				};
 				let mut cpus = exclusive.clone();
 				let mut process = Process::spawn(job, cpus.as_deref(), preload.as_deref(), &dir.join(side.name()))?;
-				if let Some(spread) = spread(reservation.as_ref(), &name, process.threaded)? {
+				spreading = spread(reservation.as_ref(), &name, process.threaded)?;
+				if let Some(spread) = &spreading {
 					process.finish()?;
-					cpus = Some(spread);
+					cpus = Some(spread.cpus.clone());
 					process = Process::spawn(job, cpus.as_deref(), preload.as_deref(), &dir.join(side.name()))?;
 				}
 				let (iterations, samples) = alone(&mut process)?;
@@ -332,7 +336,7 @@ fn spread(
 	reservation: Option<&crate::cores::Reservation>,
 	name: &str,
 	threaded: bool,
-) -> Result<Option<Vec<usize>>, String> {
+) -> Result<Option<crate::cores::Spread>, String> {
 	let Some(reservation) = reservation.filter(|_| threaded) else {
 		return Ok(None);
 	};
@@ -340,7 +344,7 @@ fn spread(
 	eprintln!(
 		"swole: {name} runs other threads, so it times on CPUs {}, every core no other swole run leases, rather \
 		 than CPU {} alone",
-		perf::list(&spread),
+		perf::list(&spread.cpus),
 		reservation.cpu()
 	);
 	Ok(Some(spread))

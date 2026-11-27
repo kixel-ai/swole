@@ -406,8 +406,8 @@ SMT sibling. A run takes the last free core, leaving the first, where the kernel
 own work, for last, and waits for one when other runs hold them all. On a hybrid Intel host it
 takes a performance core, counted by the `cpu_core` PMU, while `quick` counts on the PMU of the
 most CPUs. A benchmark that starts another thread in its first call would have its threads
-serialized on one CPU, so it times and counts on every CPU the run may use instead, which the run
-says.
+serialized on one CPU, so it times and counts on the run's core and every other core no other
+run leases, which it leases until it is counted, and the run says so.
 
 The lease keeps other `swole bench` runs off the core, not the host's other processes, which
 the run says unless the kernel isolates the CPU (`isolcpus`, listed in
