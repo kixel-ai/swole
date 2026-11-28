@@ -1,7 +1,8 @@
 //! Where a benchmark's threads wait off the CPU, beside `bench`'s times: a timed process of its own
 //! records each of its threads' context switches, and by the kernel's syscall tracepoints its
 //! futex calls, while the harness's clock runs, and splits the time a thread spent off the CPU
-//! into blocked and preempted; of the blocked, what it waited in a futex; and of that, what it
+//! into blocked until woken and runnable after, or preempted; of the blocked, what it waited in a
+//! futex; and of that, what it
 //! waited to take a lock, where the code that waited says it was taking one.
 //!
 //! swole opens the events on each CPU the process runs on whole, just before it `exec`s, keeping the
@@ -38,15 +39,18 @@ pub const MOST_RECORD: usize = 256;
 /// The tracepoints a trace opens, and where their records hold what it reads.
 #[derive(Clone, Debug)]
 pub struct Tracing {
-	/// The IDs of `syscalls:sys_enter_futex`, `sys_exit_futex`, `sys_enter_prctl`, and
-	/// `sys_exit_prctl`.
+	/// The IDs of `syscalls:sys_enter_futex`, `sys_exit_futex`, `sys_enter_prctl`,
+	/// `sys_exit_prctl`, and `sched:sched_wakeup`.
 	enter: u64,
 	exit: u64,
 	prctl: u64,
 	prctled: u64,
-	/// Where in a futex call's tracepoint record its operation lies, and a prctl's option.
+	wakeup: u64,
+	/// Where in a futex call's tracepoint record its operation lies, a prctl's option, and a
+	/// wakeup's woken thread.
 	op: usize,
 	option: usize,
+	woken: usize,
 }
 
 /// Where a futex wait was made: the instruction after its system call, the word atop the user
@@ -66,6 +70,8 @@ enum Event {
 	Out { preempted: bool },
 	/// It came back onto a CPU.
 	In,
+	/// It was woken, runnable again but not yet on a CPU.
+	Wake,
 	/// It entered a futex call, one that waits at a site, or one that does not.
 	Enter(Option<Site>),
 	/// It returned from a futex call.
@@ -79,7 +85,8 @@ enum Event {
 	Stop,
 }
 
-/// One record of a trace, of a thread of the benchmark's process.
+/// One record of a trace, of a thread of the benchmark's process, or of any thread woken on its
+/// CPUs, since a wakeup's record names the waker's process.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Record {
 	/// When, in `CLOCK_MONOTONIC` nanoseconds.
@@ -108,10 +115,10 @@ impl Drained {
 /// each time one left the CPU in a window its clock timed until it came back or the window closed.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Waits {
-	/// Asleep, waiting for anything but a CPU.
+	/// Asleep, waiting for anything but a CPU, until woken.
 	blocked: u64,
-	/// Runnable, waiting for a CPU.
-	preempted: u64,
+	/// Runnable, waiting for a CPU: preempted, or woken and not yet run.
+	runnable: u64,
 	/// Asleep in a futex wait, of the blocked, by where it waited.
 	futex: BTreeMap<Site, u64>,
 }
@@ -134,14 +141,14 @@ impl Tracing {
 			.find(|dir| dir.is_dir())
 			.ok_or("this kernel mounts no tracefs, whose tracepoints name a futex call")?;
 		let read = |event: &str, file: &str| {
-			let path = root.join("events/syscalls").join(event).join(file);
+			let path = root.join("events").join(event).join(file);
 			std::fs::read_to_string(&path).map_err(|err| match err.kind() {
 				std::io::ErrorKind::PermissionDenied => format!(
 					"swole may not read {}, its tracepoint's ID: grant its user tracefs as the README's Privileges says",
 					path.display()
 				),
 				_ => format!(
-					"cannot read {} ({err}), its tracepoint's ID, as a kernel without syscall tracepoints lacks",
+					"cannot read {} ({err}), its tracepoint's ID, as a kernel without syscall or scheduler tracepoints lacks",
 					path.display()
 				),
 			})
@@ -153,12 +160,14 @@ impl Tracing {
 				.map_err(|_| format!("{event}'s tracepoint ID is {text:?}"))
 		};
 		let tracing = Self {
-			enter: id("sys_enter_futex")?,
-			exit: id("sys_exit_futex")?,
-			prctl: id("sys_enter_prctl")?,
-			prctled: id("sys_exit_prctl")?,
-			op: offset(&read("sys_enter_futex", "format")?, "op")?,
-			option: offset(&read("sys_enter_prctl", "format")?, "option")?,
+			enter: id("syscalls/sys_enter_futex")?,
+			exit: id("syscalls/sys_exit_futex")?,
+			prctl: id("syscalls/sys_enter_prctl")?,
+			prctled: id("syscalls/sys_exit_prctl")?,
+			wakeup: id("sched/sched_wakeup")?,
+			op: offset(&read("syscalls/sys_enter_futex", "format")?, "op")?,
+			option: offset(&read("syscalls/sys_enter_prctl", "format")?, "option")?,
+			woken: offset(&read("sched/sched_wakeup", "format")?, "pid")?,
 		};
 		// Opened as a trace opens them, on a CPU swole may run on, and its ring mapped.
 		let cpu = *crate::perf::allowed()?.first().ok_or("swole may run on no CPU")?;
@@ -192,10 +201,10 @@ impl Tracing {
 	}
 
 	/// How many events it opens on each CPU.
-	pub const EVENTS: usize = 5;
+	pub const EVENTS: usize = 6;
 
 	/// Opens its events on `cpu` into `fds`: the threads' context switches and exits, then the
-	/// futex call's tracepoints and the prctl's, which [`Rings::new`] has write to the first's ring
+	/// futex call's tracepoints, the prctl's, and the wakeup's, which [`Rings::new`] has write to the first's ring
 	/// buffer once it maps it, since the kernel redirects an event only into a mapped one. It makes
 	/// system calls alone, as between fork and exec.
 	#[cfg(target_os = "linux")]
@@ -227,8 +236,15 @@ impl Tracing {
 		fds[0] = traced(&switches, cpu)?;
 		for (fd, id) in fds[1..]
 			.iter_mut()
-			.zip([self.enter, self.exit, self.prctl, self.prctled])
+			.zip([self.enter, self.exit, self.prctl, self.prctled, self.wakeup])
 		{
+			// A wakeup is the kernel's, in whatever context woke the thread, which its kernel's
+			// exclusion would drop. Every tracepoint's records share one layout to read them by.
+			let flags = if id == self.wakeup {
+				flags & !EXCLUDE_KERNEL
+			} else {
+				flags
+			};
 			let tracepoint =
 				Attr {
 					kind: PERF_TYPE_TRACEPOINT,
@@ -238,6 +254,7 @@ impl Tracing {
 						| PERF_SAMPLE_TID | PERF_SAMPLE_TIME
 						| PERF_SAMPLE_RAW | PERF_SAMPLE_STACK_USER,
 					sample_stack_user: 8,
+					flags,
 					..base
 				};
 			*fd = traced(&tracepoint, cpu)?;
@@ -301,9 +318,6 @@ impl Tracing {
 				// The instruction pointer, the process and thread, the time, then the tracepoint's
 				// own record, which leads with its ID, then the top of the user stack.
 				let (ip, task, tid, time) = (word(8)?, half(16)?, half(20)?, word(24)?);
-				if task != pid {
-					return Ok(Parsed::Other);
-				}
 				let size = half(32)? as usize;
 				let raw = record.get(36..36 + size).ok_or_else(malformed)?;
 				let field = |at: usize| -> Result<u64, String> {
@@ -314,6 +328,21 @@ impl Tracing {
 				let id = u64::from(u16::from_ne_bytes(
 					raw.get(0..2).ok_or_else(malformed)?.try_into().expect("2 bytes"),
 				));
+				// The waker may be any process's, or none's, so the woken thread is kept, whose
+				// process accounting tells by its own records.
+				if id == self.wakeup {
+					let at = self.woken;
+					let woken =
+						u32::from_ne_bytes(raw.get(at..at + 4).ok_or_else(malformed)?.try_into().expect("4 bytes"));
+					return Ok(Parsed::Record(Record {
+						time,
+						tid: woken,
+						event: Event::Wake,
+					}));
+				}
+				if task != pid {
+					return Ok(Parsed::Other);
+				}
 				let stack = 36 + size;
 				// The word copied, when the stack held one to copy.
 				let ret = match (word(stack)?, record.get(stack + 16..stack + 24)) {
@@ -361,27 +390,28 @@ fn offset(format: &str, field: &str) -> Result<usize, String> {
 			(declared.rsplit([' ', '*']).next() == Some(field)).then_some(rest)?;
 			rest.trim().strip_prefix("offset:")?.split(';').next()?.parse().ok()
 		})
-		.ok_or_else(|| format!("a syscall tracepoint's format lays out no {field}"))
+		.ok_or_else(|| format!("a tracepoint's format lays out no {field}"))
 }
 
 /// The waits `records` say the process's threads took, in time order, each from when its thread
-/// left the CPU until it came back, or the window it left in closed: a wait that began before its
-/// window, as an idle worker's parked since before it, is none of the window's.
+/// left the CPU until it came back, or the window it left in closed, blocked until woken and
+/// runnable after: a wait that began before its window, as an idle worker's parked since before
+/// it, is none of the window's.
 fn account(records: &[Record]) -> Waits {
 	/// A thread's state, as its records say.
 	#[derive(Default)]
 	struct Thread {
-		/// Since when it is off the CPU, whether preempted, and the futex wait it is blocked in.
+		/// Since when it is off the CPU, whether runnable, and the futex wait it is blocked in.
 		off: Option<(u64, bool, Option<Site>)>,
 		/// The futex wait it entered and has not returned from.
 		waiting: Option<Site>,
 		/// Whether it exited, so its last switch out waits for nothing.
 		gone: bool,
 	}
-	fn close(waits: &mut Waits, (since, preempted, site): (u64, bool, Option<Site>), until: u64) {
+	fn close(waits: &mut Waits, (since, runnable, site): (u64, bool, Option<Site>), until: u64) {
 		let span = until.saturating_sub(since);
-		if preempted {
-			waits.preempted += span;
+		if runnable {
+			waits.runnable += span;
 			return;
 		}
 		waits.blocked += span;
@@ -409,6 +439,16 @@ fn account(records: &[Record]) -> Waits {
 			}
 			_ if !open => {}
 			Event::Start | Event::Stop => {}
+			// Only a thread of the process's that blocked in the window: one woken while on a CPU,
+			// or already runnable, or another process's, has no wait to split.
+			Event::Wake => {
+				if let Some(thread) = threads.get_mut(&record.tid)
+					&& let Some(off @ (_, false, _)) = thread.off
+				{
+					close(&mut waits, off, record.time);
+					thread.off = Some((record.time, true, None));
+				}
+			}
 			event => {
 				let thread = threads.entry(record.tid).or_default();
 				match event {
@@ -425,7 +465,7 @@ fn account(records: &[Record]) -> Waits {
 					Event::Enter(site) => thread.waiting = site,
 					Event::Exit => thread.waiting = None,
 					Event::Gone => thread.gone = true,
-					Event::Start | Event::Stop => unreachable!("matched above"),
+					Event::Start | Event::Stop | Event::Wake => unreachable!("matched above"),
 				}
 			}
 		}
@@ -434,10 +474,10 @@ fn account(records: &[Record]) -> Waits {
 }
 
 /// Each of `samples`' waits, a call's share over all their calls, within the least and most one
-/// sample's calls shared, since the scheduler moves them: blocked, preempted, futex, and lock
+/// sample's calls shared, since the scheduler moves them: blocked, runnable, futex, and lock
 /// wait, a futex wait at one of `locks` having waited to take a lock.
 pub fn measures(samples: &[(Waits, u64)], locks: &BTreeSet<Site>) -> Vec<Measure> {
-	const NAMES: [&str; 4] = ["blocked time", "preempted time", "futex wait time", "lock wait time"];
+	const NAMES: [&str; 4] = ["blocked time", "runnable time", "futex wait time", "lock wait time"];
 	let calls: u64 = samples.iter().map(|(_, calls)| calls).sum();
 	if calls == 0 {
 		return Vec::new();
@@ -451,7 +491,7 @@ pub fn measures(samples: &[(Waits, u64)], locks: &BTreeSet<Site>) -> Vec<Measure
 				.filter(|(site, _)| locks.contains(site))
 				.map(|(_, ns)| ns)
 				.sum();
-			([waits.blocked, waits.preempted, futex, lock], *calls)
+			([waits.blocked, waits.runnable, futex, lock], *calls)
 		})
 		.collect();
 	NAMES
@@ -722,21 +762,28 @@ mod tests {
 	};
 
 	#[test]
-	fn splits_off_cpu_time_into_blocked_preempted_and_futex_waits() {
+	fn splits_off_cpu_time_into_blocked_runnable_and_futex_waits() {
 		let out = Event::Out { preempted: false };
 		let preempted = Event::Out { preempted: true };
 		let records = [
 			// Before the window opens, nothing counts.
 			record(50, 2, out),
+			record(60, 2, Event::Wake),
 			record(90, 1, Event::Start),
-			// A sleep, then a futex wait, then a preemption inside a futex call, which waits for a
-			// CPU rather than the futex.
+			// A sleep, then a futex wait, runnable once woken, then a preemption inside a futex
+			// call, which waits for a CPU rather than the futex.
 			record(100, 1, out),
 			record(150, 1, Event::In),
+			// A wake of a thread on a CPU, or another process's, splits nothing.
+			record(160, 1, Event::Wake),
 			record(200, 1, Event::Enter(Some(SITE))),
 			record(210, 1, out),
+			record(290, 1, Event::Wake),
+			record(295, 1, Event::Wake),
+			record(300, 99, Event::Wake),
 			record(310, 1, Event::In),
 			record(320, 1, preempted),
+			record(322, 1, Event::Wake),
 			record(325, 1, Event::In),
 			record(330, 1, Event::Exit),
 			// A wake does not wait; the thread then sleeps outside any futex call.
@@ -771,13 +818,13 @@ mod tests {
 		assert_eq!(
 			account(&records),
 			Waits {
-				blocked: 50 + 100 + 10 + 350 + 10,
-				preempted: 5,
-				futex: BTreeMap::from([(SITE, 100 + 350)]),
+				blocked: 50 + 80 + 10 + 350 + 10,
+				runnable: 20 + 5,
+				futex: BTreeMap::from([(SITE, 80 + 350)]),
 			}
 		);
 		// A window left open, as a sample's last records before its stop leave one, closes nothing.
-		assert_eq!(account(&records[..3]), Waits::default());
+		assert_eq!(account(&records[..4]), Waits::default());
 	}
 
 	#[test]
@@ -787,7 +834,7 @@ mod tests {
 			(
 				Waits {
 					blocked: 400,
-					preempted: 0,
+					runnable: 0,
 					futex: BTreeMap::from([(SITE, 100), (lock, 200)]),
 				},
 				2,
@@ -795,7 +842,7 @@ mod tests {
 			(
 				Waits {
 					blocked: 800,
-					preempted: 40,
+					runnable: 40,
 					futex: BTreeMap::from([(lock, 600)]),
 				},
 				2,
@@ -811,7 +858,7 @@ mod tests {
 			shown,
 			[
 				("blocked time", 150.0, (0.0, 400.0)),
-				("preempted time", 5.0, (0.0, 20.0)),
+				("runnable time", 5.0, (0.0, 20.0)),
 				("futex wait time", 112.5, (0.0, 300.0)),
 				("lock wait time", 100.0, (0.0, 300.0)),
 			]
@@ -868,8 +915,10 @@ mod tests {
 			exit: 498,
 			prctl: 199,
 			prctled: 200,
+			wakeup: 311,
 			op: 24,
 			option: 16,
+			woken: 24,
 		}
 	}
 
@@ -954,6 +1003,11 @@ mod tests {
 		assert_eq!(
 			parse(PERF_RECORD_SAMPLE, 0, &sample(200, 16, &[0], Some(1))),
 			at(16, 7, Event::Start)
+		);
+		// A wakeup names the thread it woke, whatever process woke it.
+		assert_eq!(
+			parse(PERF_RECORD_SAMPLE, 0, &sample(311, 18, &[0, 42], None)),
+			at(18, 42, Event::Wake)
 		);
 		// A thread's exit: the process and its parent, the thread and its parent, and the time.
 		let exit = |pid: u32| -> Vec<u8> {

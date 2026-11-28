@@ -303,12 +303,12 @@ impl Sides<'_> {
 	/// blocked.
 	fn waited(&self) -> Option<(&'static str, Moved)> {
 		let gained = |name: &str| self.get(name).map_or(0.0, |moved| moved.delta());
-		let off = gained("blocked time") + gained("preempted time");
+		let off = gained("blocked time") + gained("runnable time");
 		[
 			("lock contention", "lock wait time"),
 			("futex wait", "futex wait time"),
 			("blocked", "blocked time"),
-			("preempted", "preempted time"),
+			("runnable", "runnable time"),
 		]
 		.into_iter()
 		.find_map(|(label, name)| {
@@ -592,7 +592,7 @@ mod tests {
 			&base[..],
 			&side(&[
 				("blocked time", 1000.0, "ns"),
-				("preempted time", 0.0, "ns"),
+				("runnable time", 0.0, "ns"),
 				("futex wait time", 800.0, "ns"),
 				("lock wait time", 10.0, "ns"),
 			]),
@@ -601,7 +601,7 @@ mod tests {
 		let waited = |waits: [f64; 4]| {
 			let mut head = traced.clone();
 			head.iter_mut().find(|m| m.name == "CPUs busy").unwrap().value = 0.7;
-			for (name, value) in ["blocked time", "preempted time", "futex wait time", "lock wait time"]
+			for (name, value) in ["blocked time", "runnable time", "futex wait time", "lock wait time"]
 				.into_iter()
 				.zip(waits)
 			{
@@ -624,7 +624,7 @@ mod tests {
 		);
 		assert_eq!(
 			waited([1200.0, 1500.0, 800.0, 10.0]),
-			"preempted (CPUs busy 0.980 CPUs → 0.700 CPUs, preempted time 0 ns → 1500 ns)"
+			"runnable (CPUs busy 0.980 CPUs → 0.700 CPUs, runnable time 0 ns → 1500 ns)"
 		);
 		// Waits that held name nothing narrower.
 		assert_eq!(

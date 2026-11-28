@@ -364,7 +364,7 @@ what each job gets; the native [fingerprint](#fingerprints) holds all of it.
   call.
   `quick` counts user space alone at any tier.
 - Tier L-1, `perf_event_paranoid` at most -1 or `CAP_PERFMON`, on x86_64, and the kernel's
-  syscall tracepoints readable under tracefs: `bench` traces where each benchmark's threads
+  syscall and scheduler tracepoints readable under tracefs: `bench` traces where each benchmark's threads
   [wait off the CPU](#off-cpu-waits), printing that it does or why it cannot.
 - No tier, above 2 without `CAP_PERFMON`, or a host without a PMU, or one that does not let a
   process read its counters in user space (`cap_user_rdpmc` off), or a CPU other than x86_64, or
@@ -403,7 +403,7 @@ security.wrappers.swole = {
 A `swole` given the capability itself runs its helpers through the `cargo-swole` installed beside
 it, since Valgrind refuses an executable that holds capabilities.
 
-A [trace of off-CPU waits](#off-cpu-waits) also reads the IDs of the syscall tracepoints it opens
+A [trace of off-CPU waits](#off-cpu-waits) also reads the IDs of the syscall and scheduler tracepoints it opens
 from tracefs, which most distributions mount for root alone, and which no capability opens.
 Grant a group read access when mounting it, by its numeric ID, as the kernel's
 [perf security](https://docs.kernel.org/admin-guide/perf-security.html) guide does:
@@ -524,7 +524,8 @@ Where the host allows it, `bench` measures where each side's threads wait off th
 share summed over every thread of the process, beside its time and `CPUs busy`. On the CPUs its
 times took, it runs each side once more, in a timed process of its own, over a tenth of a second
 of calls, recording each of the process's context switches and, by the kernel's
-`syscalls:sys_enter_futex` and `sys_exit_futex` tracepoints, its futex calls. As a
+`syscalls:sys_enter_futex` and `sys_exit_futex` tracepoints, its futex calls, and by
+`sched:sched_wakeup`, when each of its threads was woken, whatever woke it. As a
 [profile](#functions) does, it records each of those CPUs whole and keeps the process's records
 alone, since events every thread inherited would cost each thread the benchmark starts hundreds of
 microseconds, and the harness starts and stops them with its clock, so setup, steps, and inputs
@@ -535,8 +536,10 @@ so it lies within the time, and what other CPUs record before the stop reaches t
 inside it counts until it ends or the window does, so a worker parked since before the window,
 waiting for work that never came, counts nothing, nor does a thread's last switch as it exits:
 
-- `blocked time`: off the CPU, waiting on something, as a sleep, I/O, or a futex;
-- `preempted time`: off the CPU while still runnable, as when the scheduler ran another thread;
+- `blocked time`: off the CPU, waiting on something, as a sleep, I/O, or a futex, until woken;
+- `runnable time`: off the CPU while runnable, waiting for one, as when the scheduler preempted
+  the thread or has yet to run it once woken, so a loaded CPU's delay counts in no futex or lock
+  wait. A wakeup another CPU than the traced ones records goes unseen, and its wait stays blocked;
 - `futex wait time`: the blocked time inside a futex call that waits, as a parked worker's or a
   lock's;
 - `lock wait time`: the futex wait time at a call that takes a lock. swole resolves each call's
@@ -672,7 +675,7 @@ first two of these its measures show, each citing the measure on both sides: `th
 (`cycles/ref-cycles:u` fell 2%; never the estimated clock alone), `off-CPU` (`CPUs busy` lost 0.1 and
 ended under 0.9), named, where a [trace](#off-cpu-waits) split it, for the narrowest wait that
 gained half or more of the off-CPU time a call gained, `lock contention`, `futex wait`, `blocked`,
-or `preempted`, citing it beside `CPUs busy`, `more instructions` (1% more), `memory-bound` (the last-level, L1 data, or data
+or `runnable`, citing it beside `CPUs busy`, `more instructions` (1% more), `memory-bound` (the last-level, L1 data, or data
 TLB MPKI grew by a quarter and 0.1, or the breakdown's memory bound gained 3 points), else
 `backend-bound` (its backend bound did), `branch mispredicts` (its miss rate, MPKI, or share),
 else `bad speculation`, `frontend-bound`, `kernel` (its share gained 5 points), and for a time that

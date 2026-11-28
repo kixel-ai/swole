@@ -116,7 +116,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 	let tracing = match crate::offcpu::Tracing::probe() {
 		Ok(tracing) => {
 			eprintln!(
-				"swole: tracing each benchmark's context switches and futex calls, for where its threads wait off the CPU"
+				"swole: tracing each benchmark's context switches, wakeups, and futex calls, for where its threads wait off the CPU"
 			);
 			Some(tracing)
 		}
@@ -505,14 +505,21 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					)? {
 					// The `prctl`s that start and stop sampling around each call put kernel cycles
 					// of their own in each, which a side sampling a whole sample at once lacks.
-					if base.0 == head.0 {
-						profiles.insert(name.clone(), [base.1, head.1]);
-					} else {
+					// So do the clock's own reads in a side whose harness starts sampling outside them.
+					if base.0 != head.0 {
 						eprintln!(
 							"swole: {name}'s clock brackets each {} in the base and each {} in the head, so their samples \
 							 hold unlike harness work and name no functions",
 							base.0, head.0
 						);
+					} else if base.1 != head.1 {
+						eprintln!(
+							"swole: {name}'s samples hold its clock's reads in the {} alone, whose harness starts sampling \
+							 outside its clock, so they hold unlike harness work and name no functions",
+							if base.1 { "head" } else { "base" }
+						);
+					} else {
+						profiles.insert(name.clone(), [base.2, head.2]);
 					}
 				}
 			}
@@ -760,9 +767,10 @@ struct Profiling<'a> {
 
 /// Profiles `job`'s benchmark as `how` says, its output under `dir`, in a timed process of its own
 /// whose clock starts and stops the sampling, so its samples take neither the time's nor the
-/// counters' place: what its clock brackets, and the profile. None when its harness is too old
+/// counters' place: what its clock brackets, whether its harness starts sampling inside its clock,
+/// and the profile. None when its harness is too old
 /// to, or the benchmark times itself, whose calls may hold work its time leaves out.
-fn profile(job: &Job, how: Profiling, dir: &Path) -> Result<Option<(String, crate::profile::Profile)>, String> {
+fn profile(job: &Job, how: Profiling, dir: &Path) -> Result<Option<(String, bool, crate::profile::Profile)>, String> {
 	#[cfg(target_os = "linux")]
 	{
 		let mut command = Process::command(job, Some(how.cpus), Some(how.preload))?;
@@ -799,6 +807,7 @@ fn profile(job: &Job, how: Profiling, dir: &Path) -> Result<Option<(String, crat
 		}
 		let path = format!("/proc/{}/maps", process.child.id());
 		let maps = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
+		let inside = process.inside;
 		process.finish()?;
 		// A sample missed is cycles no function holds, and the rest would claim them.
 		if samples.lost > 0 || samples.throttled > 0 {
@@ -836,7 +845,7 @@ fn profile(job: &Job, how: Profiling, dir: &Path) -> Result<Option<(String, crat
 				job.label
 			);
 		}
-		Ok(Some((window, profile)))
+		Ok(Some((window, inside, profile)))
 	}
 	#[cfg(not(target_os = "linux"))]
 	{
@@ -860,7 +869,7 @@ struct Tracing<'a> {
 }
 
 /// Where `job`'s benchmark's threads wait off the CPU, as `how` says, its output under `dir`: a
-/// timed process of its own records its threads' context switches and futex calls while its clock
+/// timed process of its own records its threads' context switches, wakeups, and futex calls while its clock
 /// runs, so the records take neither the time's nor the counters' place. A call's share of each
 /// wait, or none when its harness is too old to trace, or the benchmark times itself, whose calls
 /// may hold waits its time leaves out.
@@ -935,7 +944,7 @@ fn trace(job: &Job, how: Tracing, dir: &Path) -> Result<Vec<Measure>, String> {
 		if samples.is_empty() {
 			process.finish()?;
 			return Err(format!(
-				"{}: every sample of its trace lost records its ring buffers had no room for, of its own calls' context switches and futex calls or other processes' on its CPUs",
+				"{}: every sample of its trace lost records its ring buffers had no room for, of its own calls' context switches, wakeups, and futex calls or other processes' on its CPUs",
 				job.label
 			));
 		}
