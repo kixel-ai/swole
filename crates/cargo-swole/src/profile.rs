@@ -70,17 +70,8 @@ impl Samples {
 			*cycles.entry(function("[kernel]", "kernel")).or_default() += self.kernel;
 		}
 		for (&ip, &weight) in &self.user {
-			let found = match mappings.binary_search_by(|mapping| {
-				if mapping.end <= ip {
-					std::cmp::Ordering::Less
-				} else if mapping.start > ip {
-					std::cmp::Ordering::Greater
-				} else {
-					std::cmp::Ordering::Equal
-				}
-			}) {
-				Ok(i) => {
-					let mapping = &mappings[i];
+			let found = match mapped(&mappings, ip) {
+				Some(mapping) => {
 					let shown = shown(&mapping.path);
 					let object = objects.entry(&mapping.path).or_insert_with(|| {
 						mapping
@@ -102,7 +93,7 @@ impl Samples {
 					};
 					Function { name, object: shown }
 				}
-				Err(_) => function("[unmapped]", ""),
+				None => function("[unmapped]", ""),
 			};
 			*cycles.entry(found).or_default() += weight;
 		}
@@ -126,17 +117,23 @@ fn function(name: &str, object: &str) -> Function {
 
 /// An executable mapping of a process, as `/proc/<pid>/maps` lists it.
 #[derive(Debug, PartialEq)]
-struct Mapping {
-	start: u64,
-	end: u64,
+pub(crate) struct Mapping {
+	pub start: u64,
+	pub end: u64,
 	/// Where in its file it starts.
-	offset: u64,
+	pub offset: u64,
 	/// Its file, or what the kernel calls an anonymous one, such as `[vdso]`.
-	path: String,
+	pub path: String,
+}
+
+/// The mapping of `mappings`, sorted by address, that holds `ip`.
+pub(crate) fn mapped(mappings: &[Mapping], ip: u64) -> Option<&Mapping> {
+	let i = mappings.partition_point(|mapping| mapping.end <= ip);
+	mappings.get(i).filter(|mapping| mapping.start <= ip)
 }
 
 /// The executable mappings `/proc/<pid>/maps` lists, by address.
-fn mappings(maps: &str) -> Result<Vec<Mapping>, String> {
+pub(crate) fn mappings(maps: &str) -> Result<Vec<Mapping>, String> {
 	let mut mappings = Vec::new();
 	for line in maps.lines() {
 		let malformed = || format!("/proc/<pid>/maps listed {line:?}");
@@ -179,18 +176,21 @@ fn shown(path: &str) -> String {
 }
 
 /// An ELF file, its symbols and debug info, and where each of its loaded segments lies in it.
-struct Object {
+pub(crate) struct Object {
 	loader: addr2line::Loader,
 	/// Each loaded segment's offset and size in the file, and its address.
 	segments: Vec<(u64, u64, u64)>,
+	/// Each function symbol's address, size, and name, by address: the symbol table's, or without
+	/// one, the dynamic symbols'.
+	symbols: Vec<(u64, u64, String)>,
 	/// Whether it holds neither a symbol table nor debug info.
 	bare: bool,
 }
 
 impl Object {
 	/// The ELF file at `path`, or none when it cannot be read as one, whose samples then name no function.
-	fn load(path: &str) -> Option<Self> {
-		use object::{Object as _, ObjectSegment as _};
+	pub(crate) fn load(path: &str) -> Option<Self> {
+		use object::{Object as _, ObjectSegment as _, ObjectSymbol as _};
 		let data = std::fs::read(path).ok()?;
 		let file = object::File::parse(&*data).ok()?;
 		let segments = file
@@ -201,22 +201,62 @@ impl Object {
 			})
 			.collect();
 		let bare = file.symbol_table().is_none() && !file.has_debug_symbols();
+		let table = if file.symbol_table().is_some() {
+			file.symbols()
+		} else {
+			file.dynamic_symbols()
+		};
+		let mut symbols: Vec<(u64, u64, String)> = table
+			.filter(|symbol| symbol.kind() == object::SymbolKind::Text && symbol.size() > 0)
+			.filter_map(|symbol| Some((symbol.address(), symbol.size(), symbol.name().ok()?.to_owned())))
+			.collect();
+		symbols.sort();
 		Some(Self {
 			loader: addr2line::Loader::new(path).ok()?,
 			segments,
+			symbols,
 			bare,
 		})
+	}
+
+	/// The address `offset` in the file loads at.
+	fn address(&self, offset: u64) -> Option<u64> {
+		let &(start, _, address) = self
+			.segments
+			.iter()
+			.find(|&&(start, size, _)| (start..start + size).contains(&offset))?;
+		Some(offset - start + address)
+	}
+
+	/// Every function at `offset` in the file, demangled: each frame inlined there, innermost
+	/// first, then the symbol whose bytes hold it, which a function with neither debug info nor a
+	/// symbol of its own, such as one of a stripped library's internal ones, lacks.
+	pub(crate) fn names(&self, offset: u64) -> Vec<String> {
+		let Some(probe) = self.address(offset) else {
+			return Vec::new();
+		};
+		let mut names = Vec::new();
+		if let Ok(mut frames) = self.loader.find_frames(probe) {
+			while let Ok(Some(frame)) = frames.next() {
+				if let Some(name) = frame.function.as_ref().and_then(|name| name.raw_name().ok()) {
+					names.push(demangle(&name));
+				}
+			}
+		}
+		let i = self.symbols.partition_point(|&(address, _, _)| address <= probe);
+		if let Some((address, size, name)) = i.checked_sub(1).map(|i| &self.symbols[i])
+			&& probe < address + size
+		{
+			names.push(demangle(name));
+		}
+		names
 	}
 
 	/// The function at `offset` in the file: the innermost frame inlined there that is not Rust's
 	/// standard library's, whose generic helpers belong to the code that called them, or the
 	/// outermost when every frame is; else the symbol there.
 	fn function(&self, offset: u64) -> Option<String> {
-		let &(start, _, address) = self
-			.segments
-			.iter()
-			.find(|&&(start, size, _)| (start..start + size).contains(&offset))?;
-		let probe = offset - start + address;
+		let probe = self.address(offset)?;
 		if let Ok(mut frames) = self.loader.find_frames(probe) {
 			let mut outermost = None;
 			while let Ok(Some(frame)) = frames.next() {
@@ -250,7 +290,7 @@ fn standard(path: &str) -> bool {
 
 /// A Rust symbol's path without its hash, or any other name without the version a shared
 /// library's dynamic symbol carries, such as `pthread_create@@GLIBC_2.34`.
-fn demangle(name: &str) -> String {
+pub(crate) fn demangle(name: &str) -> String {
 	let name = name.split('@').next().unwrap_or(name);
 	rustc_demangle::try_demangle(name).map_or_else(|_| name.to_owned(), |name| format!("{name:#}"))
 }
@@ -315,7 +355,7 @@ pub fn report(profile: &Profile) -> serde_json::Value {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{Ring, arm};
+pub use linux::{Ring, arm, hand};
 
 #[cfg(test)]
 mod tests {
@@ -491,36 +531,52 @@ mod linux {
 	/// The most descriptors one message hands over, well under the kernel's 253.
 	const CHUNK: usize = 64;
 
-	/// Has `command` open `sampling`'s event on each of `cpus` just before it `exec`s, where the
-	/// target holds none of them, and hand each to swole: what receives them once it has run.
+	/// Has `command` open a profile's sampling event on each of `cpus` just before it `exec`s, where
+	/// the target holds none of them, and hand each to swole: what receives them once it has run.
 	pub fn arm(command: &mut std::process::Command, sampling: &Sampling, cpus: &[usize]) -> Result<Armed, String> {
+		let sampling = sampling.clone();
+		hand(command, cpus, 1, move |cpu, fds| {
+			fds[0] = sampling.open(cpu)?;
+			Ok(())
+		})
+	}
+
+	/// Has `command` open `per` events on each of `cpus` with `open`, which fills one CPU's
+	/// descriptors, just before it `exec`s, where the target holds none of them, and hand each to
+	/// swole, a CPU's in order: what receives them once it has run. `open` runs between fork and
+	/// exec, so it makes system calls alone, and opens each event closed on exec.
+	pub fn hand(
+		command: &mut std::process::Command,
+		cpus: &[usize],
+		per: usize,
+		open: impl Fn(i32, &mut [i32]) -> std::io::Result<()> + Send + Sync + 'static,
+	) -> Result<Armed, String> {
 		use std::os::unix::process::CommandExt;
+		assert!((1..=CHUNK).contains(&per), "a message hands over a CPU's events at once");
 		let mut pair = [0i32; 2];
 		// SAFETY: `pair` holds the two descriptors the call writes.
 		if unsafe { socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair.as_mut_ptr()) } != 0 {
 			return Err(format!(
-				"cannot open a socket to hand sampling events over: {}",
+				"cannot open a socket to hand perf events over: {}",
 				std::io::Error::last_os_error()
 			));
 		}
 		// SAFETY: the kernel returned two new descriptors, which nothing else owns.
 		let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
 		let sender = theirs.as_raw_fd();
-		let sampling = sampling.clone();
 		let cpus: Vec<i32> = cpus.iter().map(|&cpu| cpu as i32).collect();
-		let count = cpus.len();
+		let count = cpus.len() * per;
 		// Built before the fork, which the child only writes into.
 		let mut control = vec![0u64; space(CHUNK) / 8];
 		let mut fds = vec![0i32; CHUNK];
 		// SAFETY: between fork and exec it makes only system calls, into buffers built before.
 		unsafe {
 			command.pre_exec(move || {
-				for chunk in cpus.chunks(CHUNK) {
-					for (fd, &cpu) in fds.iter_mut().zip(chunk) {
-						// Closed on exec, so only swole's copy outlives it.
-						*fd = sampling.open(cpu)?;
+				for chunk in cpus.chunks(CHUNK / per) {
+					for (fds, &cpu) in fds.chunks_mut(per).zip(chunk) {
+						open(cpu, fds)?;
 					}
-					send(sender, &fds[..chunk.len()], &mut control)?;
+					send(sender, &fds[..chunk.len() * per], &mut control)?;
 				}
 				Ok(())
 			});
@@ -575,9 +631,15 @@ mod linux {
 	}
 
 	impl Armed {
-		/// The ring buffer of each event the process `pid`, now started, handed over, whose samples
-		/// alone each keeps.
+		/// The ring buffer of each sampling event the process `pid`, now started, handed over,
+		/// whose samples alone each keeps.
 		pub fn rings(self, pid: u32) -> Result<Rings, String> {
+			let rings = self.receive()?.into_iter().map(Ring::map).collect::<Result<_, _>>()?;
+			Ok(Rings { rings, pid })
+		}
+
+		/// Every event the process, now started, handed over, in the order it opened them.
+		pub fn receive(self) -> Result<Vec<OwnedFd>, String> {
 			let Self { socket, sender, count } = self;
 			drop(sender);
 			let mut fds = Vec::with_capacity(count);
@@ -602,24 +664,24 @@ mod linux {
 				let received = unsafe { recvmsg(socket.as_raw_fd(), &mut message, MSG_CMSG_CLOEXEC) };
 				if received < 0 {
 					return Err(format!(
-						"cannot receive the sampling events: {}",
+						"cannot receive the perf events: {}",
 						std::io::Error::last_os_error()
 					));
 				}
 				if received == 0 {
 					return Err(format!(
-						"the benchmark handed over {} of its {count} sampling events",
+						"the benchmark handed over {} of its {count} perf events",
 						fds.len()
 					));
 				}
 				if message.flags & MSG_CTRUNC != 0 {
-					return Err("the benchmark handed over more sampling events than asked".to_owned());
+					return Err("the benchmark handed over more perf events than asked".to_owned());
 				}
 				let buffer = control.as_ptr().cast::<u8>();
 				// SAFETY: the kernel wrote one header of this kind and its descriptors, as sent.
 				let header = unsafe { buffer.cast::<CmsgHdr>().read() };
 				if message.controllen < HEADER || header.level != SOL_SOCKET || header.kind != SCM_RIGHTS {
-					return Err("the benchmark handed over no sampling events".to_owned());
+					return Err("the benchmark handed over no perf events".to_owned());
 				}
 				for i in 0..(header.len - HEADER) / 4 {
 					// SAFETY: as above; each is a new descriptor, which nothing else owns.
@@ -627,8 +689,7 @@ mod linux {
 					fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
 				}
 			}
-			let rings = fds.into_iter().map(Ring::map).collect::<Result<_, _>>()?;
-			Ok(Rings { rings, pid })
+			Ok(fds)
 		}
 	}
 
@@ -652,7 +713,7 @@ mod linux {
 
 	/// A sampling event's ring buffer, mapped: a header page, then the data the kernel writes.
 	pub struct Ring {
-		_fd: OwnedFd,
+		fd: OwnedFd,
 		base: *mut u8,
 		len: usize,
 		/// Where the data starts past the header, and its size.
@@ -721,12 +782,17 @@ mod linux {
 				(offset, size)
 			};
 			Ok(Self {
-				_fd: fd,
+				fd,
 				base,
 				len,
 				offset,
 				size,
 			})
+		}
+
+		/// The event whose ring buffer it is.
+		pub fn fd(&self) -> &OwnedFd {
+			&self.fd
 		}
 
 		/// The kernel's `u64` at `at` in the header page.
@@ -738,25 +804,7 @@ mod linux {
 
 		/// Adds every record of the process `pid` since the last drain to `samples`, and frees its room.
 		fn drain(&mut self, pid: u32, samples: &mut Samples) -> Result<(), String> {
-			let head = self.word(DATA_HEAD).load(Ordering::Acquire);
-			let mut tail = self.word(DATA_TAIL).load(Ordering::Relaxed);
-			// Without room for another record, the kernel dropped what came next, and says so only
-			// in a record it writes once there is room again, which may never come. It keeps a
-			// byte of the ring free, so a record fits only in less than the rest.
-			if head - tail >= (self.size - MOST_RECORD) as u64 {
-				samples.filled += 1;
-			}
-			while tail < head {
-				let header = self.copy(tail, 8);
-				let kind = u32::from_ne_bytes(header[0..4].try_into().expect("4 bytes"));
-				let misc = u16::from_ne_bytes(header[4..6].try_into().expect("2 bytes"));
-				let size = u16::from_ne_bytes(header[6..8].try_into().expect("2 bytes")) as u64;
-				if size < 8 || tail + size > head {
-					return Err(format!(
-						"a sampling ring buffer holds a record of {size} bytes, which no kernel writes"
-					));
-				}
-				let record = self.copy(tail, size as usize);
+			let filled = self.records(MOST_RECORD, |kind, misc, record| {
 				let field = |at: usize| {
 					record
 						.get(at..at + 8)
@@ -773,8 +821,7 @@ mod linux {
 						let task = u32::from_ne_bytes(record[16..20].try_into().expect("4 bytes"));
 						// Another process's, which ran on one of the CPUs meanwhile.
 						if task != pid {
-							tail += size;
-							continue;
+							return Ok(());
 						}
 						if misc & PERF_RECORD_MISC_CPUMODE_MASK == PERF_RECORD_MISC_USER {
 							*samples.user.entry(ip).or_default() += period;
@@ -788,10 +835,44 @@ mod linux {
 					PERF_RECORD_THROTTLE => samples.throttled += 1,
 					_ => {}
 				}
+				Ok(())
+			})?;
+			if filled {
+				samples.filled += 1;
+			}
+			Ok(())
+		}
+
+		/// Hands `each` every record since the last drain, its kind, its header's `misc`, and its
+		/// bytes, the header's among them, then frees their room; and says whether the ring had too
+		/// little left for a record of `most` bytes, the largest its events write, so the kernel may
+		/// have dropped what came next unsaid.
+		pub fn records(
+			&mut self,
+			most: usize,
+			mut each: impl FnMut(u32, u16, &[u8]) -> Result<(), String>,
+		) -> Result<bool, String> {
+			let head = self.word(DATA_HEAD).load(Ordering::Acquire);
+			let mut tail = self.word(DATA_TAIL).load(Ordering::Relaxed);
+			// Without room for another record, the kernel dropped what came next, and says so only
+			// in a record it writes once there is room again, which may never come. It keeps a
+			// byte of the ring free, so a record fits only in less than the rest.
+			let filled = head - tail >= (self.size - most) as u64;
+			while tail < head {
+				let header = self.copy(tail, 8);
+				let kind = u32::from_ne_bytes(header[0..4].try_into().expect("4 bytes"));
+				let misc = u16::from_ne_bytes(header[4..6].try_into().expect("2 bytes"));
+				let size = u16::from_ne_bytes(header[6..8].try_into().expect("2 bytes")) as u64;
+				if size < 8 || tail + size > head {
+					return Err(format!(
+						"a perf ring buffer holds a record of {size} bytes, which no kernel writes"
+					));
+				}
+				each(kind, misc, &self.copy(tail, size as usize))?;
 				tail += size;
 			}
 			self.word(DATA_TAIL).store(tail, Ordering::Release);
-			Ok(())
+			Ok(filled)
 		}
 
 		/// `len` bytes of data from `at`, which may wrap around the data's end.

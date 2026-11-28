@@ -46,6 +46,11 @@ mod heap;
 mod metrics;
 #[cfg_attr(
 	not(target_os = "linux"),
+	allow(dead_code, reason = "elsewhere it only says the host traces nothing")
+)]
+mod offcpu;
+#[cfg_attr(
+	not(target_os = "linux"),
 	allow(dead_code, reason = "elsewhere it only says the host has no perf counters")
 )]
 mod perf;

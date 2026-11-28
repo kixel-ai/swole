@@ -67,6 +67,12 @@ const PROFILED: Duration = Duration::from_millis(250);
 /// steps between calls take far longer than the calls.
 const PROFILE_WALL: Duration = Duration::from_secs(2);
 
+/// How much of its calls' time a trace of one side records: some hundred samples of a slice.
+const TRACED: Duration = Duration::from_millis(100);
+
+/// How long a trace of one side may take in all, before its calls fill [`TRACED`].
+const TRACE_WALL: Duration = Duration::from_secs(1);
+
 /// Times the working tree's benchmarks, or with `base` each beside the base's, with what each
 /// used and every counter the host allows, prints them, and writes them to `--out` and `--report`
 /// when given.
@@ -96,6 +102,19 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 			perf::PERIOD
 		);
 	}
+	// What traces where each benchmark's threads wait off the CPU.
+	let tracing = match crate::offcpu::Tracing::probe() {
+		Ok(tracing) => {
+			eprintln!(
+				"swole: tracing each benchmark's context switches and futex calls, for where its threads wait off the CPU"
+			);
+			Some(tracing)
+		}
+		Err(why) => {
+			eprintln!("swole: no off-CPU waits, since {why}");
+			None
+		}
+	};
 	// Whether the counters count the kernel too, when there are counters, for the note on threads.
 	let kernel = perf.map(|perf| perf.kernel);
 	// Both timed and counting passes run under the preload built to count threads alone when perf
@@ -415,6 +434,16 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				}
 				if let Some(used) = &used[i] {
 					measures.extend(used.iter().cloned());
+				}
+				// On the CPUs the times took, while the run still holds them.
+				if let (Some(tracing), Some(cpus)) = (&tracing, cpus.as_deref()) {
+					let how = Tracing {
+						tracing,
+						cpus,
+						preload: preload.as_deref(),
+						iterations,
+					};
+					measures.extend(trace(job, how, &dir.join(side.name()).join("trace"))?);
 				}
 				// What derives from the side's time and counts, per what each of its calls processes.
 				if let (Some(throughput), Some(time)) = (declared[i], [timed.base(), timed.head()][i]) {
@@ -790,6 +819,96 @@ fn profile(job: &Job, how: Profiling, dir: &Path) -> Result<Option<(String, crat
 	{
 		let _ = (job, how, dir);
 		unreachable!("sampling is Linux's")
+	}
+}
+
+/// How a benchmark's trace runs.
+#[derive(Clone, Copy)]
+struct Tracing<'a> {
+	tracing: &'a crate::offcpu::Tracing,
+	/// The CPUs its times took, which it traces on.
+	cpus: &'a [usize],
+	/// The library its process runs under, as a timed one does.
+	preload: Option<&'a Path>,
+	/// The iterations each of its samples takes, as each timed one did, at most.
+	iterations: u64,
+}
+
+/// Where `job`'s benchmark's threads wait off the CPU, as `how` says, its output under `dir`: a
+/// timed process of its own records its threads' context switches and futex calls while its clock
+/// runs, so the records take neither the time's nor the counters' place. A call's share of each
+/// wait, or none when its harness is too old to trace, or the benchmark times itself, whose calls
+/// may hold waits its time leaves out.
+fn trace(job: &Job, how: Tracing, dir: &Path) -> Result<Vec<Measure>, String> {
+	#[cfg(target_os = "linux")]
+	{
+		let mut command = Process::command(job, Some(how.cpus), how.preload)?;
+		command.env(PROFILE, "1");
+		let tracing = how.tracing.clone();
+		let armed = crate::profile::hand(
+			&mut command,
+			how.cpus,
+			crate::offcpu::Tracing::EVENTS,
+			move |cpu, fds| tracing.open(cpu, fds),
+		)?;
+		let mut process = Process::start(&job.label, command, dir)?;
+		let mut rings = crate::offcpu::Rings::new(how.tracing, armed.receive()?, process.child.id())?;
+		match process.profiles.take().as_deref() {
+			None => {
+				process.finish()?;
+				eprintln!(
+					"swole: {}'s swole harness is too old to trace, so it has no off-CPU waits",
+					job.label
+				);
+				return Ok(Vec::new());
+			}
+			Some("own") => {
+				process.finish()?;
+				eprintln!(
+					"swole: {} times itself, so its calls could hold waits its time leaves out, and it has no off-CPU waits",
+					job.label
+				);
+				return Ok(Vec::new());
+			}
+			Some(_) => {}
+		}
+		// A sample to warm up, as timing's calibration does, which the trace drops with setup's.
+		process.sample(how.iterations)?;
+		drop(rings.drain()?);
+		let started = Instant::now();
+		let mut timed = Duration::ZERO;
+		let mut iterations = how.iterations;
+		let mut samples = Vec::new();
+		while timed < TRACED && started.elapsed() < TRACE_WALL {
+			let sample = process.sample(iterations)?;
+			let drained = rings.drain()?;
+			// A record dropped would leave a wait open, or never open one, so a sample whose ring
+			// filled counts nothing. A ring holds every process's records on its CPU, so another's
+			// burst fills one too. A sample of fewer calls fits, and one of a single call is retried.
+			if drained.filled > 0 {
+				iterations = (iterations / 2).max(1);
+				continue;
+			}
+			timed += Duration::from_nanos(sample.nanos);
+			samples.push((drained.waits(), iterations));
+		}
+		if samples.is_empty() {
+			process.finish()?;
+			return Err(format!(
+				"{}: every sample of its trace filled a ring buffer, with its own calls' context switches and futex calls or other processes' on its CPUs",
+				job.label
+			));
+		}
+		let path = format!("/proc/{}/maps", process.child.id());
+		let maps = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
+		process.finish()?;
+		let locks = crate::offcpu::locks(samples.iter().flat_map(|(waits, _)| waits.sites()), &maps)?;
+		Ok(crate::offcpu::measures(&samples, &locks))
+	}
+	#[cfg(not(target_os = "linux"))]
+	{
+		let _ = (job, how, dir);
+		unreachable!("tracing is Linux's")
 	}
 }
 

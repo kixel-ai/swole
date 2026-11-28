@@ -1447,42 +1447,49 @@ pub fn cpus(list: &str) -> Result<Vec<usize>, String> {
 	Ok(cpus)
 }
 
-/// `perf_event_attr`'s first 64 bytes, `PERF_ATTR_SIZE_VER0`, all a count or a profile needs.
+/// `perf_event_attr`'s first 96 bytes, `PERF_ATTR_SIZE_VER3`, all a count, a profile, or a trace
+/// needs.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Attr {
-	kind: u32,
-	size: u32,
-	config: u64,
-	sample_period: u64,
-	sample_type: u64,
-	read_format: u64,
-	flags: u64,
-	wakeup_events: u32,
-	bp_type: u32,
-	config1: u64,
+	pub kind: u32,
+	pub size: u32,
+	pub config: u64,
+	pub sample_period: u64,
+	pub sample_type: u64,
+	pub read_format: u64,
+	pub flags: u64,
+	pub wakeup_events: u32,
+	pub bp_type: u32,
+	pub config1: u64,
+	pub config2: u64,
+	pub branch_sample_type: u64,
+	pub sample_regs_user: u64,
+	/// How many bytes of the user stack each sample copies, from its stack pointer.
+	pub sample_stack_user: u32,
+	pub clockid: i32,
 }
 
 const PERF_TYPE_HARDWARE: u32 = 0;
-const PERF_TYPE_SOFTWARE: u32 = 1;
+pub(crate) const PERF_TYPE_SOFTWARE: u32 = 1;
 const PERF_TYPE_HW_CACHE: u32 = 3;
 /// Where a hardware event's config names the PMU on a host with several.
 const PERF_PMU_TYPE_SHIFT: u32 = 32;
 const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1;
 const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 2;
-const DISABLED: u64 = 1 << 0;
+pub(crate) const DISABLED: u64 = 1 << 0;
 /// `inherit`: every thread and child the task starts from then on counts a copy of the event.
-const INHERIT_THREADS: u64 = 1 << 1;
+pub(crate) const INHERIT_THREADS: u64 = 1 << 1;
 const EXCLUDE_USER: u64 = 1 << 4;
-const EXCLUDE_KERNEL: u64 = 1 << 5;
-const EXCLUDE_HV: u64 = 1 << 6;
+pub(crate) const EXCLUDE_KERNEL: u64 = 1 << 5;
+pub(crate) const EXCLUDE_HV: u64 = 1 << 6;
 /// `precise_ip` 2, the `:pp` of `cycles:pp`: each sample's instruction pointer is the instruction's
 /// own, as AMD's IBS and Intel's PEBS take it, not one some cycles past it.
 const PRECISE: u64 = 2 << 15;
 /// The instruction pointer of each sample, its process and thread, and the period it stands for.
-const PERF_SAMPLE_IP: u64 = 1 << 0;
-const PERF_SAMPLE_TID: u64 = 1 << 1;
-const PERF_SAMPLE_PERIOD: u64 = 1 << 8;
+pub(crate) const PERF_SAMPLE_IP: u64 = 1 << 0;
+pub(crate) const PERF_SAMPLE_TID: u64 = 1 << 1;
+pub(crate) const PERF_SAMPLE_PERIOD: u64 = 1 << 8;
 
 #[cfg(target_os = "linux")]
 mod sys {
@@ -1494,6 +1501,8 @@ mod sys {
 	pub const AT_SECURE: u64 = 23;
 	pub const PR_CAP_AMBIENT: i32 = 47;
 	pub const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
+	/// `PERF_EVENT_IOC_SET_OUTPUT`: write an event's records to another's ring buffer.
+	pub const PERF_EVENT_IOC_SET_OUTPUT: u64 = 0x2405;
 	#[cfg(target_arch = "x86_64")]
 	pub const PROT_READ: i32 = 1;
 	#[cfg(target_arch = "x86_64")]
@@ -1570,6 +1579,52 @@ fn open(attr: &Attr, group: i32, flags: u64) -> std::io::Result<i32> {
 			"swole opens perf counters on x86_64 and aarch64",
 		))
 	}
+}
+
+/// Opens `attr` on `cpu` whole, owned by the calling thread, which starts and stops it with the rest
+/// of its events, closed on exec. It makes system calls alone, as between fork and exec.
+#[cfg(target_os = "linux")]
+pub(crate) fn traced(attr: &Attr, cpu: i32) -> std::io::Result<i32> {
+	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+	{
+		// SAFETY: `attr` is a `perf_event_attr` of the size it states, read during the call.
+		let fd = unsafe {
+			syscall(
+				SYS_PERF_EVENT_OPEN,
+				attr as *const Attr,
+				-1i32,
+				cpu,
+				-1i32,
+				PERF_FLAG_FD_CLOEXEC,
+			)
+		};
+		if fd < 0 {
+			return Err(std::io::Error::last_os_error());
+		}
+		Ok(fd as i32)
+	}
+	#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+	{
+		let _ = (attr, cpu);
+		Err(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			"swole traces on x86_64 and aarch64",
+		))
+	}
+}
+
+/// Has the event `fd` write its records to the ring buffer of `output`, an event of the same CPU
+/// whose ring buffer is mapped.
+#[cfg(target_os = "linux")]
+pub(crate) fn redirect(fd: &impl std::os::fd::AsRawFd, output: &impl std::os::fd::AsRawFd) -> Result<(), String> {
+	// SAFETY: both are perf event descriptors; the request takes the other one.
+	if unsafe { ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_SET_OUTPUT, output.as_raw_fd()) } != 0 {
+		return Err(format!(
+			"cannot have a perf event write to another's ring buffer: {}",
+			std::io::Error::last_os_error()
+		));
+	}
+	Ok(())
 }
 
 /// Opens `events` as one group on the calling thread, counts a loop with them, and says whether
