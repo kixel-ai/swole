@@ -381,6 +381,8 @@ impl Tracing {
 					}
 					_ => None,
 				};
+				// The harness toggles the events from the process's main thread, so another thread's
+				// prctl, as one naming itself as it starts, marks no window.
 				let event = if id == self.enter {
 					let command = field(self.op)?;
 					let op = command & !FUTEX_FLAGS;
@@ -392,9 +394,9 @@ impl Tracing {
 					}))
 				} else if id == self.exit {
 					Event::Exit
-				} else if id == self.prctl && field(self.option)? == STOP {
+				} else if id == self.prctl && tid == pid && field(self.option)? == STOP {
 					Event::Stop
-				} else if id == self.prctled {
+				} else if id == self.prctled && tid == pid {
 					Event::Start
 				} else {
 					return Ok(Parsed::Other);
@@ -454,13 +456,12 @@ fn account(records: &[Record]) -> Waits {
 	}
 	let mut waits = Waits::default();
 	let mut threads: HashMap<u32, Thread> = HashMap::new();
-	// Whether a window is open, and the thread that stopped the last, which starts the next. The
-	// harness's start returns once every CPU's events are on, but its stop reaches the other CPUs
-	// after it begins: what they record past it is outside the window.
-	let (mut open, mut harness) = (false, None);
+	// Whether a window is open. The harness's start returns once every CPU's events are on, but its
+	// stop reaches the other CPUs after it begins: what they record past it is outside the window.
+	let mut open = false;
 	for record in records {
 		match record.event {
-			Event::Start if !open && harness.is_none_or(|tid| tid == record.tid) => open = true,
+			Event::Start if !open => open = true,
 			Event::Stop if open => {
 				// An exiting thread may still block as it tears down, after its exit's record, and
 				// counts like any other: its last switch out, reaped by then, names no thread.
@@ -471,7 +472,7 @@ fn account(records: &[Record]) -> Waits {
 				}
 				threads.clear();
 				waits.windows += 1;
-				(open, harness) = (false, Some(record.tid));
+				open = false;
 			}
 			_ if !open => {}
 			Event::Start | Event::Stop => {}
@@ -851,11 +852,9 @@ mod tests {
 			// The benchmark's own prctl opens nothing.
 			record(800, 1, Event::Start),
 			record(1000, 1, Event::Stop),
-			// A switch another CPU recorded before the stop reached it, and its prctl, are outside
-			// any window.
+			// A switch another CPU recorded before the stop reached it is outside any window.
 			record(1010, 2, Event::In),
 			record(1020, 2, out),
-			record(1030, 2, Event::Start),
 			// The next window: the thread's switch back in, and its return, close nothing.
 			record(1900, 1, Event::Start),
 			record(2000, 2, Event::In),
@@ -980,6 +979,11 @@ mod tests {
 	/// A sample of the tracepoint `id`, of thread 7 of process 5 at `time`, with `args` after the
 	/// syscall's number, and `stack` copied from the user stack.
 	fn sample(id: u16, time: u64, args: &[u64], stack: Option<u64>) -> Vec<u8> {
+		sample_of(7, id, time, args, stack)
+	}
+
+	/// [`sample`], of thread `tid`.
+	fn sample_of(tid: u32, id: u16, time: u64, args: &[u64], stack: Option<u64>) -> Vec<u8> {
 		let mut raw = vec![0u8; 16];
 		raw[0..2].copy_from_slice(&id.to_ne_bytes());
 		for arg in args {
@@ -992,7 +996,7 @@ mod tests {
 		let mut record = vec![0u8; 8];
 		record.extend(0xabcu64.to_ne_bytes());
 		record.extend(5u32.to_ne_bytes());
-		record.extend(7u32.to_ne_bytes());
+		record.extend(tid.to_ne_bytes());
 		record.extend(time.to_ne_bytes());
 		record.extend((raw.len() as u32).to_ne_bytes());
 		record.extend(raw);
@@ -1047,19 +1051,37 @@ mod tests {
 			parse(PERF_RECORD_SAMPLE, 0, &sample(498, 13, &[0], Some(0x55))),
 			at(13, 7, Event::Exit)
 		);
-		// The harness stopping its events closes a window; another prctl does nothing.
+		// The harness's main thread stopping its events closes a window; another prctl does
+		// nothing, nor does another thread's stop.
 		assert_eq!(
-			parse(PERF_RECORD_SAMPLE, 0, &sample(199, 14, &[31, 0, 0, 0, 0], Some(1))),
-			at(14, 7, Event::Stop)
+			parse(
+				PERF_RECORD_SAMPLE,
+				0,
+				&sample_of(5, 199, 14, &[31, 0, 0, 0, 0], Some(1))
+			),
+			at(14, 5, Event::Stop)
 		);
 		assert_eq!(
-			parse(PERF_RECORD_SAMPLE, 0, &sample(199, 15, &[32, 0, 0, 0, 0], Some(1))),
+			parse(
+				PERF_RECORD_SAMPLE,
+				0,
+				&sample_of(5, 199, 15, &[32, 0, 0, 0, 0], Some(1))
+			),
 			Parsed::Other
 		);
-		// Any prctl's return may open one, as the harness's starting them does.
+		assert_eq!(
+			parse(PERF_RECORD_SAMPLE, 0, &sample(199, 14, &[31, 0, 0, 0, 0], Some(1))),
+			Parsed::Other
+		);
+		// Any of the main thread's prctls may open one as it returns, as the harness's starting
+		// them does, but no other thread's, as one naming itself while the events start.
+		assert_eq!(
+			parse(PERF_RECORD_SAMPLE, 0, &sample_of(5, 200, 16, &[0], Some(1))),
+			at(16, 5, Event::Start)
+		);
 		assert_eq!(
 			parse(PERF_RECORD_SAMPLE, 0, &sample(200, 16, &[0], Some(1))),
-			at(16, 7, Event::Start)
+			Parsed::Other
 		);
 		// A wakeup names the thread it woke, whatever process woke it.
 		assert_eq!(

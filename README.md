@@ -369,7 +369,9 @@ what each job gets; the native [fingerprint](#fingerprints) holds all of it.
   [wait off the CPU](#off-cpu-waits), printing that it does or why it cannot.
 - No tier, above 2 without `CAP_PERFMON`, or a host without a PMU, or one that does not let a
   process read its counters in user space (`cap_user_rdpmc` off), or a CPU other than x86_64, or
-  macOS: `bench` times by wall clock with rusage alone, saying why, and `quick` fails.
+  macOS: `bench` times by wall clock with rusage alone, saying why, and `quick` fails. A Linux
+  host without a usable PMU still traces off-CPU waits where it grants the L-1 row's privilege
+  and tracefs.
 
 A PMU holds only so many counters at once, and the kernel shares more among them by turns,
 scaling each up by a guess. swole never lets it: the probe packs the counters into groups that
