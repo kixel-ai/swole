@@ -9,6 +9,7 @@ mod cargo;
 mod compare;
 #[cfg(target_os = "linux")]
 mod cores;
+mod diagnose;
 /// No host but Linux leases a core.
 #[cfg(not(target_os = "linux"))]
 mod cores {
@@ -87,6 +88,8 @@ options:
                        for quick, instructions and estimated cycles for sim, time for bench,
                        each beside its heap allocations (sim and quick: no <base>)
   --report <file>      write every measure of every benchmark as JSON
+  --all-details        print every measure of every benchmark, not only those that moved in a
+                       suite of more than 10 (without a base, none moved)
   --jobs <n>           how many jobs run at once (default: every core, or for quick, every core
                        of the PMU it counts on; bench runs one at a time)
   --build <command>    a shell command that builds the programs, run first (sim, with --program)
@@ -172,7 +175,12 @@ fn cli(args: &[String]) -> Result<(), String> {
 				}
 				print!("{}", metrics::table(&counts));
 				print!("{}", threaded(&counts));
-				print!("{}", metrics::details(None, &counts.shown(), &BTreeMap::new()));
+				let pick = metrics::Pick::new(
+					counts.counts.keys().map(|name| (name.clone(), false)).collect(),
+					options.all_details,
+					false,
+				);
+				print!("{}", metrics::details(None, &counts.shown(), &BTreeMap::new(), &pick));
 				if let Some(out) = &options.out {
 					metrics::File::counts(&counts, &counter)?.write(out)?;
 					eprintln!("swole: wrote {}", out.display());
@@ -236,6 +244,8 @@ pub(crate) struct Options {
 	allow_missing: bool,
 	out: Option<PathBuf>,
 	report: Option<PathBuf>,
+	/// Whether stdout prints every measure of every benchmark, rather than only what moved.
+	all_details: bool,
 	/// How many jobs run at once, when given.
 	jobs: Option<usize>,
 	build: Option<String>,
@@ -250,6 +260,7 @@ impl Options {
 			allow_missing: false,
 			out: None,
 			report: None,
+			all_details: false,
 			jobs: None,
 			build: None,
 			programs: Vec::new(),
@@ -267,6 +278,7 @@ impl Options {
 				"--allow-missing" => options.allow_missing = true,
 				"--out" => options.out = Some(PathBuf::from(value()?)),
 				"--report" => options.report = Some(PathBuf::from(value()?)),
+				"--all-details" => options.all_details = true,
 				"--jobs" => {
 					let jobs = value()?;
 					options.jobs = Some(
@@ -412,7 +424,7 @@ impl Counts {
 	}
 
 	/// Every measure of the benchmark `name`, when counted: its details, or its headline count
-	/// alone, then what derives from them and what each call processes.
+	/// alone, then what derives from them per what each call processes, and the ratios they give.
 	pub(crate) fn measures(&self, name: &str) -> Option<Vec<Measure>> {
 		let count = *self.counts.get(name)?;
 		let mut measures = match self.details.get(name) {
@@ -426,6 +438,8 @@ impl Counts {
 		if let Some(throughput) = self.throughput.get(name) {
 			measures.extend(throughput.measures(&measures));
 		}
+		let derived = diagnose::derive(&measures, false);
+		measures.extend(derived);
 		Some(measures)
 	}
 
@@ -862,22 +876,27 @@ pub(crate) fn measure(dir: &Path, options: &Options, counter: &Counter, strict: 
 
 /// Each measure of a benchmark's `samples`, the median of its values, with their least and most
 /// when it took more than one, so a measure the scheduler moves reads as its spread, not one draw.
+/// A ratio of counters a sample may leave undefined, as a top-down split when neither of its pair
+/// counted, is kept only when every sample defines it; any other measure every sample must have.
 pub(crate) fn median(samples: &[Vec<Measure>]) -> Result<Vec<Measure>, String> {
-	let Some((first, rest)) = samples.split_first() else {
-		return Ok(Vec::new());
-	};
+	let mut names: Vec<(&str, &'static str)> = Vec::new();
+	for measure in samples.iter().flatten() {
+		if !names.iter().any(|(name, _)| *name == measure.name) {
+			names.push((&measure.name, measure.unit));
+		}
+	}
 	let mut measures = Vec::new();
-	for measure in first {
-		let mut values = vec![measure.value];
-		for details in rest {
-			let other = details
-				.iter()
-				.find(|other| other.name == measure.name)
-				.ok_or_else(|| format!("a sample lacks its {}", measure.name))?;
-			values.push(other.value);
+	'measure: for (name, unit) in names {
+		let mut values = Vec::with_capacity(samples.len());
+		for details in samples {
+			match details.iter().find(|other| other.name == name) {
+				Some(other) => values.push(other.value),
+				None if perf::derived(name) => continue 'measure,
+				None => return Err(format!("a sample lacks its {name}")),
+			}
 		}
 		values.sort_by(f64::total_cmp);
-		let mut median = Measure::new(&measure.name, values[values.len() / 2], measure.unit);
+		let mut median = Measure::new(name, values[values.len() / 2], unit);
 		if values.len() > 1 {
 			median.spread = Some((values[0], values[values.len() - 1]));
 		}
@@ -1403,6 +1422,31 @@ fn one(job: &Job, dir: &Path, preload: &Path) -> Measured {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_ratio_some_sample_leaves_undefined_drops_but_a_counter_fails() {
+		let split = |value| Measure::new("topdown branch mispredicts", value, "%");
+		let counter = |value| Measure::new("cycles:u", value, "events");
+		// Whichever round counted no mispredict or restart, the split goes and the counter stays.
+		for samples in [
+			vec![
+				vec![counter(1.0)],
+				vec![counter(2.0), split(5.0)],
+				vec![counter(3.0), split(6.0)],
+			],
+			vec![
+				vec![counter(1.0), split(5.0)],
+				vec![counter(2.0)],
+				vec![counter(3.0), split(6.0)],
+			],
+		] {
+			let measures = median(&samples).unwrap();
+			assert_eq!(measures.len(), 1);
+			assert_eq!(measures[0].name, "cycles:u");
+			assert_eq!(measures[0].spread, Some((1.0, 3.0)));
+		}
+		assert!(median(&[vec![counter(1.0), split(5.0)], vec![split(6.0)]]).is_err());
+	}
 
 	#[test]
 	fn a_list_holds_one_name_a_line() {

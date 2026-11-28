@@ -1,7 +1,6 @@
 //! A base commit's counts against the working tree's, on this host, from one directory.
 
-use std::collections::BTreeSet;
-use std::fmt::Write;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -75,7 +74,7 @@ pub fn compare(base: &str, options: &Options, mode: Mode) -> Result<(), String> 
 		after.fingerprint = before.fingerprint.clone();
 		after.host = before.host.clone();
 	}
-	let rendered = table(&before, &after)?;
+	let (rendered, order) = table(&before, &after)?;
 	if mode == Mode::Quick {
 		eprintln!("swole: fingerprint {}", after.fingerprint);
 	}
@@ -84,15 +83,18 @@ pub fn compare(base: &str, options: &Options, mode: Mode) -> Result<(), String> 
 	threaded.threaded = before.threaded.union(&after.threaded).cloned().collect();
 	threaded.spread = before.spread.clone().into_iter().chain(after.spread.clone()).collect();
 	print!("{}", crate::threaded(&threaded));
+	// The functions behind each change follow the details, of the same benchmarks in their order.
+	let pick = metrics::Pick::new(order, options.all_details, true);
 	print!(
 		"{}",
 		metrics::details(
 			Some(&before.shown()),
 			&after.shown(),
-			&std::collections::BTreeMap::new()
+			&std::collections::BTreeMap::new(),
+			&pick,
 		)
 	);
-	print!("{}", crate::attribution::table(&before, &after));
+	print!("{}", crate::attribution::table(&before, &after, pick.names()));
 	if let Some(report) = &options.report {
 		metrics::report(&after, Some(&before), &counter, Some(&sha)).write(report)?;
 		eprintln!("swole: wrote {}", report.display());
@@ -685,10 +687,12 @@ fn output(args: &[&str], out: std::process::Output) -> Result<String, String> {
 		.map_err(|_| "git printed something not UTF-8".to_owned())
 }
 
-/// The change of each benchmark from `before` to `after`, a Markdown table, refusing counts
-/// from two environments, which do not compare. A count of several samples shows their least and
-/// most beside their median.
-fn table(before: &Counts, after: &Counts) -> Result<String, String> {
+/// The change of each benchmark from `before` to `after`, a Markdown table, refusing counts from
+/// two environments, which do not compare: the largest changes first, sim's estimated cycles
+/// among them, then each benchmark one side has, then those that held, with the likely cause
+/// beside each regression its measures explain, and a count of several samples their least and
+/// most beside their median. And each benchmark in the table's order, with whether it moved.
+fn table(before: &Counts, after: &Counts) -> Result<(String, Vec<(String, bool)>), String> {
 	if before.fingerprint != after.fingerprint {
 		return Err(format!(
 			"the base counted under fingerprint {} and the working tree under {}: their counts do not compare",
@@ -696,7 +700,6 @@ fn table(before: &Counts, after: &Counts) -> Result<String, String> {
 		));
 	}
 	let names: BTreeSet<&String> = before.counts.keys().chain(after.counts.keys()).collect();
-	let mut out = String::from("| benchmark | base | head | change |\n|---|---:|---:|---:|\n");
 	let cell = |counts: &Counts, name: &str| match (counts.counts.get(name), counts.spread.get(name)) {
 		(Some(count), Some((least, most))) => format!("{}{count} ({least} to {most})", metrics::SAMPLED),
 		(Some(count), None) => count.to_string(),
@@ -710,30 +713,73 @@ fn table(before: &Counts, after: &Counts) -> Result<String, String> {
 			.map(|&(least, most)| (least as f64, most as f64));
 		(count as f64, spread)
 	};
+	let (base, head) = (before.shown(), after.shown());
+	let mut rows = Vec::new();
 	for name in names {
-		let change = match (before.counts.get(name), after.counts.get(name)) {
-			(Some(&b), Some(&a)) => metrics::change(side(before, b, name), side(after, a, name)),
-			(None, Some(_)) => "added".to_owned(),
-			(Some(_), None) => "removed".to_owned(),
+		let (rank, impact, change, cause) = match (before.counts.get(name), after.counts.get(name)) {
+			(Some(&b), Some(&a)) => {
+				let (b_side, a_side) = (side(before, b, name), side(after, a, name));
+				// Sim's estimated cycles are a headline too, which a change of misses alone moves.
+				let cycles = |side: &BTreeMap<String, Vec<crate::Measure>>| {
+					side.get(name)?
+						.iter()
+						.find(|m| m.name == crate::callgrind::ESTIMATED)
+						.map(|m| (m.value, m.spread))
+				};
+				let headlines = std::iter::once((b_side, a_side)).chain(cycles(&base).zip(cycles(&head)));
+				// Two sampled counts move only past their spreads; one sampled beside an exact one
+				// has no verdict, so it moved without regressing.
+				// A moved benchmark sorts by the headlines that moved, a held one by every one.
+				let (mut moved, mut regressed) = (false, false);
+				let (mut moved_impact, mut held_impact) = (0.0f64, 0.0f64);
+				// The estimated cycles' change, whenever they moved, beside the instructions', since either
+				// can be what regressed.
+				let mut change = metrics::change(b_side, a_side);
+				for (index, ((b, b_spread), (a, a_spread))) in headlines.enumerate() {
+					let shifted = a != b && a_spread.zip(b_spread).is_none_or(|(a, b)| !metrics::overlap(b, a));
+					if index > 0 && shifted {
+						change += &format!(", cycles {}", metrics::change((b, b_spread), (a, a_spread)));
+					}
+					moved |= shifted;
+					regressed |= shifted && a_spread.is_some() == b_spread.is_some() && a > b;
+					let impact = if b == 0.0 { f64::INFINITY } else { (a - b).abs() / b };
+					held_impact = held_impact.max(impact);
+					if shifted {
+						moved_impact = moved_impact.max(impact);
+					}
+				}
+				let impact = if moved { moved_impact } else { held_impact };
+				let cause = regressed
+					.then(|| crate::diagnose::cause(base.get(name)?, head.get(name)?, None))
+					.flatten();
+				(
+					if moved {
+						metrics::Rank::Moved
+					} else {
+						metrics::Rank::Held
+					},
+					impact,
+					change,
+					cause,
+				)
+			}
+			(None, Some(_)) => (metrics::Rank::OneSide, 0.0, "added".to_owned(), None),
+			(Some(_), None) => (metrics::Rank::OneSide, 0.0, "removed".to_owned(), None),
 			(None, None) => unreachable!("every name comes from one side"),
 		};
-		// A `|` in a name would split its cell.
-		let shown = name.replace('|', "\\|");
-		writeln!(
-			out,
-			"| {shown} | {} | {} | {change} |",
-			cell(before, name),
-			cell(after, name)
-		)
-		.expect("a String takes every write");
+		rows.push(metrics::Row {
+			name,
+			cells: format!("{} | {} | {change}", cell(before, name), cell(after, name)),
+			rank,
+			impact,
+			cause,
+		});
 	}
-	Ok(out)
+	Ok(metrics::headline("base | head | change", "---:|---:|---:", rows))
 }
 
 #[cfg(test)]
 mod tests {
-	use std::collections::BTreeMap;
-
 	use super::*;
 
 	#[test]
@@ -822,15 +868,103 @@ mod tests {
 
 	#[test]
 	fn tables_each_change_and_each_benchmark_one_side_has() {
-		let before = counts("f", &[("a", 200), ("gone", 5)]);
-		let mut after = counts("f", &[("a", 150), ("new", 7)]);
+		let before = counts("f", &[("a", 200), ("gone", 5), ("held", 9), ("small", 100)]);
+		let mut after = counts("f", &[("a", 150), ("new", 7), ("held", 9), ("small", 101)]);
 		after.spread.insert("a".to_owned(), (140, 160));
+		// The largest change first, then each benchmark one side has, then those that held.
+		let (table, order) = table(&before, &after).unwrap();
 		assert_eq!(
-			table(&before, &after).unwrap(),
+			table,
 			"| benchmark | base | head | change |\n|---|---:|---:|---:|\n\
-			 | a | 200 | ~150 (140 to 160) | ~-25.00% |\n| gone | 5 | - | removed |\n\
-			 | new | - | 7 | added |\n"
+			 | a | 200 | ~150 (140 to 160) | ~-25.00% |\n| small | 100 | 101 | +1.00% |\n\
+			 | gone | 5 | - | removed |\n| new | - | 7 | added |\n| held | 9 | 9 | +0.00% |\n"
 		);
+		assert_eq!(
+			order,
+			[
+				("a", true),
+				("small", true),
+				("gone", true),
+				("new", true),
+				("held", false)
+			]
+			.map(|(name, moved)| (name.to_owned(), moved))
+		);
+	}
+
+	#[test]
+	fn sorts_a_moved_benchmark_by_the_headlines_that_moved() {
+		let cycles = |value: f64| vec![crate::Measure::new(crate::callgrind::ESTIMATED, value, "cycles")];
+		let mut before = counts("f", &[("wide", 1000), ("small", 100)]);
+		let mut after = counts("f", &[("wide", 1500), ("small", 120)]);
+		// Its instructions held within their spreads, so only its cycles' 5% moved it.
+		before.spread.insert("wide".to_owned(), (900, 2000));
+		after.spread.insert("wide".to_owned(), (1400, 2500));
+		before.details.insert("wide".to_owned(), cycles(10_000.0));
+		after.details.insert("wide".to_owned(), cycles(10_500.0));
+		let (_, order) = table(&before, &after).unwrap();
+		assert_eq!(
+			order,
+			[("small", true), ("wide", true)].map(|(name, moved)| (name.to_owned(), moved))
+		);
+	}
+
+	#[test]
+	fn shows_the_cycles_change_beside_moved_instructions() {
+		let cycles = |value: f64| vec![crate::Measure::new(crate::callgrind::ESTIMATED, value, "cycles")];
+		let mut before = counts("f", &[("a", 10_000)]);
+		let mut after = counts("f", &[("a", 9_900)]);
+		before.details.insert("a".to_owned(), cycles(10_000.0));
+		after.details.insert("a".to_owned(), cycles(15_000.0));
+		let (rendered, _) = table(&before, &after).unwrap();
+		assert!(rendered.contains("| -1.00%, cycles +50.00% |"), "{rendered}");
+	}
+
+	#[test]
+	fn names_the_likely_cause_beside_a_regression() {
+		let measures = |misses: f64| {
+			vec![
+				crate::Measure::new("instructions", 10_000.0, "instructions"),
+				crate::Measure::new("LL instruction misses", 0.0, "events"),
+				crate::Measure::new("LL read misses", misses, "events"),
+				crate::Measure::new("LL write misses", 0.0, "events"),
+			]
+		};
+		let mut before = counts("f", &[("a", 10_000), ("b", 10_000)]);
+		let mut after = counts("f", &[("a", 10_100), ("b", 9_000)]);
+		before.details.insert("a".to_owned(), measures(1.0));
+		after.details.insert("a".to_owned(), measures(20.0));
+		before.details.insert("b".to_owned(), measures(1.0));
+		after.details.insert("b".to_owned(), measures(20.0));
+		let (rendered, _) = table(&before, &after).unwrap();
+		// An improvement names none, even where its misses grew.
+		assert_eq!(
+			rendered,
+			"| benchmark | base | head | change | likely cause |\n|---|---:|---:|---:|---|\n\
+			 | b | 10000 | 9000 | -10.00% |  |\n\
+			 | a | 10000 | 10100 | +1.00% | memory-bound (LL MPKI 0.100 → 2.000) |\n"
+		);
+		// Sim's estimated cycles are a headline too: misses alone move them, and the benchmark.
+		let cycles = |misses: f64| {
+			let mut measures = measures(misses);
+			measures.push(crate::Measure::new(
+				crate::callgrind::ESTIMATED,
+				10_000.0 + 100.0 * misses,
+				"cycles",
+			));
+			measures
+		};
+		let mut before = counts("f", &[("c", 10_000)]);
+		let mut after = counts("f", &[("c", 10_000)]);
+		before.details.insert("c".to_owned(), cycles(1.0));
+		after.details.insert("c".to_owned(), cycles(20.0));
+		let (rendered, order) = table(&before, &after).unwrap();
+		assert!(
+			rendered
+				.ends_with("| c | 10000 | 10000 | +0.00%, cycles +18.81% | memory-bound (LL MPKI 0.100 → 2.000) |\n"),
+			"{rendered}"
+		);
+		assert_eq!(order, [("c".to_owned(), true)]);
 	}
 
 	#[test]
