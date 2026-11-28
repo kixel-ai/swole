@@ -42,6 +42,12 @@ const PROFILE: &str = "SWOLE_PROFILE";
 /// `own`, each run of a benchmark that times itself; one too old to prints nothing.
 const PROFILES: &str = "swole profiles ";
 
+/// What a timed run prints, alone on a line, after `PROFILES`, when the harness's clock starts
+/// before a profile's events and stops after them, so all they record lies within its time; one
+/// too old to prints nothing. A line of its own, so a runner that predates it still reads
+/// `PROFILES` alone.
+const INSIDE: &str = "swole profile inside clock";
+
 /// How many times a benchmark that times itself runs its work, as a loop takes it:
 /// `for _ in iterations`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,6 +208,10 @@ fn run() -> Result<(), String> {
 		let mut first = throughput.unwrap_or_default();
 		if profiled {
 			first.push_str(&format!("\n{PROFILES}{}", sampler.window()));
+			// A benchmark that times itself has no clock of the harness's to start them inside.
+			if !sampler.self_timed() {
+				first.push_str(&format!("\n{INSIDE}"));
+			}
 		}
 		return serve(&name, sampler, first, std::io::stdin().lock(), std::io::stdout(), true);
 	}

@@ -163,10 +163,12 @@ benchmark's own output on stdout around its samples.
 With `SWOLE_PROFILE=1` beside `SWOLE_TIME`, on Linux, it starts every perf event swole opened on
 the process with a `prctl` just after its clock starts and stops them just before the clock stops,
 around the calls of a sample or each call its clock brackets alone, so all they record lies within
-the time, or around each call of a benchmark that times itself, and prints `swole profiles <window>` before its first sample, so swole samples or
-traces what a time holds and nothing else, and knows a harness too old to. The window says what its clock
-brackets: `sample`, a sample's calls at once, `call`, each call alone, or `own`, each run of a
-benchmark that times itself, whose calls may hold work its time leaves out.
+the time, or around each call of a benchmark that times itself. Before its first sample it prints
+`swole profiles <window>`, then, unless the benchmark times itself, `swole profile inside clock`
+alone on a line, so swole samples or traces what a time holds and nothing else, and knows a
+harness too old to: one that toggled the events outside its clock has no trace. The window says
+what its clock brackets: `sample`, a sample's calls at once, `call`, each call alone, or `own`,
+each run of a benchmark that times itself, whose calls may hold work its time leaves out.
 
 Under Valgrind with `--instr-atstart=no`, as swole runs it, each case's count is
 everything its call executes on every thread, between `ZERO_STATS` and

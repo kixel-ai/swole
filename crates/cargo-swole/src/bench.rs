@@ -60,14 +60,21 @@ const PROFILE: &str = "SWOLE_PROFILE";
 /// benchmark that times itself.
 const PROFILES: &str = "swole profiles ";
 
-/// How much of its calls' time a profile of one side samples, some 5,000 samples' worth.
+/// What a harness target prints, alone on a line, when its clock starts before a profile's events
+/// and stops after them, so all they record lies within its time. One too old to toggles them
+/// outside its clock, so a wait there would count in its trace but not its time.
+const INSIDE: &str = "swole profile inside clock";
+
+/// How much of its calls' time a profile of one side samples, some 5,000 samples' worth, as
+/// timing's median call took: the profile's own clock would add the toggles' syscalls.
 const PROFILED: Duration = Duration::from_millis(250);
 
 /// How long a profile of one side may take in all, before its calls fill [`PROFILED`], as when
 /// steps between calls take far longer than the calls.
 const PROFILE_WALL: Duration = Duration::from_secs(2);
 
-/// How much of its calls' time a trace of one side records: some hundred samples of a slice.
+/// How much of its calls' time a trace of one side records, as timing's median call took: some
+/// hundred samples of a slice.
 const TRACED: Duration = Duration::from_millis(100);
 
 /// How long a trace of one side may take in all, before its calls fill [`TRACED`].
@@ -439,12 +446,15 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					measures.extend(used.iter().cloned());
 				}
 				// On the CPUs the times took, while the run still holds them.
-				if let (Some(tracing), Some(cpus)) = (&tracing, cpus.as_deref()) {
+				if let (Some(tracing), Some(cpus), Some(call)) =
+					(&tracing, cpus.as_deref(), [timed.base(), timed.head()][i])
+				{
 					let how = Tracing {
 						tracing,
 						cpus,
 						preload: preload.as_deref(),
 						iterations,
+						call,
 					};
 					measures.extend(trace(job, how, &dir.join(side.name()).join("trace"))?);
 				}
@@ -475,8 +485,8 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 				continue;
 			}
 			// On the CPUs the times took, while the run still holds them.
-			if let (Some(sampling), Some(perf), Some(preload), Some(base), Some(head)) =
-				(&sampling, perf, &preload, &base, &head)
+			if let (Some(sampling), Some(perf), Some(preload), Some(base), Some(head), Some(calls)) =
+				(&sampling, perf, &preload, &base, &head, timed.base().zip(timed.head()))
 				&& timed.changed()
 			{
 				let how = Profiling {
@@ -484,11 +494,15 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					cpus: cpus.as_deref().unwrap_or(&perf.pmu.cpus),
 					preload,
 					iterations,
+					call: calls.0,
 				};
 				// The head's only once the base's can be compared with it.
 				if let Some(base) = profile(base, how, &dir.join("base").join("profile"))?
-					&& let Some(head) = profile(head, how, &dir.join("head").join("profile"))?
-				{
+					&& let Some(head) = profile(
+						head,
+						Profiling { call: calls.1, ..how },
+						&dir.join("head").join("profile"),
+					)? {
 					// The `prctl`s that start and stop sampling around each call put kernel cycles
 					// of their own in each, which a side sampling a whole sample at once lacks.
 					if base.0 == head.0 {
@@ -725,6 +739,11 @@ fn too_old(label: &str) -> String {
 	)
 }
 
+/// What `calls` took, at timing's median of `call` nanoseconds each.
+fn timed(calls: u64, call: f64) -> Duration {
+	Duration::from_secs_f64(calls as f64 * call / 1e9)
+}
+
 /// How a benchmark's profile runs.
 #[derive(Clone, Copy)]
 struct Profiling<'a> {
@@ -735,6 +754,8 @@ struct Profiling<'a> {
 	preload: &'a Path,
 	/// The iterations each of its samples takes, as each timed one did.
 	iterations: u64,
+	/// The side's median nanoseconds a call, as timing found.
+	call: f64,
 }
 
 /// Profiles `job`'s benchmark as `how` says, its output under `dir`, in a timed process of its own
@@ -769,11 +790,10 @@ fn profile(job: &Job, how: Profiling, dir: &Path) -> Result<Option<(String, crat
 		process.sample(how.iterations)?;
 		drop(rings.drain()?);
 		let started = Instant::now();
-		let mut timed = Duration::ZERO;
 		let mut calls = 0;
 		let mut samples = crate::profile::Samples::default();
-		while timed < PROFILED && started.elapsed() < PROFILE_WALL {
-			timed += Duration::from_nanos(process.sample(how.iterations)?.nanos);
+		while timed(calls, how.call) < PROFILED && started.elapsed() < PROFILE_WALL {
+			process.sample(how.iterations)?;
 			calls += how.iterations;
 			samples.add(rings.drain()?);
 		}
@@ -799,7 +819,7 @@ fn profile(job: &Job, how: Profiling, dir: &Path) -> Result<Option<(String, crat
 			return Err(format!(
 				"{}: profiling its calls for {} ms took no samples",
 				job.label,
-				timed.as_millis()
+				timed(calls, how.call).as_millis()
 			));
 		}
 		let profile = samples.resolve(&maps, calls)?;
@@ -835,6 +855,8 @@ struct Tracing<'a> {
 	preload: Option<&'a Path>,
 	/// The iterations a timed sample took, which none of its samples takes more of.
 	iterations: u64,
+	/// The side's median nanoseconds a call, as timing found.
+	call: f64,
 }
 
 /// Where `job`'s benchmark's threads wait off the CPU, as `how` says, its output under `dir`: a
@@ -857,6 +879,15 @@ fn trace(job: &Job, how: Tracing, dir: &Path) -> Result<Vec<Measure>, String> {
 		let mut process = Process::start(&job.label, command, dir)?;
 		let mut rings = crate::offcpu::Rings::new(how.tracing, armed.receive()?, process.child.id())?;
 		match process.profiles.take().as_deref() {
+			Some(window) if window != "own" && !process.inside => {
+				process.finish()?;
+				eprintln!(
+					"swole: {}'s swole harness is too old to trace inside its clock, so a wait outside its time \
+					 could count and it has no off-CPU waits",
+					job.label
+				);
+				return Ok(Vec::new());
+			}
 			None => {
 				process.finish()?;
 				eprintln!(
@@ -878,16 +909,16 @@ fn trace(job: &Job, how: Tracing, dir: &Path) -> Result<Vec<Measure>, String> {
 		// A call to warm up, which the trace drops with setup's.
 		rings.during(|| process.sample(1))?.0?;
 		let started = Instant::now();
-		let mut timed = Duration::ZERO;
+		let mut calls = 0;
 		// Samples grow from one call, doubling while one takes under a slice of the wall clock, to
 		// as many calls as a timed one: the rings take every process's records on their CPUs, and
 		// a clock that brackets each call alone starts and stops the events on each CPU each call.
 		let (mut iterations, mut most) = (1, how.iterations);
 		let mut samples = Vec::new();
-		while timed < TRACED && started.elapsed() < TRACE_WALL {
+		while timed(calls, how.call) < TRACED && started.elapsed() < TRACE_WALL {
 			let begun = Instant::now();
 			let (sample, drained) = rings.during(|| process.sample(iterations))?;
-			let sample = sample?;
+			sample?;
 			// A record dropped would leave a wait open, or never open one, so a sample whose events
 			// lost any counts nothing, and no later sample takes as many calls.
 			if drained.lost > 0 {
@@ -895,7 +926,7 @@ fn trace(job: &Job, how: Tracing, dir: &Path) -> Result<Vec<Measure>, String> {
 				iterations = most;
 				continue;
 			}
-			timed += Duration::from_nanos(sample.nanos);
+			calls += iterations;
 			samples.push((drained.waits(), iterations));
 			if begun.elapsed() < TRACE_SLICE {
 				iterations = (iterations * 2).min(most);
@@ -1498,6 +1529,8 @@ struct Process {
 	/// What its clock brackets, when its harness starts and stops a profile's sampling with it,
 	/// as it says once.
 	profiles: Option<String>,
+	/// Whether its harness starts and stops a profile's events inside its clock, as it says once.
+	inside: bool,
 }
 
 impl Process {
@@ -1553,6 +1586,7 @@ impl Process {
 			own_timer: false,
 			inherits: false,
 			profiles: None,
+			inside: false,
 		};
 		let first = process.sample(1)?;
 		process.threaded |= first.threaded;
@@ -1729,6 +1763,10 @@ impl Side for Process {
 				.and_then(|rest| rest.strip_suffix(b"\n"))
 			{
 				self.profiles = Some(String::from_utf8_lossy(window).into_owned());
+				continue;
+			}
+			if line.strip_suffix(b"\n") == Some(INSIDE.as_bytes()) {
+				self.inside = true;
 				continue;
 			}
 			self.log
