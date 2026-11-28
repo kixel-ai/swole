@@ -529,8 +529,9 @@ of calls, recording each of the process's context switches and, by the kernel's
 alone, since events every thread inherited would cost each thread the benchmark starts hundreds of
 microseconds, and the harness starts and stops them with its clock, so setup, steps, and inputs
 built between calls wait in none of them, and neither the times nor the counters share a process
-with it. The window opens as the harness's start of the events returns and closes as its stop
-begins, so what other CPUs record before the stop reaches them stays out. Each wait a thread began
+with it. The harness starts the events just after its clock starts and stops them just before the
+clock stops, and the window opens as its start of the events returns and closes as its stop begins,
+so it lies within the time, and what other CPUs record before the stop reaches them stays out. Each wait a thread began
 inside it counts until it ends or the window does, so a worker parked since before the window,
 waiting for work that never came, counts nothing, nor does a thread's last switch as it exits:
 
@@ -548,9 +549,10 @@ waiting for work that never came, counts nothing, nor does a thread's last switc
 
 Each is sampled, between the least and most one sample's calls waited. Samples grow from one call,
 doubling while one takes under 10 ms, to as many calls as a timed sample, and swole reads the rings
-while a sample runs, each time one holds 64 KiB. A sample a ring filled in before swole read it,
-which a burst of other processes' records on its CPUs can do as well as its own, counts nothing,
-and no later sample takes as many calls; a side left with no sample fails the run. A
+while a sample runs, each time one holds 64 KiB. A sample whose events lost a record, as each
+counts, which a burst of other processes' records on its CPUs can cause as well as its own, counts
+nothing, and no later sample takes as many calls; a side left with no sample fails the run. A
+trace counts its losses from Linux 6.0 on. A
 benchmark that times itself has none, since its calls may hold waits its time leaves out, as does a
 side whose harness predates profiling. A trace needs the host's tier L-1, as
 [Capabilities](#capabilities) says, and its tracepoints' IDs from tracefs, as

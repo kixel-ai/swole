@@ -888,9 +888,9 @@ fn trace(job: &Job, how: Tracing, dir: &Path) -> Result<Vec<Measure>, String> {
 			let begun = Instant::now();
 			let (sample, drained) = rings.during(|| process.sample(iterations))?;
 			let sample = sample?;
-			// A record dropped would leave a wait open, or never open one, so a sample whose ring
-			// filled before it was read counts nothing, and no later sample takes as many calls.
-			if drained.filled > 0 {
+			// A record dropped would leave a wait open, or never open one, so a sample whose events
+			// lost any counts nothing, and no later sample takes as many calls.
+			if drained.lost > 0 {
 				most = (iterations / 2).max(1);
 				iterations = most;
 				continue;
@@ -904,7 +904,7 @@ fn trace(job: &Job, how: Tracing, dir: &Path) -> Result<Vec<Measure>, String> {
 		if samples.is_empty() {
 			process.finish()?;
 			return Err(format!(
-				"{}: every sample of its trace filled a ring buffer, with its own calls' context switches and futex calls or other processes' on its CPUs",
+				"{}: every sample of its trace lost records its ring buffers had no room for, of its own calls' context switches and futex calls or other processes' on its CPUs",
 				job.label
 			));
 		}

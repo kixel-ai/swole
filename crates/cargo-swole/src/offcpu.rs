@@ -92,10 +92,9 @@ struct Record {
 #[derive(Debug, Default)]
 pub struct Drained {
 	records: Vec<Record>,
-	/// How many times a read found a ring full, so the kernel may have dropped records of the
-	/// window: the record it writes of what it dropped comes only once there is room again, maybe
-	/// in a later window, and says nothing of which.
-	pub filled: u64,
+	/// How many records the kernel dropped for want of room, by each event's own count, since the
+	/// record it writes of what it dropped may come in a later sample, or never.
+	pub lost: u64,
 }
 
 impl Drained {
@@ -172,6 +171,9 @@ impl Tracing {
 			.map(|fd| unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
 			.collect();
 		opened.map_err(|err| match err.raw_os_error() {
+			Some(EINVAL) => format!(
+				"cannot trace context switches and futex calls ({err}): Linux counts the records a trace loses from 6.0 on"
+			),
 			Some(EACCES | EPERM) => format!(
 				"tracing context switches and futex calls needs kernel.perf_event_paranoid at most -1 or CAP_PERFMON, \
 				 since it traces whole CPUs ({err})"
@@ -208,6 +210,7 @@ impl Tracing {
 		let base = Attr {
 			size: size_of::<Attr>() as u32,
 			sample_type: PERF_SAMPLE_TID | PERF_SAMPLE_TIME,
+			read_format: PERF_FORMAT_LOST,
 			flags,
 			clockid: CLOCK_MONOTONIC,
 			..Attr::default()
@@ -269,7 +272,8 @@ impl Tracing {
 				// The thread switched to or from, then the record's process and thread, the one
 				// switching, and its time, which every event's records end with.
 				let (task, tid, time) = (half(16)?, half(20)?, word(24)?);
-				if task != pid {
+				// A thread reaped before its last switch out has no ID left to name it by.
+				if task != pid || tid == u32::MAX {
 					return Ok(Parsed::Other);
 				}
 				let event = if misc & PERF_RECORD_MISC_SWITCH_OUT != 0 {
@@ -539,10 +543,12 @@ mod linux {
 	pub struct Rings {
 		rings: Vec<Ring>,
 		/// The events beside each ring's leader, open until the trace ends.
-		_events: Vec<std::os::fd::OwnedFd>,
+		events: Vec<std::os::fd::OwnedFd>,
 		tracing: Tracing,
 		/// The process whose threads it traces.
 		pid: u32,
+		/// The records its events had lost when last read.
+		lost: u64,
 	}
 
 	impl Rings {
@@ -561,9 +567,10 @@ mod linux {
 			}
 			Ok(Self {
 				rings,
-				_events: events,
+				events,
 				tracing: tracing.clone(),
 				pid,
+				lost: 0,
 			})
 		}
 
@@ -608,21 +615,44 @@ mod linux {
 				}
 				Ok(worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
 			})?;
+			let lost = self.lost()?;
+			drained.lost = lost - self.lost;
+			self.lost = lost;
 			drained.records.sort_by_key(|record| record.time);
 			Ok((out, drained))
+		}
+
+		/// How many records its events have lost in all.
+		fn lost(&self) -> Result<u64, String> {
+			let leaders = self.rings.iter().map(|ring| ring.fd());
+			let mut lost = 0;
+			for fd in leaders.chain(&self.events) {
+				// Its count, then what it lost.
+				let mut read = [0u64; 2];
+				// SAFETY: `read` holds the 16 bytes the call writes at most.
+				let got = unsafe { read_fd(fd.as_raw_fd(), read.as_mut_ptr().cast(), size_of_val(&read)) };
+				if got != size_of_val(&read) as isize {
+					return Err(format!(
+						"cannot read what a trace's event lost: {}",
+						std::io::Error::last_os_error()
+					));
+				}
+				lost += read[1];
+			}
+			Ok(lost)
 		}
 
 		/// Every record since the last read into `drained`.
 		fn read(&mut self, drained: &mut Drained) -> Result<(), String> {
 			for ring in &mut self.rings {
-				let filled = ring.records(MOST_RECORD, |kind, misc, record| {
+				// Each event counts what it lost, which says more than how full the ring was.
+				ring.records(MOST_RECORD, |kind, misc, record| {
 					match self.tracing.parse(kind, misc, record, self.pid)? {
 						Parsed::Record(record) => drained.records.push(record),
 						Parsed::Other => {}
 					}
 					Ok(())
 				})?;
-				drained.filled += u64::from(filled);
 			}
 			Ok(())
 		}
@@ -643,6 +673,8 @@ mod linux {
 
 	unsafe extern "C" {
 		fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+		#[link_name = "read"]
+		fn read_fd(fd: i32, buf: *mut u8, count: usize) -> isize;
 	}
 }
 
@@ -664,6 +696,9 @@ const PERF_SAMPLE_STACK_USER: u64 = 1 << 13;
 const CLOCK_MONOTONIC: i32 = 1;
 const EPERM: i32 = 1;
 const EACCES: i32 = 13;
+const EINVAL: i32 = 22;
+/// An event's read also says how many of its records the kernel dropped.
+const PERF_FORMAT_LOST: u64 = 1 << 4;
 const PERF_RECORD_EXIT: u32 = 4;
 const PERF_RECORD_SAMPLE: u32 = 9;
 /// A switch on a CPU a whole-CPU event watches.
@@ -959,6 +994,13 @@ mod tests {
 		);
 		// Another process's.
 		assert_eq!(parse(PERF_RECORD_SWITCH_CPU_WIDE, 0, &switch(6, 23)), Parsed::Other);
+		// A thread reaped before it switched out, which the kernel names by no thread.
+		let mut reaped = switch(5, 24);
+		reaped[20..24].copy_from_slice(&u32::MAX.to_ne_bytes());
+		assert_eq!(
+			parse(PERF_RECORD_SWITCH_CPU_WIDE, PERF_RECORD_MISC_SWITCH_OUT, &reaped),
+			Parsed::Other
+		);
 		assert!(tracing.parse(PERF_RECORD_SWITCH_CPU_WIDE, 0, &[0u8; 12], 5).is_err());
 	}
 }
