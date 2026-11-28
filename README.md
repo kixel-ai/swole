@@ -587,8 +587,9 @@ does, each where the run took what it divides, into the details table and `--rep
 - the branch miss rate, mispredicts over branches;
 - the kernel's share of the instructions, where tier L1 counts both rings, and under `bench` of
   the CPU time, from rusage;
-- under `bench`, `CPUs busy`: the process's average CPU occupancy, the CPU time it used, user and
-  system, over its samples' wall clock, as the harness measures both, sampled between the least
+- under `bench`, where one clock times each whole sample, `CPUs busy`: the process's average CPU
+  occupancy, the CPU time it used, user and system, over its samples' wall clock, as the harness
+  measures both, sampled between the least
   and most one sample was, since the scheduler moves it. Under one, the process was off the CPU,
   as on a lock or I/O, or when the host ran something else; over one, it ran threads in parallel,
   any of the process's beside the benchmark's own included;

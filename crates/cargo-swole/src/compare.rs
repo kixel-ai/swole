@@ -732,11 +732,12 @@ fn table(before: &Counts, after: &Counts) -> Result<(String, Vec<(String, bool)>
 				// A moved benchmark sorts by the headlines that moved, a held one by every one.
 				let (mut moved, mut regressed) = (false, false);
 				let (mut moved_impact, mut held_impact) = (0.0f64, 0.0f64);
-				// The estimated cycles' change, when they alone moved it, beside the instructions'.
+				// The estimated cycles' change, whenever they moved, beside the instructions', since either
+				// can be what regressed.
 				let mut change = metrics::change(b_side, a_side);
 				for (index, ((b, b_spread), (a, a_spread))) in headlines.enumerate() {
 					let shifted = a != b && a_spread.zip(b_spread).is_none_or(|(a, b)| !metrics::overlap(b, a));
-					if index > 0 && shifted && !moved {
+					if index > 0 && shifted {
 						change += &format!(", cycles {}", metrics::change((b, b_spread), (a, a_spread)));
 					}
 					moved |= shifted;
@@ -906,6 +907,17 @@ mod tests {
 			order,
 			[("small", true), ("wide", true)].map(|(name, moved)| (name.to_owned(), moved))
 		);
+	}
+
+	#[test]
+	fn shows_the_cycles_change_beside_moved_instructions() {
+		let cycles = |value: f64| vec![crate::Measure::new(crate::callgrind::ESTIMATED, value, "cycles")];
+		let mut before = counts("f", &[("a", 10_000)]);
+		let mut after = counts("f", &[("a", 9_900)]);
+		before.details.insert("a".to_owned(), cycles(10_000.0));
+		after.details.insert("a".to_owned(), cycles(15_000.0));
+		let (rendered, _) = table(&before, &after).unwrap();
+		assert!(rendered.contains("| -1.00%, cycles +50.00% |"), "{rendered}");
 	}
 
 	#[test]

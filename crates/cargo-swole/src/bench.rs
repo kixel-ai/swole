@@ -280,8 +280,8 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					base.finish()?;
 					head.finish()?;
 					let nanos: Vec<(u64, u64)> = pairs.iter().map(|(b, h)| (b.nanos, h.nanos)).collect();
-					let base_used = usage(pairs.iter().map(|(b, _)| b));
-					let head_used = usage(pairs.iter().map(|(_, h)| h));
+					let base_used = usage(pairs.iter().map(|(b, _)| b), iterations);
+					let head_used = usage(pairs.iter().map(|(_, h)| h), iterations);
 					let timed = Times::pairs(iterations, &nanos).map_err(|err| format!("{name}: {err}"))?;
 					(
 						timed,
@@ -317,7 +317,7 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					process.finish()?;
 					let nanos: Vec<u64> = samples.iter().map(|sample| sample.nanos).collect();
 					let timed = Times::alone(side, iterations, &nanos).map_err(|err| format!("{name}: {err}"))?;
-					let used = usage(samples.iter());
+					let used = usage(samples.iter(), iterations);
 					(
 						timed,
 						iterations,
@@ -413,10 +413,8 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					)? {
 					measures.extend(allocs);
 				}
-				if let Some((used, calls, busy)) = &used[i] {
-					measures.extend(used.measures(*calls * iterations));
-					// Over the harness's own wall clock, which none of swole's requests and replies add to.
-					measures.extend(busy.clone());
+				if let Some(used) = &used[i] {
+					measures.extend(used.iter().cloned());
 				}
 				// What derives from the side's time and counts, per what each of its calls processes.
 				if let (Some(throughput), Some(time)) = (declared[i], [timed.base(), timed.head()][i]) {
@@ -574,22 +572,42 @@ fn spread(
 	Ok(Some(spread))
 }
 
-/// What the process used over `samples`, in all, how many samples that took, and how busy it
-/// kept the CPUs, when its harness says what it used, and says over how long.
-fn usage<'a>(samples: impl Iterator<Item = &'a Sample>) -> Option<(perf::Usage, u64, Option<crate::Measure>)> {
+/// What the process used over `samples`, each a call's share of its sample's, user and system
+/// time sampled within the least and most one sample used, since the tick splits a sample's CPU
+/// time between them, and how busy it kept the CPUs, when its harness says what it used, and says
+/// over how long.
+fn usage<'a>(samples: impl Iterator<Item = &'a Sample>, iterations: u64) -> Option<Vec<Measure>> {
 	let mut total = perf::Usage::default();
 	let mut count = 0;
 	let mut windows = Some(Vec::new());
+	let (mut user, mut system) = ((u64::MAX, 0), (u64::MAX, 0));
 	for sample in samples {
 		let used = sample.usage?;
 		total.add(&used);
 		count += 1;
+		user = (user.0.min(used.user_ns), user.1.max(used.user_ns));
+		system = (system.0.min(used.system_ns), system.1.max(used.system_ns));
 		windows = windows.zip(sample.window).map(|(mut windows, window)| {
 			windows.push((used.user_ns + used.system_ns, window.as_nanos()));
 			windows
 		});
 	}
-	(count > 0).then(|| (total, count, windows.and_then(crate::diagnose::busy)))
+	if count == 0 {
+		return None;
+	}
+	let per = |ns: u64| ns as f64 / iterations as f64;
+	let mut measures = total.measures(count * iterations);
+	for measure in &mut measures {
+		let (least, most) = match measure.name.as_str() {
+			"user time" => user,
+			"system time" => system,
+			_ => continue,
+		};
+		measure.spread = Some((per(least), per(most)));
+	}
+	// Over the harness's own wall clock, which none of swole's requests and replies add to.
+	measures.extend(windows.and_then(crate::diagnose::busy));
+	Some(measures)
 }
 
 /// What counting a benchmark found.

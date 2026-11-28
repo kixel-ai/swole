@@ -155,8 +155,9 @@ each iteration count a line of stdin holds, printing its `swole throughput` line
 the first, and `swole sample <nanoseconds>` on a
 line of its own after each, until stdin ends; on 64-bit Unix, after a `swole rusage` line of what the process
 used over the sample: user and system CPU nanoseconds, peak resident bytes, minor and major page
-faults, and voluntary and involuntary context switches, and a `swole wall <nanoseconds>` line of
-the wall clock that covers. swole drives it so, and reads a
+faults, and voluntary and involuntary context switches, and, when one clock times the whole
+sample, with no step, setup, or drop between calls, a `swole wall <nanoseconds>` line of the wall
+clock that covers. swole drives it so, and reads a
 benchmark's own output on stdout around its samples.
 
 With `SWOLE_PROFILE=1` beside `SWOLE_TIME`, on Linux, it starts every perf event swole opened on
@@ -184,9 +185,10 @@ too old to watch says neither.
 
 With `SWOLE_COUNTERS` set to how many Linux perf counters swole opened on the process before it
 ran the target, as `<rdpmc>+<read>`, it starts them all after the case's setup and reads the
-first `<rdpmc>` in user space with `rdpmc` and the rest with `read()`, then reads them again after
-its call and stops them, so a count `rdpmc` reads holds no system call; one `read()` reads counts from
-the system call that starts it to the one that stops it, a little wider than the call. swole passes
+first `<rdpmc>` in user space with `rdpmc`, then reads those again after its call and stops them
+all, so a count `rdpmc` reads holds no system call. It reads each of the rest once with `read()`
+after the last call, which holds what it counted from each system call that started it to the one
+that stopped it, a little wider than the calls. swole passes
 its software counters, and every counter of a pass `rdpmc` cannot read, such as Intel's top-down
 metrics, as `read()`'s. It counts only under swole's preload, or its build that counts threads alone, whose thread count
 tells swole whether another thread, whose work the counters cannot see, ran beside a call. For
