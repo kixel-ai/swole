@@ -13,6 +13,8 @@ if ! grep -Eq '^ci([[:space:]]|:)' justfile 2>/dev/null; then
 	echo "pre-push: this checkout has no just ci recipe; merge the default branch to check pushes here" >&2
 	exit 0
 fi
+# A linked worktree's push hands the hook its GIT_DIR, which would send a test's scratch repository's git commands to this one.
+for var in $(git rev-parse --local-env-vars); do unset "$var"; done
 if [ -f flake.nix ]; then
 	exec nix develop --command just ci
 fi
