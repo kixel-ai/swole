@@ -272,13 +272,15 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					let mut cpus = first;
 					let (mut base, mut head) = spawn(cpus.as_deref())?;
 					if narrow(
-						&mut spreading,
+						spreading.as_ref(),
 						reservation.as_ref(),
 						&name,
 						widen || base.threaded || head.threaded,
 					) {
 						base.finish()?;
 						head.finish()?;
+						// Released once the wide processes have exited, so no other run times beside them.
+						spreading = None;
 						cpus = exclusive.clone();
 						(base, head) = spawn(cpus.as_deref())?;
 					}
@@ -315,8 +317,15 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					};
 					let mut cpus = first;
 					let mut process = Process::spawn(job, cpus.as_deref(), preload.as_deref(), &dir.join(side.name()))?;
-					if narrow(&mut spreading, reservation.as_ref(), &name, widen || process.threaded) {
+					if narrow(
+						spreading.as_ref(),
+						reservation.as_ref(),
+						&name,
+						widen || process.threaded,
+					) {
 						process.finish()?;
+						// Released once the wide process has exited, so no other run times beside it.
+						spreading = None;
 						cpus = exclusive.clone();
 						process = Process::spawn(job, cpus.as_deref(), preload.as_deref(), &dir.join(side.name()))?;
 					}
@@ -564,16 +573,16 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 /// scripts of the profile, such as `DEBUG`, as it is.
 const SYMBOLS: &[&str] = &["-Cdebuginfo=limited", "-Cstrip=none"];
 
-/// Whether `name`'s processes, started on `spreading`, narrow to the reserved CPU, releasing the
-/// other cores, since no other thread ran beside its first call; one that ran one keeps them, as
-/// one CPU would serialize its threads.
+/// Whether `name`'s processes, started on `spreading`, narrow to the reserved CPU, since no other
+/// thread ran beside its first call; one that ran one keeps the spread, as one CPU would serialize
+/// its threads.
 fn narrow(
-	spreading: &mut Option<crate::cores::Spread>,
+	spreading: Option<&crate::cores::Spread>,
 	reservation: Option<&crate::cores::Reservation>,
 	name: &str,
 	threaded: bool,
 ) -> bool {
-	let (Some(spread), Some(reservation)) = (spreading.as_ref(), reservation) else {
+	let (Some(spread), Some(reservation)) = (spreading, reservation) else {
 		return false;
 	};
 	if threaded {
@@ -585,7 +594,6 @@ fn narrow(
 		);
 		return false;
 	}
-	*spreading = None;
 	true
 }
 
