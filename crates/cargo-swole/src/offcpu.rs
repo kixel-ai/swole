@@ -26,8 +26,15 @@ const WAITS: [u64; 5] = [0, 6, 9, 11, 13];
 /// The futex operations that take a priority-inheriting lock, whoever calls them.
 const LOCKS: [u64; 2] = [6, 13];
 
+/// `FUTEX_PRIVATE_FLAG`, set on a futex only its own process's threads use.
+const FUTEX_PRIVATE: u64 = 128;
+
 /// `FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME`, which a futex operation's command leaves out.
-const FUTEX_FLAGS: u64 = 128 | 256;
+const FUTEX_FLAGS: u64 = FUTEX_PRIVATE | 256;
+
+/// The inode of the first PID namespace's `/proc/self/ns/pid`, which Linux fixes as
+/// `PROC_PID_INIT_INO`.
+const INIT_PID_NAMESPACE: &str = "pid:[4026531836]";
 
 /// `PR_TASK_PERF_EVENTS_DISABLE`, which the harness stops its events with as its clock stops.
 const STOP: u64 = 31;
@@ -55,12 +62,14 @@ pub struct Tracing {
 
 /// Where a futex wait was made: the instruction after its system call, the word atop the user
 /// stack there, which a generic wrapper such as libc's `syscall` leaves as its caller's return
-/// address, and whether its operation takes a priority-inheriting lock.
+/// address, whether its operation takes a priority-inheriting lock, and whether its futex is
+/// shared, which another process, on a CPU the trace does not watch, may wake unseen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Site {
 	ip: u64,
 	ret: Option<u64>,
 	pi: bool,
+	shared: bool,
 }
 
 /// What one record of a trace says a thread did.
@@ -121,6 +130,10 @@ pub struct Waits {
 	runnable: u64,
 	/// Asleep in a futex wait, of the blocked, by where it waited.
 	futex: BTreeMap<Site, u64>,
+	/// Asleep in a shared futex's wait, of the blocked, that no wakeup the trace saw ended: another
+	/// process may have woken it on a CPU the trace does not watch, so it may hold a wait for a
+	/// CPU, and is never a lock's.
+	unwoken: u64,
 }
 
 impl Waits {
@@ -136,10 +149,11 @@ impl Tracing {
 	#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 	pub fn probe() -> Result<Self, String> {
 		// A wakeup's record names the thread it woke by its ID in the first PID namespace, and a
-		// context switch's by its ID in swole's, which differ in a nested one.
-		let status = std::fs::read_to_string("/proc/self/status")
-			.map_err(|err| format!("cannot read /proc/self/status, for swole's PID namespace: {err}"))?;
-		if nested(&status)? {
+		// context switch's by its ID in swole's, which differ in a nested one. A container may mount
+		// a /proc of its own, whose status names the one ID it sees, but not hide its namespace.
+		let namespace = std::fs::read_link("/proc/self/ns/pid")
+			.map_err(|err| format!("cannot read /proc/self/ns/pid, for swole's PID namespace: {err}"))?;
+		if namespace.as_os_str() != INIT_PID_NAMESPACE {
 			return Err(
 				"swole runs in a nested PID namespace, as a container's, where a wakeup names a thread by an ID its \
 				 context switches do not"
@@ -363,11 +377,13 @@ impl Tracing {
 					_ => None,
 				};
 				let event = if id == self.enter {
-					let op = field(self.op)? & !FUTEX_FLAGS;
+					let command = field(self.op)?;
+					let op = command & !FUTEX_FLAGS;
 					Event::Enter(WAITS.contains(&op).then_some(Site {
 						ip,
 						ret,
 						pi: LOCKS.contains(&op),
+						shared: command & FUTEX_PRIVATE == 0,
 					}))
 				} else if id == self.exit {
 					Event::Exit
@@ -390,16 +406,6 @@ impl Tracing {
 enum Parsed {
 	Record(Record),
 	Other,
-}
-
-/// Whether the `/proc/<pid>/status` `status` names its process in more PID namespaces than the
-/// first.
-fn nested(status: &str) -> Result<bool, String> {
-	let ids = status
-		.lines()
-		.find_map(|line| line.strip_prefix("NSpid:"))
-		.ok_or("/proc/self/status names no NSpid, which Linux has printed since 4.1")?;
-	Ok(ids.split_whitespace().count() > 1)
 }
 
 /// Where the tracepoint `format` lays out `field`, in its record.
@@ -429,15 +435,18 @@ fn account(records: &[Record]) -> Waits {
 		/// Whether it exited, so its last switch out waits for nothing.
 		gone: bool,
 	}
-	fn close(waits: &mut Waits, (since, runnable, site): (u64, bool, Option<Site>), until: u64) {
+	/// Counts a wait from `since` until `until`, which a wakeup the trace saw ended if `woken`.
+	fn close(waits: &mut Waits, (since, runnable, site): (u64, bool, Option<Site>), until: u64, woken: bool) {
 		let span = until.saturating_sub(since);
 		if runnable {
 			waits.runnable += span;
 			return;
 		}
 		waits.blocked += span;
-		if let Some(site) = site {
-			*waits.futex.entry(site).or_default() += span;
+		match site {
+			Some(site) if site.shared && !woken => waits.unwoken += span,
+			Some(site) => *waits.futex.entry(site).or_default() += span,
+			None => {}
 		}
 	}
 	let mut waits = Waits::default();
@@ -452,7 +461,7 @@ fn account(records: &[Record]) -> Waits {
 			Event::Stop if open => {
 				for thread in threads.values_mut() {
 					if let Some(off) = thread.off.take() {
-						close(&mut waits, off, record.time);
+						close(&mut waits, off, record.time, false);
 					}
 				}
 				threads.clear();
@@ -466,7 +475,7 @@ fn account(records: &[Record]) -> Waits {
 				if let Some(thread) = threads.get_mut(&record.tid)
 					&& let Some(off @ (_, false, _)) = thread.off
 				{
-					close(&mut waits, off, record.time);
+					close(&mut waits, off, record.time, true);
 					thread.off = Some((record.time, true, None));
 				}
 			}
@@ -480,7 +489,7 @@ fn account(records: &[Record]) -> Waits {
 					}
 					Event::In => {
 						if let Some(off) = thread.off.take() {
-							close(&mut waits, off, record.time);
+							close(&mut waits, off, record.time, false);
 						}
 					}
 					Event::Enter(site) => thread.waiting = site,
@@ -507,7 +516,7 @@ pub fn measures(samples: &[(Waits, u64)], locks: &BTreeSet<Site>) -> Vec<Measure
 	let kinds: Vec<([u64; 4], u64)> = samples
 		.iter()
 		.map(|(waits, calls)| {
-			let futex = waits.futex.values().sum();
+			let futex = waits.futex.values().sum::<u64>() + waits.unwoken;
 			let lock = (waits.futex.iter())
 				.filter(|(site, _)| locks.contains(site))
 				.map(|(_, ns)| ns)
@@ -780,10 +789,12 @@ mod tests {
 		ip: 0x1000,
 		ret: Some(0x2000),
 		pi: false,
+		shared: false,
 	};
 
 	#[test]
 	fn splits_off_cpu_time_into_blocked_runnable_and_futex_waits() {
+		let shared = Site { shared: true, ..SITE };
 		let out = Event::Out { preempted: false };
 		let preempted = Event::Out { preempted: true };
 		let records = [
@@ -820,6 +831,14 @@ mod tests {
 			// A worker that exits leaves the CPU for good, waiting on nothing.
 			record(700, 3, Event::Gone),
 			record(710, 3, out),
+			// A shared futex's wait that no seen wakeup ended may hold another process's wakeup,
+			// unseen, and is never a lock's; one a seen wakeup ended is.
+			record(720, 4, Event::Enter(Some(shared))),
+			record(730, 4, out),
+			record(760, 4, Event::In),
+			record(770, 4, out),
+			record(775, 4, Event::Wake),
+			record(780, 4, Event::In),
 			// The benchmark's own prctl opens nothing.
 			record(800, 1, Event::Start),
 			record(1000, 1, Event::Stop),
@@ -839,9 +858,10 @@ mod tests {
 		assert_eq!(
 			account(&records),
 			Waits {
-				blocked: 50 + 80 + 10 + 350 + 10,
-				runnable: 20 + 5,
-				futex: BTreeMap::from([(SITE, 80 + 350)]),
+				blocked: 50 + 80 + 10 + 350 + 10 + 30 + 5,
+				runnable: 20 + 5 + 5,
+				futex: BTreeMap::from([(SITE, 80 + 350), (shared, 5)]),
+				unwoken: 30,
 			}
 		);
 		// A window left open, as a sample's last records before its stop leave one, closes nothing.
@@ -857,6 +877,7 @@ mod tests {
 					blocked: 400,
 					runnable: 0,
 					futex: BTreeMap::from([(SITE, 100), (lock, 200)]),
+					unwoken: 100,
 				},
 				2,
 			),
@@ -865,6 +886,7 @@ mod tests {
 					blocked: 800,
 					runnable: 40,
 					futex: BTreeMap::from([(lock, 600)]),
+					unwoken: 0,
 				},
 				2,
 			),
@@ -880,7 +902,7 @@ mod tests {
 			[
 				("blocked time", 150.0, (0.0, 400.0)),
 				("runnable time", 5.0, (0.0, 20.0)),
-				("futex wait time", 112.5, (0.0, 300.0)),
+				("futex wait time", 125.0, (0.0, 300.0)),
 				("lock wait time", 100.0, (0.0, 300.0)),
 			]
 		);
@@ -915,13 +937,6 @@ mod tests {
 		] {
 			assert!(!takes_lock(name), "{name}");
 		}
-	}
-
-	#[test]
-	fn knows_a_nested_pid_namespace() {
-		assert_eq!(nested("Name:\tswole\nNSpid:\t4242\nNSsid:\t1\n"), Ok(false));
-		assert_eq!(nested("NSpid:\t4242\t17\n"), Ok(true));
-		assert!(nested("Name:\tswole\n").is_err());
 	}
 
 	#[test]
@@ -994,7 +1009,8 @@ mod tests {
 				Event::Enter(Some(Site {
 					ip: 0xabc,
 					ret: Some(0x55),
-					pi: false
+					pi: false,
+					shared: false
 				}))
 			)
 		);
@@ -1010,7 +1026,8 @@ mod tests {
 				Event::Enter(Some(Site {
 					ip: 0xabc,
 					ret: None,
-					pi: true
+					pi: true,
+					shared: true
 				}))
 			)
 		);

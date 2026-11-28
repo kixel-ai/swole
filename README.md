@@ -549,7 +549,9 @@ waiting for work that never came, counts nothing, nor does a thread's last switc
   inlined there or holding it is std's `Mutex::lock_contended` or `RwLock`'s `read_contended` or
   `write_contended`, glibc's `lll_lock_wait` or a `pthread_mutex_*lock` or
   `pthread_rwlock_*(rd|wr)lock`, or the futex operation takes a priority-inheriting lock. A lock
-  of its own futex, as parking_lot's, counts as a futex wait alone.
+  of its own futex, as parking_lot's, counts as a futex wait alone, as does a wait on a futex
+  shared between processes that no traced wakeup ended, since another process may have woken it
+  on a CPU swole does not trace.
 
 Each is sampled, between the least and most one sample's calls waited. Samples grow from one call,
 doubling while one takes under 10 ms, to as many calls as a timed sample, and swole reads the rings
