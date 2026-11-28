@@ -637,6 +637,16 @@ fn prctl(option: i32) {
 	assert_eq!(done, 0, "a thread starts and stops the perf events it owns");
 }
 
+/// Starts or stops every perf event swole opened on the process, as a profile's timed parts do.
+#[inline(always)]
+pub fn toggle(on: bool) {
+	prctl(if on {
+		PR_TASK_PERF_EVENTS_ENABLE
+	} else {
+		PR_TASK_PERF_EVENTS_DISABLE
+	});
+}
+
 /// A counter's value, refusing one that did not count the whole time it was enabled.
 fn read(fd: &OwnedFd) -> Result<u64, String> {
 	let mut bytes = [0u8; 24];

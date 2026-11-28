@@ -32,6 +32,16 @@ const OWN_TIMER: &str = "swole timer own ";
 /// What a timed run prints, alone on a line, before each sample's nanoseconds.
 const SAMPLE: &str = "swole sample ";
 
+/// The variable that, set to `1` beside `SWOLE_TIME`, has the harness start every perf event
+/// swole opened on the process as its clock starts and stop them as it stops, so a profile samples
+/// what the time holds alone.
+const PROFILE: &str = "SWOLE_PROFILE";
+
+/// What a timed run prints before its first sample, when it profiles as `SWOLE_PROFILE` asks,
+/// with what its clock brackets: `sample`, a sample's calls at once, `call`, each call alone, or
+/// `own`, each run of a benchmark that times itself; one too old to prints nothing.
+const PROFILES: &str = "swole profiles ";
+
 /// How many times a benchmark that times itself runs its work, as a loop takes it:
 /// `for _ in iterations`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +172,17 @@ fn run() -> Result<(), String> {
 	} else if timed {
 		return Err(format!("{TIME} times one benchmark, which {ONLY} names"));
 	}
+	let profiled = match std::env::var_os(PROFILE) {
+		None => false,
+		Some(value) if value == "1" && timed => true,
+		Some(value) if value == "1" => {
+			return Err(format!("{PROFILE} profiles what {TIME} times, which it does not set"));
+		}
+		Some(value) => return Err(format!("{PROFILE} is {}, not 1", value.to_string_lossy())),
+	};
+	if profiled {
+		profiling()?;
+	}
 	if timed {
 		let (name, case) = cases.pop_first().expect("one case is left");
 		let sampler = (case.build)();
@@ -174,14 +195,11 @@ fn run() -> Result<(), String> {
 			};
 			Some(format!("\n{THROUGHPUT}{} {n} {name}{own}", throughput.unit))
 		});
-		return serve(
-			&name,
-			sampler,
-			throughput.unwrap_or_default(),
-			std::io::stdin().lock(),
-			std::io::stdout(),
-			true,
-		);
+		let mut first = throughput.unwrap_or_default();
+		if profiled {
+			first.push_str(&format!("\n{PROFILES}{}", sampler.window()));
+		}
+		return serve(&name, sampler, first, std::io::stdin().lock(), std::io::stdout(), true);
 	}
 	let counters = split(COUNTERS)?;
 	let every_thread = match std::env::var_os(INHERIT) {
@@ -315,6 +333,19 @@ fn open((hardware, software): (usize, usize), every_thread: bool) -> Result<Coun
 		));
 	}
 	Counters::inherited(hardware, software, every_thread)
+}
+
+/// Has the timed parts start and stop the perf events swole opened, where there are any.
+#[cfg(target_os = "linux")]
+fn profiling() -> Result<(), String> {
+	__private::PROFILING.store(true, std::sync::atomic::Ordering::Relaxed);
+	Ok(())
+}
+
+/// Elsewhere swole opens none.
+#[cfg(not(target_os = "linux"))]
+fn profiling() -> Result<(), String> {
+	Err(format!("{PROFILE}: perf events are Linux's"))
 }
 
 /// The allocation interposer's controls, which swole preloaded.
@@ -608,6 +639,8 @@ pub mod __private {
 		fn self_timed(&self) -> bool {
 			false
 		}
+		/// What its clock brackets, as a profile says: `sample`, `call`, or `own`.
+		fn window(&self) -> &'static str;
 	}
 
 	/// A deterministic, phase-free subset of `iterations` calls: every call when `iterations <=
@@ -891,6 +924,45 @@ pub mod __private {
 		}
 	}
 
+	/// Whether a timed part starts and stops the perf events swole opened to profile it.
+	pub(crate) static PROFILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+	/// Starts or stops the events a profile samples with, when it runs.
+	#[inline(always)]
+	fn profile(on: bool) {
+		#[cfg(target_os = "linux")]
+		if PROFILING.load(std::sync::atomic::Ordering::Relaxed) {
+			crate::perf::toggle(on);
+		}
+		#[cfg(not(target_os = "linux"))]
+		let _ = on;
+	}
+
+	/// Starts the clock around a timed part, after starting a profile's events.
+	#[inline(always)]
+	fn clock() -> Instant {
+		profile(true);
+		Instant::now()
+	}
+
+	/// What the timed part `start` began took, before stopping a profile's events.
+	#[inline(always)]
+	fn since(start: Instant) -> Duration {
+		let elapsed = start.elapsed();
+		profile(false);
+		elapsed
+	}
+
+	/// What a benchmark that times itself returns, with a profile's events running around it,
+	/// which cannot start with its clock.
+	#[inline(always)]
+	fn own(call: impl FnOnce() -> Duration) -> u64 {
+		profile(true);
+		let elapsed = call();
+		profile(false);
+		nanos(elapsed)
+	}
+
 	/// The nanoseconds in `elapsed`, as a sample reports them.
 	fn nanos(elapsed: Duration) -> u64 {
 		u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
@@ -951,16 +1023,20 @@ pub mod __private {
 			calls
 		}
 
+		fn window(&self) -> &'static str {
+			if self.batched::<I, O>() { "sample" } else { "call" }
+		}
+
 		fn time(&mut self, iterations: u64) -> u64 {
 			if self.batched::<I, O>() {
 				// Clones with nothing to drop, so one clock around every call, the clones built
 				// before it and their vector freed after it.
 				let mut inputs: Vec<I> = (0..iterations).map(|_| (self.make)()).collect();
-				let start = Instant::now();
+				let start = clock();
 				for input in inputs.drain(..) {
 					black_box((self.call)(input));
 				}
-				let elapsed = start.elapsed();
+				let elapsed = since(start);
 				drop(inputs);
 				return nanos(elapsed);
 			}
@@ -970,9 +1046,9 @@ pub mod __private {
 			let mut total = Duration::ZERO;
 			for _ in 0..iterations {
 				let input = (self.make)();
-				let start = Instant::now();
+				let start = clock();
 				let output = black_box((self.call)(input));
-				total += start.elapsed();
+				total += since(start);
 				drop(output);
 			}
 			nanos(total)
@@ -1017,14 +1093,22 @@ pub mod __private {
 			calls
 		}
 
+		fn window(&self) -> &'static str {
+			if self.before.is_none() && self.after.is_none() && !std::mem::needs_drop::<O>() {
+				"sample"
+			} else {
+				"call"
+			}
+		}
+
 		fn time(&mut self, iterations: u64) -> u64 {
 			if self.before.is_none() && self.after.is_none() && !std::mem::needs_drop::<O>() {
 				// No step and nothing to drop, so one clock around every call.
-				let start = Instant::now();
+				let start = clock();
 				for _ in 0..iterations {
 					black_box((self.call)(&mut self.input));
 				}
-				return nanos(start.elapsed());
+				return nanos(since(start));
 			}
 			// A step or a drop between calls, so a clock around each call: no output, such as a
 			// lock's guard, is still held when the next call runs.
@@ -1033,9 +1117,9 @@ pub mod __private {
 				if let Some(before) = &mut self.before {
 					before(&mut self.input);
 				}
-				let start = Instant::now();
+				let start = clock();
 				let output = black_box((self.call)(&mut self.input));
-				total += start.elapsed();
+				total += since(start);
 				drop(output);
 				if let Some(after) = &mut self.after {
 					after(&mut self.input);
@@ -1064,11 +1148,15 @@ pub mod __private {
 
 		fn time(&mut self, iterations: u64) -> u64 {
 			let input = (self.make)();
-			nanos((self.call)(input, Iterations(iterations)))
+			own(|| (self.call)(input, Iterations(iterations)))
 		}
 
 		fn self_timed(&self) -> bool {
 			true
+		}
+
+		fn window(&self) -> &'static str {
+			"own"
 		}
 	}
 
@@ -1089,11 +1177,15 @@ pub mod __private {
 		}
 
 		fn time(&mut self, iterations: u64) -> u64 {
-			nanos((self.call)(&mut self.input, Iterations(iterations)))
+			own(|| (self.call)(&mut self.input, Iterations(iterations)))
 		}
 
 		fn self_timed(&self) -> bool {
 			true
+		}
+
+		fn window(&self) -> &'static str {
+			"own"
 		}
 	}
 

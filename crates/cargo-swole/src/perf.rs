@@ -162,6 +162,106 @@ pub struct Perf {
 	pub passes: Vec<Pass>,
 	/// The events this PMU, or at tier L2 the kernel, does not count.
 	pub absent: Vec<String>,
+	/// The event a `bench` samples with to attribute a change to functions, or why it cannot.
+	pub sampling: Result<Sampling, String>,
+}
+
+/// The event a profile samples instruction pointers with, `cycles:pp`: precise cycles, which the
+/// kernel takes with IBS op on an AMD host and with PEBS on an Intel one, in every ring, since IBS
+/// filters none. It samples each CPU a benchmark runs on whole, keeping its process's samples
+/// alone: an event each thread inherits would start its period afresh with every thread, so a
+/// worker that lives shorter than a period would go unseen.
+#[derive(Clone, Debug)]
+pub struct Sampling {
+	/// What takes the samples, for the run's log.
+	pub by: &'static str,
+	pub(crate) attr: Attr,
+}
+
+/// The cycles each sample stands for: some 20,000 samples a second at 5 GHz, 5,000 over the quarter
+/// second of calls a profile takes. A fixed period, since the kernel starts one it adjusts toward a
+/// rate at a single cycle, and stops a CPU's sampling for a while as such a burst comes in. Prime,
+/// so no loop's length divides it and lands every sample on the same instruction.
+pub const PERIOD: u64 = 250_007;
+
+impl Sampling {
+	/// The event's name, as perf spells it.
+	pub const NAME: &str = "cycles:pp";
+
+	/// Whether this host lets swole sample `pmu`'s precise cycles on its CPUs, and into a ring
+	/// buffer as large as each CPU's in a profile.
+	#[cfg(target_os = "linux")]
+	fn probe(pmu: &Pmu) -> Result<Self, String> {
+		let by = if Path::new(PMUS).join("ibs_op").is_dir() {
+			"AMD IBS op"
+		} else {
+			"PEBS"
+		};
+		let sampling = Self {
+			by,
+			attr: Attr {
+				kind: PERF_TYPE_HARDWARE,
+				size: size_of::<Attr>() as u32,
+				// Cycles, of this PMU on a host with several.
+				config: u64::from(pmu.extended) << PERF_PMU_TYPE_SHIFT,
+				sample_period: PERIOD,
+				sample_type: PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PERIOD,
+				flags: DISABLED | PRECISE,
+				..Attr::default()
+			},
+		};
+		let cpu = pmu.cpus[0] as i32;
+		let fd = sampling.open(cpu).map_err(|err| match err.raw_os_error() {
+			Some(EACCES | EPERM) => format!(
+				"sampling {} needs kernel.perf_event_paranoid at most 0 or CAP_PERFMON, since it samples whole CPUs \
+					 ({err})",
+				Self::NAME
+			),
+			_ if unsupported(&err) => format!(
+				"PMU {} takes no precise samples, as a VM without AMD IBS or Intel PEBS does ({err})",
+				pmu.name
+			),
+			_ => format!("cannot sample {}: {err}", Self::NAME),
+		})?;
+		// SAFETY: the kernel returned a new descriptor, which nothing else owns.
+		let fd = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) };
+		crate::profile::Ring::map(fd).map(drop)?;
+		Ok(sampling)
+	}
+
+	#[cfg(not(target_os = "linux"))]
+	fn probe(_: &Pmu) -> Result<Self, String> {
+		Err("sampling is Linux's".to_owned())
+	}
+
+	/// Opens the event, stopped, on `cpu` whole, owned by the calling thread, which starts and
+	/// stops it with the rest of its events; closed on `exec`.
+	#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+	pub(crate) fn open(&self, cpu: i32) -> std::io::Result<i32> {
+		// SAFETY: `attr` is a `perf_event_attr` of the size it states, read during the call.
+		let fd = unsafe {
+			syscall(
+				SYS_PERF_EVENT_OPEN,
+				&raw const self.attr,
+				-1i32,
+				cpu,
+				-1i32,
+				PERF_FLAG_FD_CLOEXEC,
+			)
+		};
+		if fd < 0 {
+			return Err(std::io::Error::last_os_error());
+		}
+		Ok(fd as i32)
+	}
+
+	#[cfg(all(target_os = "linux", not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+	pub(crate) fn open(&self, _: i32) -> std::io::Result<i32> {
+		Err(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			"swole samples on x86_64 and aarch64",
+		))
+	}
 }
 
 impl Host {
@@ -359,12 +459,18 @@ impl Perf {
 				.map_err(|err| format!("cannot open a perf counter of {name}: {err}"))?;
 			passes[0].groups.push(vec![event]);
 		}
+		let sampling = if quick {
+			Err("quick samples nothing".to_owned())
+		} else {
+			Sampling::probe(&pmu)
+		};
 		Ok(Self {
 			pmu,
 			kernel: kernel && !quick,
 			slots,
 			passes,
 			absent,
+			sampling,
 		})
 	}
 }
@@ -977,10 +1083,10 @@ pub fn cpus(list: &str) -> Result<Vec<usize>, String> {
 	Ok(cpus)
 }
 
-/// `perf_event_attr`'s first 64 bytes, `PERF_ATTR_SIZE_VER0`, all a count needs.
+/// `perf_event_attr`'s first 64 bytes, `PERF_ATTR_SIZE_VER0`, all a count or a profile needs.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-struct Attr {
+pub(crate) struct Attr {
 	kind: u32,
 	size: u32,
 	config: u64,
@@ -1006,6 +1112,13 @@ const INHERIT_THREADS: u64 = 1 << 1;
 const EXCLUDE_USER: u64 = 1 << 4;
 const EXCLUDE_KERNEL: u64 = 1 << 5;
 const EXCLUDE_HV: u64 = 1 << 6;
+/// `precise_ip` 2, the `:pp` of `cycles:pp`: each sample's instruction pointer is the instruction's
+/// own, as AMD's IBS and Intel's PEBS take it, not one some cycles past it.
+const PRECISE: u64 = 2 << 15;
+/// The instruction pointer of each sample, its process and thread, and the period it stands for.
+const PERF_SAMPLE_IP: u64 = 1 << 0;
+const PERF_SAMPLE_TID: u64 = 1 << 1;
+const PERF_SAMPLE_PERIOD: u64 = 1 << 8;
 
 #[cfg(target_os = "linux")]
 mod sys {
@@ -1032,6 +1145,8 @@ mod sys {
 	#[cfg(target_arch = "x86_64")]
 	pub const CAP_USER_RDPMC: u64 = 1 << 2;
 	pub const ENOENT: i32 = 2;
+	pub const EPERM: i32 = 1;
+	pub const EACCES: i32 = 13;
 	pub const EINVAL: i32 = 22;
 	pub const EOPNOTSUPP: i32 = 95;
 	#[cfg(target_arch = "x86_64")]
