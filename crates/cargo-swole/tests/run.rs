@@ -376,9 +376,11 @@ fn target(bench: &str, args: &[&str]) -> Command {
 		.args(args)
 		.args(["--", "-p", "swole", "--bench", bench])
 		.current_dir(env!("CARGO_MANIFEST_DIR"))
+		// Never a scratch directory's name: scratch empties its directory, which would delete
+		// the binaries a concurrent test is running.
 		.env(
 			"CARGO_TARGET_DIR",
-			Path::new(env!("CARGO_TARGET_TMPDIR")).join("harness"),
+			Path::new(env!("CARGO_TARGET_TMPDIR")).join("harness-target"),
 		)
 		.env_remove("GITHUB_STEP_SUMMARY");
 	command
