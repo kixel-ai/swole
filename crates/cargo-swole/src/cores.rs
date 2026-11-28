@@ -1,7 +1,7 @@
 //! The physical core a `bench` run times on, leased from every other swole run on the host.
 //!
 //! A run leases one physical core with an open file description lock on a file in [`LEASES`],
-//! which the kernel drops however the run ends, and times every benchmark on the core's first
+//! which the run releases itself and the kernel drops however the run ends, and times every benchmark on the core's first
 //! hardware thread. No other swole run uses any of the core's threads while the lease is held, so
 //! two runs never share a core or contend through its SMT sibling. The lease keeps other swole
 //! runs off the core, not the host's other processes: only the kernel's isolated CPUs keep those
@@ -52,13 +52,35 @@ pub struct Reservation {
 	/// What to write back on drop, before the lease's lock is released.
 	restore: Option<Box<Restore>>,
 	#[expect(dead_code, reason = "held for its lock, released after the restore")]
-	lease: File,
+	lease: Lease,
 }
 
 /// The CPUs a threaded benchmark runs on, and the leases of the cores it holds beyond the run's own.
 pub struct Spread {
 	pub cpus: Vec<usize>,
-	leases: Vec<File>,
+	leases: Vec<Lease>,
+}
+
+/// A core's lease, held while its lock is.
+struct Lease(File);
+
+impl Lease {
+	/// Locks the lease of `core` in `dir` unless another run holds it.
+	fn take(dir: &Path, core: &[usize]) -> Result<Option<Self>, String> {
+		let file = open(dir, core)?;
+		let free = setlk(&file, F_WRLCK).map_err(|e| format!("cannot lease core {}: {e}", core[0]))?;
+		Ok(free.then_some(Self(file)))
+	}
+}
+
+impl Drop for Lease {
+	/// Unlocks before the close, since a child forked meanwhile holds a copy of the descriptor
+	/// until it `exec`s, which would hold the lock past the close until then.
+	fn drop(&mut self) {
+		if let Err(e) = setlk(&self.0, F_UNLCK) {
+			eprintln!("swole: cannot release a core's lease, which closing it releases instead: {e}");
+		}
+	}
 }
 
 /// The cpufreq governor a run times under.
@@ -95,8 +117,7 @@ impl Reservation {
 			leases: Vec::new(),
 		};
 		for core in self.cores.iter().filter(|core| **core != self.core) {
-			let file = open(&self.leases, core)?;
-			if lock(&file).map_err(|e| format!("cannot lease core {}: {e}", core[0]))? {
+			if let Some(lease) = Lease::take(&self.leases, core)? {
 				// A killed run's changed governor would otherwise outlive this run on a core it
 				// never times on, since a run leases such a core last. A core whose journal this run
 				// cannot replay, such as one naming a policy its sysfs view lacks, only drops out of
@@ -107,7 +128,7 @@ impl Reservation {
 					continue;
 				}
 				spread.cpus.extend(core);
-				spread.leases.push(file);
+				spread.leases.push(lease);
 			}
 		}
 		spread.cpus.retain(|cpu| self.candidates.contains(cpu));
@@ -227,14 +248,13 @@ fn cores(sys: &Path, candidates: &[usize]) -> Result<Vec<Vec<usize>>, String> {
 
 /// Leases the first of `cores` no other swole run holds, trying them all again until one is free
 /// when other runs hold every one: the core, and its lease's file, locked.
-fn lease(leases: &Path, cores: &[Vec<usize>]) -> Result<(Vec<usize>, File), String> {
+fn lease(leases: &Path, cores: &[Vec<usize>]) -> Result<(Vec<usize>, Lease), String> {
 	shared(leases)?;
 	let mut pause = Duration::from_millis(10);
 	loop {
 		for core in cores {
-			let file = open(leases, core)?;
-			if lock(&file).map_err(|e| format!("cannot lease core {}: {e}", core[0]))? {
-				return Ok((core.clone(), file));
+			if let Some(lease) = Lease::take(leases, core)? {
+				return Ok((core.clone(), lease));
 			}
 		}
 		// No lock waits on any one of several, and a run may free any core, even one another
@@ -247,9 +267,14 @@ fn lease(leases: &Path, cores: &[Vec<usize>]) -> Result<(Vec<usize>, File), Stri
 	}
 }
 
-/// Takes the write lock of all of `file` for its open file description, which every descriptor of
-/// it shares and the kernel releases with the last, unless another holds it: whether it was free.
-fn lock(file: &File) -> std::io::Result<bool> {
+/// `l_type`s of an open file description's lock: the write lock, and none.
+const F_WRLCK: i16 = 1;
+const F_UNLCK: i16 = 2;
+
+/// Sets the lock of all of `file` for its open file description to `l_type`, which every
+/// descriptor of it shares and the kernel releases with the last, unless another holds it:
+/// whether it was free.
+fn setlk(file: &File, l_type: i16) -> std::io::Result<bool> {
 	/// `struct flock`, which an open file description's lock takes with `l_pid` 0.
 	#[repr(C)]
 	struct Flock {
@@ -260,7 +285,6 @@ fn lock(file: &File) -> std::io::Result<bool> {
 		l_pid: i32,
 	}
 	const F_OFD_SETLK: i32 = 37;
-	const F_WRLCK: i16 = 1;
 	const EAGAIN: i32 = 11;
 	const EACCES: i32 = 13;
 	const EINTR: i32 = 4;
@@ -269,7 +293,7 @@ fn lock(file: &File) -> std::io::Result<bool> {
 	}
 	loop {
 		let mut flock = Flock {
-			l_type: F_WRLCK,
+			l_type,
 			l_whence: 0,
 			l_start: 0,
 			l_len: 0,
@@ -724,9 +748,13 @@ mod tests {
 		let first = reserve_in(&sys, &leases, &all).unwrap();
 		let spread = first.spread().unwrap();
 		assert_eq!(spread.cpus, all);
-		// The spread holds the other core until it drops.
-		assert!(!lock(&open(&leases, &[0, 2]).unwrap()).unwrap());
+		// The spread holds the other core until it drops, even while a copy of its descriptor, as a
+		// child forked meanwhile holds until it `exec`s, outlives it.
+		assert!(Lease::take(&leases, &[0, 2]).unwrap().is_none());
+		let forked = spread.leases[0].0.try_clone().unwrap();
 		drop(spread);
+		assert!(Lease::take(&leases, &[0, 2]).unwrap().is_some());
+		drop(forked);
 		let second = reserve_in(&sys, &leases, &all).unwrap();
 		assert_eq!((first.cpu, &first.core), (1, &vec![1, 3]));
 		assert_eq!((second.cpu, &second.core), (0, &vec![0, 2]));

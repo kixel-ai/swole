@@ -506,18 +506,20 @@ predates profiling.
 
 ### Cores
 
-On Linux, `bench` leases one physical core once its builds are done and runs every benchmark
-process on that core's first hardware thread swole may run on, so a sample never migrates and a pair's two sides
+On Linux, `bench` leases one physical core once its builds are done and times every benchmark
+process that runs no other thread on that core's first hardware thread swole may run on, so a sample never migrates and a pair's two sides
 run on one core. The lease is an advisory lock on a file in `/dev/shm/swole`, shared by every
-user, which the kernel drops however the run ends: no other `swole bench` uses any hardware
+user, which the run releases and the kernel drops however the run ends: no other `swole bench` uses any hardware
 thread of the core meanwhile, so concurrent runs take disjoint cores and never contend through an
 SMT sibling. A run takes the last free core, leaving the first, where the kernel does most of its
 own work, for last, and when other runs hold them all, waits until any one frees. On a hybrid Intel host it
 takes a performance core, counted by the `cpu_core` PMU, while `quick` counts on the PMU of the
-most CPUs. A benchmark that starts another thread in its first call would have its threads
-serialized on one CPU, so it times on the run's core and every other core no other run leases,
-which it leases until it is counted, and the run says so; its counter passes run there too, and
-count every thread, as above.
+most CPUs. Each benchmark starts on the run's core and every other core no other run leases, so
+one that checks at setup that it may use the host's CPUs can, and narrows to the one CPU, in a new
+process, once its first call runs no other thread. One whose first call does would have its
+threads serialized on one CPU, so it keeps those cores until it is counted, and the run says so;
+its counter passes run there too, and count every thread, as above. One whose threads start only
+later is timed and counted again on them.
 
 The lease keeps other `swole bench` runs off the core, not the host's other processes, which
 the run says unless the kernel excludes the CPU from scheduler load balancing (`isolcpus`, listed in
