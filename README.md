@@ -363,9 +363,15 @@ what each job gets; the native [fingerprint](#fingerprints) holds all of it.
   count holds the reads' few dozen user-space instructions once a sample rather than once a
   call.
   `quick` counts user space alone at any tier.
+- Tier L-1, `perf_event_paranoid` at most -1 or `CAP_PERFMON`, on x86_64, and the kernel's
+  syscall and scheduler tracepoints readable under tracefs, outside a nested PID namespace such as
+  a container's, whose thread IDs a wakeup's record does not use: `bench` traces where each benchmark's threads
+  [wait off the CPU](#off-cpu-waits), printing that it does or why it cannot.
 - No tier, above 2 without `CAP_PERFMON`, or a host without a PMU, or one that does not let a
   process read its counters in user space (`cap_user_rdpmc` off), or a CPU other than x86_64, or
-  macOS: `bench` times by wall clock with rusage alone, saying why, and `quick` fails.
+  macOS: `bench` times by wall clock with rusage alone, saying why, and `quick` fails. A Linux
+  host without a usable PMU still traces off-CPU waits where it grants the L-1 row's privilege
+  and tracefs.
 
 A PMU holds only so many counters at once, and the kernel shares more among them by turns,
 scaling each up by a guess. swole never lets it: the probe packs the counters into groups that
@@ -399,6 +405,17 @@ security.wrappers.swole = {
 `cargo swole` runs `cargo-swole` from `PATH`, which holds no capability: run `swole` instead.
 A `swole` given the capability itself runs its helpers through the `cargo-swole` installed beside
 it, since Valgrind refuses an executable that holds capabilities.
+
+A [trace of off-CPU waits](#off-cpu-waits) also reads the IDs of the syscall and scheduler tracepoints it opens
+from tracefs, which most distributions mount for root alone, and which no capability opens.
+Grant a group read access when mounting it, by its numeric ID, as the kernel's
+[perf security](https://docs.kernel.org/admin-guide/perf-security.html) guide does:
+
+```bash
+sudo mount -o remount,gid=10,mode=0750 /sys/kernel/tracing   # now, for group 10 (wheel)
+# /etc/fstab, at boot:
+# tracefs  /sys/kernel/tracing  tracefs  gid=10,mode=0750  0 0
+```
 
 glibc starts a program that holds a capability in its secure mode, which drops `LD_LIBRARY_PATH`,
 `GLIBC_TUNABLES`, and the loader's other variables from its environment, so a granted swole and
@@ -497,12 +514,61 @@ benchmark's `functions`. A sample the kernel dropped, a stretch it stopped sampl
 buffer that filled fails the run, since the other functions would claim its cycles. A benchmark
 that times itself names no functions, since its calls may hold work its time leaves out, nor does
 one whose two sides' clocks bracket unlike windows, such as a sample's calls in one and each call
-alone in the other.
+alone in the other, or whose harnesses differ in whether sampling starts inside the clock's reads,
+as a base from before swole started it there does.
 
 Sampling needs a PMU that takes precise samples, which a VM's often lacks, and, since it samples
 whole CPUs, `perf_event_paranoid` at most 0 or `CAP_PERFMON`, as [Privileges](#privileges)
 grants; a paired run without them says why and names no functions, as does a side whose harness
 predates profiling.
+
+### Off-CPU waits
+
+Where the host allows it, `bench` measures where each side's threads wait off the CPU, a call's
+share summed over every thread of the process, beside its time and `CPUs busy`. On the CPUs its
+times took, it runs each side once more, in a timed process of its own, over a tenth of a second
+of calls, recording each of the process's context switches and, by the kernel's
+`syscalls:sys_enter_futex` and `sys_exit_futex` tracepoints, its futex calls, and by
+`sched:sched_wakeup`, when each of its threads was woken, whatever woke it. As a
+[profile](#functions) does, it records each of those CPUs whole and keeps the process's records
+alone, since events every thread inherited would cost each thread the benchmark starts hundreds of
+microseconds, and the harness starts and stops them with its clock, so setup, steps, and inputs
+built between calls wait in none of them, and neither the times nor the counters share a process
+with it. The harness starts the events just after its clock starts and stops them just before the
+clock stops, and the window opens as its start of the events returns and closes as its stop begins,
+so it lies within the time, and what other CPUs record before the stop reaches them stays out. Each wait a thread began
+inside it counts until it ends or the window does, so a worker parked since before the window,
+waiting for work that never came, counts nothing, nor does a thread's last switch as it exits,
+which names no thread once Linux reaps it, though a block as it tears down counts:
+
+- `blocked time`: off the CPU, waiting on something, as a sleep, I/O, or a futex, until woken;
+- `runnable time`: off the CPU while runnable, waiting for one, as when the scheduler preempted
+  the thread or has yet to run it once woken, so a loaded CPU's delay counts in no futex or lock
+  wait. A wakeup another CPU than the traced ones records goes unseen, and its wait stays blocked;
+- `futex wait time`: the blocked time inside a futex call that waits, as a parked worker's or a
+  lock's;
+- `lock wait time`: the futex wait time at a call that takes a lock. swole resolves each call's
+  site and its caller, through libc's `syscall` wrapper, against the mapped executable and
+  libraries, as a profile's samples are resolved, and takes a site for a lock where a function
+  inlined there or holding it is std's `Mutex::lock_contended` or `RwLock`'s `read_contended` or
+  `write_contended`, glibc's `lll_lock_wait` or a `pthread_mutex_*lock` or
+  `pthread_rwlock_*(rd|wr)lock`, or the futex operation takes a priority-inheriting lock. A lock
+  of its own futex, as parking_lot's, counts as a futex wait alone, as does a wait on a futex
+  shared between processes that no traced wakeup ended, since another process may have woken it
+  on a CPU swole does not trace.
+
+Each is sampled, between the least and most one sample's calls waited. Samples grow from one call,
+doubling while one takes under 10 ms, to as many calls as a timed sample, and swole reads the rings
+while a sample runs, each time one holds 64 KiB. A sample whose events lost a record, as each
+counts, which a burst of other processes' records on its CPUs can cause as well as its own, counts
+nothing, and no later sample takes as many calls; a side left with no sample fails the run. A
+trace counts its losses from Linux 6.0 on. A
+benchmark that times itself has none, since its calls may hold waits its time leaves out, as does a
+side whose harness predates starting its events inside its clock's reads. A sample whose records
+miss one of its clock's windows, as when the benchmark moves its thread off the CPUs swole traces,
+fails the run. A trace needs the host's tier L-1, as
+[Capabilities](#capabilities) says, and its tracepoints' IDs from tracefs, as
+[Privileges](#privileges) grants; a run without them says why and has no waits.
 
 ### Cores
 
@@ -618,7 +684,9 @@ A paired `bench`'s regression, a slowdown whose whole interval lies above no cha
 compare's, a headline count, or `sim`'s estimated cycles, grown past its spread, names its likely cause in a column beside it, from the
 first two of these its measures show, each citing the measure on both sides: `throttled`
 (`cycles/ref-cycles:u` fell 2%; never the estimated clock alone), `off-CPU` (`CPUs busy` lost 0.1 and
-ended under 0.9), `more instructions` (1% more), `memory-bound` (the last-level, L1 data, or data
+ended under 0.9), named, where a [trace](#off-cpu-waits) split it, for the narrowest wait that
+gained half or more of the off-CPU time a call gained, `lock contention`, `futex wait`, `blocked`,
+or `runnable`, citing it beside `CPUs busy`, `more instructions` (1% more), `memory-bound` (the last-level, L1 data, or data
 TLB MPKI grew by a quarter and 0.1, or the breakdown's memory bound gained 3 points), else
 `backend-bound` (its backend bound did), `branch mispredicts` (its miss rate, MPKI, or share),
 else `bad speculation`, `frontend-bound`, `kernel` (its share gained 5 points), and for a time that

@@ -42,6 +42,12 @@ const PROFILE: &str = "SWOLE_PROFILE";
 /// `own`, each run of a benchmark that times itself; one too old to prints nothing.
 const PROFILES: &str = "swole profiles ";
 
+/// What a timed run prints, alone on a line, after `PROFILES`, when the harness's clock starts
+/// before a profile's events and stops after them, so all they record lies within its time; one
+/// too old to prints nothing. A line of its own, so a runner that predates it still reads
+/// `PROFILES` alone.
+const INSIDE: &str = "swole profile inside clock";
+
 /// How many times a benchmark that times itself runs its work, as a loop takes it:
 /// `for _ in iterations`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,6 +208,10 @@ fn run() -> Result<(), String> {
 		let mut first = throughput.unwrap_or_default();
 		if profiled {
 			first.push_str(&format!("\n{PROFILES}{}", sampler.window()));
+			// A benchmark that times itself has no clock of the harness's to start them inside.
+			if !sampler.self_timed() {
+				first.push_str(&format!("\n{INSIDE}"));
+			}
 		}
 		return serve(&name, sampler, first, std::io::stdin().lock(), std::io::stdout(), true);
 	}
@@ -940,30 +950,44 @@ pub mod __private {
 	/// Whether a timed part starts and stops the perf events swole opened to profile it.
 	pub(crate) static PROFILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+	/// Whether a profile's events run, which a sample checks once, so its timed parts are timed
+	/// as they would be without.
+	fn profiling() -> bool {
+		#[cfg(target_os = "linux")]
+		return PROFILING.load(std::sync::atomic::Ordering::Relaxed);
+		#[cfg(not(target_os = "linux"))]
+		false
+	}
+
 	/// Starts or stops the events a profile samples with, when it runs.
 	#[inline(always)]
 	fn profile(on: bool) {
 		#[cfg(target_os = "linux")]
-		if PROFILING.load(std::sync::atomic::Ordering::Relaxed) {
+		if profiling() {
 			crate::perf::toggle(on);
 		}
 		#[cfg(not(target_os = "linux"))]
 		let _ = on;
 	}
 
-	/// Starts the clock around a timed part, after starting a profile's events.
+	/// Starts the clock around a timed part, then, when `PROFILED`, a profile's events, so all
+	/// they record lies within the time.
 	#[inline(always)]
-	fn clock() -> Instant {
-		profile(true);
-		Instant::now()
+	fn clock<const PROFILED: bool>() -> Instant {
+		let start = Instant::now();
+		if PROFILED {
+			profile(true);
+		}
+		start
 	}
 
-	/// What the timed part `start` began took, before stopping a profile's events.
+	/// What the timed part `start` began took, after stopping a profile's events when `PROFILED`.
 	#[inline(always)]
-	fn since(start: Instant) -> Duration {
-		let elapsed = start.elapsed();
-		profile(false);
-		elapsed
+	fn since<const PROFILED: bool>(start: Instant) -> Duration {
+		if PROFILED {
+			profile(false);
+		}
+		start.elapsed()
 	}
 
 	/// What a benchmark that times itself returns, with a profile's events running around it,
@@ -1041,15 +1065,26 @@ pub mod __private {
 		}
 
 		fn time(&mut self, iterations: u64) -> u64 {
+			if profiling() {
+				self.timed::<true>(iterations)
+			} else {
+				self.timed::<false>(iterations)
+			}
+		}
+	}
+
+	impl<I, O, M: FnMut() -> I, F: FnMut(I) -> O> Fresh<M, F> {
+		/// Times `iterations` calls, starting and stopping a profile's events when `PROFILED`.
+		fn timed<const PROFILED: bool>(&mut self, iterations: u64) -> u64 {
 			if self.batched::<I, O>() {
 				// Clones with nothing to drop, so one clock around every call, the clones built
 				// before it and their vector freed after it.
 				let mut inputs: Vec<I> = (0..iterations).map(|_| (self.make)()).collect();
-				let start = clock();
+				let start = clock::<PROFILED>();
 				for input in inputs.drain(..) {
 					black_box((self.call)(input));
 				}
-				let elapsed = since(start);
+				let elapsed = since::<PROFILED>(start);
 				drop(inputs);
 				return nanos(elapsed);
 			}
@@ -1059,9 +1094,9 @@ pub mod __private {
 			let mut total = Duration::ZERO;
 			for _ in 0..iterations {
 				let input = (self.make)();
-				let start = clock();
+				let start = clock::<PROFILED>();
 				let output = black_box((self.call)(input));
-				total += since(start);
+				total += since::<PROFILED>(start);
 				drop(output);
 			}
 			nanos(total)
@@ -1115,13 +1150,24 @@ pub mod __private {
 		}
 
 		fn time(&mut self, iterations: u64) -> u64 {
+			if profiling() {
+				self.timed::<true>(iterations)
+			} else {
+				self.timed::<false>(iterations)
+			}
+		}
+	}
+
+	impl<I, O, F: FnMut(&mut I) -> O> Kept<I, F> {
+		/// Times `iterations` calls, starting and stopping a profile's events when `PROFILED`.
+		fn timed<const PROFILED: bool>(&mut self, iterations: u64) -> u64 {
 			if self.before.is_none() && self.after.is_none() && !std::mem::needs_drop::<O>() {
 				// No step and nothing to drop, so one clock around every call.
-				let start = clock();
+				let start = clock::<PROFILED>();
 				for _ in 0..iterations {
 					black_box((self.call)(&mut self.input));
 				}
-				return nanos(since(start));
+				return nanos(since::<PROFILED>(start));
 			}
 			// A step or a drop between calls, so a clock around each call: no output, such as a
 			// lock's guard, is still held when the next call runs.
@@ -1130,9 +1176,9 @@ pub mod __private {
 				if let Some(before) = &mut self.before {
 					before(&mut self.input);
 				}
-				let start = clock();
+				let start = clock::<PROFILED>();
 				let output = black_box((self.call)(&mut self.input));
-				total += since(start);
+				total += since::<PROFILED>(start);
 				drop(output);
 				if let Some(after) = &mut self.after {
 					after(&mut self.input);

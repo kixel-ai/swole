@@ -216,6 +216,8 @@ mod moved {
 	pub const CLOCK: f64 = 0.02;
 	/// What the CPUs busy must lose, and stay under, for a benchmark to wait off the CPU.
 	pub const BUSY: (f64, f64) = (0.1, 0.9);
+	/// The share of the off-CPU time a call gained that one kind of wait must hold to be named.
+	pub const WAIT: f64 = 0.5;
 	/// How little a count may move to be the same, and an MPKI.
 	pub const SAME: f64 = 0.005;
 	pub const SAME_MPKI: (f64, f64) = (0.1, 0.05);
@@ -296,6 +298,25 @@ impl Sides<'_> {
 		})
 	}
 
+	/// The narrowest kind of wait that holds half or more of the off-CPU time a call gained, as a
+	/// trace splits it, and how it moved: a lock's wait lies inside a futex's, inside the time it
+	/// blocked.
+	fn waited(&self) -> Option<(&'static str, Moved)> {
+		let gained = |name: &str| self.get(name).map_or(0.0, |moved| moved.delta());
+		let off = gained("blocked time") + gained("runnable time");
+		[
+			("lock contention", "lock wait time"),
+			("futex wait", "futex wait time"),
+			("blocked", "blocked time"),
+			("runnable", "runnable time"),
+		]
+		.into_iter()
+		.find_map(|(label, name)| {
+			let moved = self.get(name)?;
+			(off > 0.0 && moved.beyond() && moved.delta() >= moved::WAIT * off).then_some((label, moved))
+		})
+	}
+
 	/// Whether `name` held, within `share` of itself or `least`, on both sides.
 	fn held(&self, name: &str, (share, least): (f64, f64)) -> bool {
 		self.get(name)
@@ -319,13 +340,15 @@ pub fn cause(base: &[Measure], head: &[Measure], timed: Option<f64>) -> Option<S
 		// Only a clock counted beside its reference: the estimate's user time is another process's,
 		// and holds what a sample runs between calls, which a slower hook moves at the same clock.
 		add("throttled", sides.fell(&["cycles/ref-cycles:u"], moved::CLOCK));
-		add(
-			"off-CPU",
-			sides.get("CPUs busy").and_then(|busy| {
-				let (lost, under) = moved::BUSY;
-				(busy.beyond() && -busy.delta() >= lost && busy.head.value < under).then(|| busy.cited())
-			}),
-		);
+		if let Some(busy) = sides.get("CPUs busy").filter(|busy| {
+			let (lost, under) = moved::BUSY;
+			busy.beyond() && -busy.delta() >= lost && busy.head.value < under
+		}) {
+			match sides.waited() {
+				Some((label, wait)) => add(label, Some(format!("{}, {}", busy.cited(), wait.cited()))),
+				None => add("off-CPU", Some(busy.cited())),
+			}
+		}
 		add(
 			"more instructions",
 			sides.grew(&["instructions:u"], (moved::INSTRUCTIONS, 0.0)),
@@ -563,6 +586,50 @@ mod tests {
 		assert_eq!(
 			cause(&base, &with("instructions:u", 1200.0), Some(0.2)).unwrap(),
 			"more instructions (instructions:u 1000 → 1200)"
+		);
+		// A trace names the wait the time off the CPU went to, the narrowest that holds most of it.
+		let traced = [
+			&base[..],
+			&side(&[
+				("blocked time", 1000.0, "ns"),
+				("runnable time", 0.0, "ns"),
+				("futex wait time", 800.0, "ns"),
+				("lock wait time", 10.0, "ns"),
+			]),
+		]
+		.concat();
+		let waited = |waits: [f64; 4]| {
+			let mut head = traced.clone();
+			head.iter_mut().find(|m| m.name == "CPUs busy").unwrap().value = 0.7;
+			for (name, value) in ["blocked time", "runnable time", "futex wait time", "lock wait time"]
+				.into_iter()
+				.zip(waits)
+			{
+				head.iter_mut().find(|m| m.name == name).unwrap().value = value;
+			}
+			cause(&traced, &head, Some(0.3)).unwrap()
+		};
+		assert_eq!(
+			waited([3000.0, 0.0, 2800.0, 1900.0]),
+			"lock contention (CPUs busy 0.980 CPUs → 0.700 CPUs, lock wait time 10 ns → 1900 ns)"
+		);
+		// Workers parked for work wait on a futex, but take no lock.
+		assert_eq!(
+			waited([3000.0, 0.0, 2800.0, 10.0]),
+			"futex wait (CPUs busy 0.980 CPUs → 0.700 CPUs, futex wait time 800 ns → 2800 ns)"
+		);
+		assert_eq!(
+			waited([3000.0, 0.0, 800.0, 10.0]),
+			"blocked (CPUs busy 0.980 CPUs → 0.700 CPUs, blocked time 1000 ns → 3000 ns)"
+		);
+		assert_eq!(
+			waited([1200.0, 1500.0, 800.0, 10.0]),
+			"runnable (CPUs busy 0.980 CPUs → 0.700 CPUs, runnable time 0 ns → 1500 ns)"
+		);
+		// Waits that held name nothing narrower.
+		assert_eq!(
+			waited([1000.0, 0.0, 800.0, 10.0]),
+			"off-CPU (CPUs busy 0.980 CPUs → 0.700 CPUs)"
 		);
 		// A count's headline is its instructions, which explain nothing more.
 		assert_eq!(cause(&base, &with("instructions:u", 1200.0), None), None);
