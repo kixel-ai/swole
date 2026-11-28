@@ -1,8 +1,7 @@
 name: Check
 
-# The check every pull request needs before it lands; main's ruleset requires its `check` job.
+# Runs after each push to main; pull requests run `just ci` locally instead.
 on:
-  pull_request:
   push:
     branches: [main]
   workflow_dispatch:
@@ -10,9 +9,10 @@ on:
 permissions:
   contents: read
 
+# Runs coalesce: one in progress finishes, so a breakage stays on the commit that caused it, and
+# a newer push replaces a pending one.
 concurrency:
   group: check-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   check:
@@ -27,8 +27,8 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/nix
       # Dependencies are a small part of the build, but the tests' fixtures build in target
-      # directories of their own under it. Only main saves, so a pull request reads the cache
-      # and can't write what later runs build on.
+      # directories of their own under it. Only main saves, so a manual run on another branch
+      # reads the cache and can't write what later runs build on.
       - id: cargo
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
