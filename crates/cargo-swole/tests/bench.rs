@@ -74,7 +74,7 @@ fn fixture(args: &[&std::ffi::OsStr]) -> Output {
 		// The target directory the count tests build the fixture in, apart from this test's own.
 		.env(
 			"CARGO_TARGET_DIR",
-			Path::new(env!("CARGO_TARGET_TMPDIR")).join("harness"),
+			Path::new(env!("CARGO_TARGET_TMPDIR")).join("harness-target"),
 		)
 		.output()
 		.unwrap()
