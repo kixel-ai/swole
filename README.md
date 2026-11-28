@@ -364,7 +364,8 @@ what each job gets; the native [fingerprint](#fingerprints) holds all of it.
   call.
   `quick` counts user space alone at any tier.
 - Tier L-1, `perf_event_paranoid` at most -1 or `CAP_PERFMON`, on x86_64, and the kernel's
-  syscall and scheduler tracepoints readable under tracefs: `bench` traces where each benchmark's threads
+  syscall and scheduler tracepoints readable under tracefs, outside a nested PID namespace such as
+  a container's, whose thread IDs a wakeup's record does not use: `bench` traces where each benchmark's threads
   [wait off the CPU](#off-cpu-waits), printing that it does or why it cannot.
 - No tier, above 2 without `CAP_PERFMON`, or a host without a PMU, or one that does not let a
   process read its counters in user space (`cap_user_rdpmc` off), or a CPU other than x86_64, or

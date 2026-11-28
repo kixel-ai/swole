@@ -135,6 +135,17 @@ impl Tracing {
 	/// them, or why it cannot.
 	#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 	pub fn probe() -> Result<Self, String> {
+		// A wakeup's record names the thread it woke by its ID in the first PID namespace, and a
+		// context switch's by its ID in swole's, which differ in a nested one.
+		let status = std::fs::read_to_string("/proc/self/status")
+			.map_err(|err| format!("cannot read /proc/self/status, for swole's PID namespace: {err}"))?;
+		if nested(&status)? {
+			return Err(
+				"swole runs in a nested PID namespace, as a container's, where a wakeup names a thread by an ID its \
+				 context switches do not"
+					.to_owned(),
+			);
+		}
 		let root = TRACEFS
 			.iter()
 			.map(std::path::Path::new)
@@ -379,6 +390,16 @@ impl Tracing {
 enum Parsed {
 	Record(Record),
 	Other,
+}
+
+/// Whether the `/proc/<pid>/status` `status` names its process in more PID namespaces than the
+/// first.
+fn nested(status: &str) -> Result<bool, String> {
+	let ids = status
+		.lines()
+		.find_map(|line| line.strip_prefix("NSpid:"))
+		.ok_or("/proc/self/status names no NSpid, which Linux has printed since 4.1")?;
+	Ok(ids.split_whitespace().count() > 1)
 }
 
 /// Where the tracepoint `format` lays out `field`, in its record.
@@ -894,6 +915,13 @@ mod tests {
 		] {
 			assert!(!takes_lock(name), "{name}");
 		}
+	}
+
+	#[test]
+	fn knows_a_nested_pid_namespace() {
+		assert_eq!(nested("Name:\tswole\nNSpid:\t4242\nNSsid:\t1\n"), Ok(false));
+		assert_eq!(nested("NSpid:\t4242\t17\n"), Ok(true));
+		assert!(nested("Name:\tswole\n").is_err());
 	}
 
 	#[test]
