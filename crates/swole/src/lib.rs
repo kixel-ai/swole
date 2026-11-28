@@ -91,6 +91,10 @@ const COUNTED_CALLS: u64 = 64;
 /// calls, or over each sample's, from `getrusage`.
 const RUSAGE: &str = "swole rusage ";
 
+/// What a timed run prints before the nanoseconds of wall clock its `swole rusage` line covers,
+/// which an older swole reads as the benchmark's own output.
+const WALL: &str = "swole wall ";
+
 /// What a run swole measures prints before the name of a benchmark beside which the process had
 /// another thread.
 const THREADED: &str = "swole threaded ";
@@ -454,15 +458,24 @@ fn serve(
 		let before_live = watch_threads && !reported_threaded && threads()? > 1;
 		let before_started = (watch_threads && !reported_threaded).then(started).flatten();
 		#[cfg(all(unix, target_pointer_width = "64"))]
-		let start = rusage::Usage::now();
+		let (window, start) = (std::time::Instant::now(), rusage::Usage::now());
 		let nanos = sampler.time(iterations);
-		// What the process used goes before the sample's line, which an older swole waits for,
-		// reading what precedes it as the benchmark's own output.
+		// What the process used, and over how long, goes before the sample's line, which an older
+		// swole waits for, reading what precedes it as the benchmark's own output.
 		#[cfg(all(unix, target_pointer_width = "64"))]
 		let used = {
+			// Both ends together, so no delay between them counts in one and not the other.
+			let (end, wall) = (rusage::Usage::now(), window.elapsed());
 			let mut used = rusage::Usage::default();
-			rusage::Usage::now().add_since(start, &mut used);
-			format!("\n{RUSAGE}{}", used.fields())
+			end.add_since(start, &mut used);
+			// The wall clock only where one clock times the whole sample: a step, setup, or drop
+			// between calls, or a benchmark's own timer, leaves the sample wider than its time, so
+			// how busy the sample kept the CPUs would not explain that time.
+			if sampler.window() == "sample" {
+				format!("\n{RUSAGE}{}\n{WALL}{}", used.fields(), wall.as_nanos())
+			} else {
+				format!("\n{RUSAGE}{}", used.fields())
+			}
 		};
 		#[cfg(not(all(unix, target_pointer_width = "64")))]
 		let used = "";
@@ -1596,15 +1609,33 @@ mod tests {
 		let lines: Vec<&str> = rest.lines().filter(|line| !line.is_empty()).collect();
 		#[cfg(all(unix, target_pointer_width = "64"))]
 		{
+			// What the process used over each sample comes first, so an older swole reads it as the
+			// benchmark's own output; a benchmark's own timer covers less than the sample, so no
+			// wall clock comes with it.
 			assert_eq!(lines.len(), 4, "{out}");
 			assert_eq!([lines[1], lines[3]], ["swole sample 10", "swole sample 40"]);
-			// What the process used over each sample comes first, so an older swole reads it as the
-			// benchmark's own output.
 			for usage in [lines[0], lines[2]] {
 				let fields = usage.strip_prefix(RUSAGE).unwrap().split(' ');
 				let fields: Vec<u64> = fields.map(|n| n.parse().unwrap()).collect();
 				assert_eq!(fields.len(), 7, "{usage}");
 			}
+			// One clock around the whole sample says over how long.
+			let mut out = Vec::new();
+			serve(
+				"a",
+				kept((), |_| (), None, None),
+				String::new(),
+				"1\n".as_bytes(),
+				&mut out,
+				false,
+			)
+			.unwrap();
+			let out = String::from_utf8(out).unwrap();
+			let lines: Vec<&str> = out.lines().filter(|line| !line.is_empty()).collect();
+			assert_eq!(lines.len(), 3, "{out}");
+			assert!(lines[0].starts_with(RUSAGE), "{out}");
+			let wall: u64 = lines[1].strip_prefix(WALL).unwrap().parse().unwrap();
+			assert!(wall > 0, "{out}");
 		}
 		#[cfg(not(all(unix, target_pointer_width = "64")))]
 		assert_eq!(lines, ["swole sample 10", "swole sample 40"]);

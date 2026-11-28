@@ -255,11 +255,12 @@ fn demangle(name: &str) -> String {
 	rustc_demangle::try_demangle(name).map_or_else(|_| name.to_owned(), |name| format!("{name:#}"))
 }
 
-/// For each benchmark whose time changed, the functions whose sampled self cycles moved its
-/// sampled cycles most, a Markdown table as sim's attribution prints one; empty when none has any.
-pub fn table(profiles: &BTreeMap<String, [Profile; 2]>, sampling: &crate::perf::Sampling) -> String {
+/// For each of `names`, in their order, whose time changed, the functions whose sampled self
+/// cycles moved its sampled cycles most, a Markdown table as sim's attribution prints one; empty
+/// when none has any.
+pub fn table(profiles: &BTreeMap<String, [Profile; 2]>, names: &[String], sampling: &crate::perf::Sampling) -> String {
 	let mut out = String::new();
-	for (name, [base, head]) in profiles {
+	for (name, [base, head]) in names.iter().filter_map(|name| Some((name, profiles.get(name)?))) {
 		let was: f64 = base.functions.values().sum();
 		let shown = name.replace('|', "\\|");
 		for Row {
@@ -430,7 +431,7 @@ mod tests {
 
 	fn table(base: &[(&str, f64)], head: &[(&str, f64)]) -> String {
 		let profiles = BTreeMap::from([("bench".to_owned(), [profile(base), profile(head)])]);
-		super::table(&profiles, &sampling())
+		super::table(&profiles, &["bench".to_owned()], &sampling())
 	}
 
 	#[test]
@@ -453,7 +454,7 @@ mod tests {
 		assert!(rows[1].contains("`alloc` | ~500 | ~560 | ~+60"), "{table}");
 		assert!(rows[2].contains("`new` (not in base) | ~0 | ~30 | ~+30"), "{table}");
 		assert!(!table.contains("gone"), "{table}");
-		assert_eq!(super::table(&BTreeMap::new(), &sampling()), "");
+		assert_eq!(super::table(&BTreeMap::new(), &[], &sampling()), "");
 	}
 
 	#[test]
