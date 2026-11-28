@@ -232,7 +232,10 @@ fn simulates_caches_and_branches_exactly() {
 		std::fs::read_to_string(dir.join(name)).unwrap()
 	};
 	let text = report("one.json");
-	assert_eq!(text, report("two.json"), "a second run counts otherwise");
+	exact(&text);
+	let again = report("two.json");
+	exact(&again);
+	assert_eq!(text, again, "a second run counts otherwise");
 	let report: serde_json::Value = serde_json::from_str(&text).unwrap();
 	assert!(
 		report["host"].as_array().unwrap().iter().any(|line| line
@@ -243,11 +246,7 @@ fn simulates_caches_and_branches_exactly() {
 		report["host"]
 	);
 	let value = |bench: &str, measure: &str| {
-		let measured = &report["benchmarks"][bench]["head"][measure];
-		// A program's benchmarks count five times, each the same.
-		assert_eq!(measured["lower"], measured["upper"], "{bench} {measure}: {measured}");
-		assert_eq!(measured["lower"], measured["value"], "{bench} {measure}: {measured}");
-		measured["value"]
+		report["benchmarks"][bench]["head"][measure]["value"]
 			.as_f64()
 			.unwrap_or_else(|| panic!("{bench} has no {measure}: {report}"))
 	};
@@ -266,6 +265,25 @@ fn simulates_caches_and_branches_exactly() {
 		let cycles = (value(fast, "estimated cycles"), value(slow, "estimated cycles"));
 		// A debug build's dozens of instructions an iteration dilute what a miss adds.
 		assert!(cycles.1 > 1.1 * cycles.0, "{fast} {slow}: {cycles:?} estimated cycles");
+	}
+}
+
+/// Fails unless every sample of every benchmark in the sim report `text` counted the same, each
+/// measure's least and most its value: the fixture runs no other thread, but swole cannot watch a
+/// program's threads, so it samples each benchmark, and one divergent sample fails here within a
+/// run rather than only when two runs disagree.
+fn exact(text: &str) {
+	let report: serde_json::Value = serde_json::from_str(text).unwrap();
+	assert_eq!(report["mode"], "sim", "{text}");
+	let benchmarks = report["benchmarks"].as_object().unwrap();
+	assert!(!benchmarks.is_empty(), "{text}");
+	for (bench, entry) in benchmarks {
+		let head = entry["head"].as_object().unwrap_or_else(|| panic!("{bench}: {entry}"));
+		for (measure, measured) in head {
+			assert!(measured["value"].is_number(), "{bench} {measure}: {measured}");
+			assert_eq!(measured["lower"], measured["value"], "{bench} {measure}: {measured}");
+			assert_eq!(measured["upper"], measured["value"], "{bench} {measure}: {measured}");
+		}
 	}
 }
 
