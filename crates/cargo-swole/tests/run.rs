@@ -841,15 +841,17 @@ fn compares_a_base_with_every_change_in_the_working_tree_from_one_directory() {
 	let cache = scratch("compare-cache");
 	git(&repo, &["init", "--quiet"]);
 	std::fs::write(repo.join("a.list"), "cwd=1000,a=1000,").unwrap();
-	std::fs::write(repo.join("d.list"), "d=100,").unwrap();
+	// Each side's list takes as many bytes, since the shell exports it past swole's padding: a
+	// longer one moves the fixture's stack, and with it the cache lines its counts miss on.
+	std::fs::write(repo.join("d.list"), "d=10000,").unwrap();
 	std::fs::write(repo.join(".gitignore"), "Cargo.lock\n").unwrap();
 	git(&repo, &["add", "."]);
 	git(&repo, &["commit", "--quiet", "-m", "base"]);
 	// Changed but unstaged, staged only, untracked, and deleted.
 	std::fs::write(repo.join("a.list"), "cwd=1000,a=2000,").unwrap();
-	std::fs::write(repo.join("c.list"), "c=300,").unwrap();
+	std::fs::write(repo.join("c.list"), "c=3,").unwrap();
 	git(&repo, &["add", "c.list"]);
-	std::fs::write(repo.join("b.list"), "b=500,").unwrap();
+	std::fs::write(repo.join("b.list"), "b=5,").unwrap();
 	std::fs::remove_file(repo.join("d.list")).unwrap();
 	let status = git(&repo, &["status", "--porcelain"]);
 	let out = Command::new(env!("CARGO_BIN_EXE_swole"))
