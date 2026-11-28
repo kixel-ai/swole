@@ -512,7 +512,8 @@ benchmark's `functions`. A sample the kernel dropped, a stretch it stopped sampl
 buffer that filled fails the run, since the other functions would claim its cycles. A benchmark
 that times itself names no functions, since its calls may hold work its time leaves out, nor does
 one whose two sides' clocks bracket unlike windows, such as a sample's calls in one and each call
-alone in the other.
+alone in the other, or whose harnesses differ in whether sampling starts inside the clock's reads,
+as a base from before swole started it there does.
 
 Sampling needs a PMU that takes precise samples, which a VM's often lacks, and, since it samples
 whole CPUs, `perf_event_paranoid` at most 0 or `CAP_PERFMON`, as [Privileges](#privileges)
@@ -560,7 +561,9 @@ counts, which a burst of other processes' records on its CPUs can cause as well 
 nothing, and no later sample takes as many calls; a side left with no sample fails the run. A
 trace counts its losses from Linux 6.0 on. A
 benchmark that times itself has none, since its calls may hold waits its time leaves out, as does a
-side whose harness predates profiling. A trace needs the host's tier L-1, as
+side whose harness predates starting its events inside its clock's reads. A sample whose records
+miss one of its clock's windows, as when the benchmark moves its thread off the CPUs swole traces,
+fails the run. A trace needs the host's tier L-1, as
 [Capabilities](#capabilities) says, and its tracepoints' IDs from tracefs, as
 [Privileges](#privileges) grants; a run without them says why and has no waits.
 

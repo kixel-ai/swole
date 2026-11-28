@@ -887,7 +887,8 @@ fn trace(job: &Job, how: Tracing, dir: &Path) -> Result<Vec<Measure>, String> {
 		)?;
 		let mut process = Process::start(&job.label, command, dir)?;
 		let mut rings = crate::offcpu::Rings::new(how.tracing, armed.receive()?, process.child.id())?;
-		match process.profiles.take().as_deref() {
+		let window = process.profiles.take();
+		match window.as_deref() {
 			Some(window) if window != "own" && !process.inside => {
 				process.finish()?;
 				eprintln!(
@@ -935,8 +936,23 @@ fn trace(job: &Job, how: Tracing, dir: &Path) -> Result<Vec<Measure>, String> {
 				iterations = most;
 				continue;
 			}
+			// Its clock times each call alone, or the whole sample, and a window the trace missed,
+			// as one a thread the benchmark moved off the traced CPUs opened, would hide its waits.
+			let waits = drained.waits();
+			let windows = if window.as_deref() == Some("call") {
+				iterations
+			} else {
+				1
+			};
+			if waits.windows != windows {
+				process.finish()?;
+				return Err(format!(
+					"{}: its trace saw {} of a sample's {windows} timed windows, as when the benchmark moves its thread off the CPUs swole leased it, so its waits would go unseen",
+					job.label, waits.windows
+				));
+			}
 			calls += iterations;
-			samples.push((drained.waits(), iterations));
+			samples.push((waits, iterations));
 			if begun.elapsed() < TRACE_SLICE {
 				iterations = (iterations * 2).min(most);
 			}

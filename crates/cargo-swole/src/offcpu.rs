@@ -134,6 +134,8 @@ pub struct Waits {
 	/// process may have woken it on a CPU the trace does not watch, so it may hold a wait for a
 	/// CPU, and is never a lock's.
 	unwoken: u64,
+	/// How many windows its clock timed closed.
+	pub windows: u64,
 }
 
 impl Waits {
@@ -160,10 +162,12 @@ impl Tracing {
 					.to_owned(),
 			);
 		}
+		// An empty mount point where tracefs is not mounted has no events; one swole may not read
+		// is kept, so the read below says how to grant it.
 		let root = TRACEFS
 			.iter()
 			.map(std::path::Path::new)
-			.find(|dir| dir.is_dir())
+			.find(|dir| dir.join("events").try_exists().unwrap_or(true))
 			.ok_or("this kernel mounts no tracefs, whose tracepoints name a futex call")?;
 		let read = |event: &str, file: &str| {
 			let path = root.join("events").join(event).join(file);
@@ -432,7 +436,7 @@ fn account(records: &[Record]) -> Waits {
 		off: Option<(u64, bool, Option<Site>)>,
 		/// The futex wait it entered and has not returned from.
 		waiting: Option<Site>,
-		/// Whether it exited, so its last switch out waits for nothing.
+		/// Whether it exited, so its last switch out, which no switch in follows, waits for nothing.
 		gone: bool,
 	}
 	/// Counts a wait from `since` until `until`, which a wakeup the trace saw ended if `woken`.
@@ -459,12 +463,15 @@ fn account(records: &[Record]) -> Waits {
 		match record.event {
 			Event::Start if !open && harness.is_none_or(|tid| tid == record.tid) => open = true,
 			Event::Stop if open => {
-				for thread in threads.values_mut() {
+				// An exiting thread may still block as it tears down, but its last switch out
+				// never ends.
+				for thread in threads.values_mut().filter(|thread| !thread.gone) {
 					if let Some(off) = thread.off.take() {
 						close(&mut waits, off, record.time, false);
 					}
 				}
 				threads.clear();
+				waits.windows += 1;
 				(open, harness) = (false, Some(record.tid));
 			}
 			_ if !open => {}
@@ -482,7 +489,6 @@ fn account(records: &[Record]) -> Waits {
 			event => {
 				let thread = threads.entry(record.tid).or_default();
 				match event {
-					Event::Out { .. } if thread.gone => {}
 					Event::Out { preempted } => {
 						let site = thread.waiting.filter(|_| !preempted);
 						thread.off = Some((record.time, preempted, site));
@@ -494,7 +500,8 @@ fn account(records: &[Record]) -> Waits {
 					}
 					Event::Enter(site) => thread.waiting = site,
 					Event::Exit => thread.waiting = None,
-					Event::Gone => thread.gone = true,
+					// A thread exit_group kills mid-wait never returns from its futex call.
+					Event::Gone => (thread.gone, thread.waiting) = (true, None),
 					Event::Start | Event::Stop | Event::Wake => unreachable!("matched above"),
 				}
 			}
@@ -828,8 +835,11 @@ mod tests {
 			record(500, 2, Event::In),
 			record(600, 2, Event::Enter(Some(SITE))),
 			record(650, 2, out),
-			// A worker that exits leaves the CPU for good, waiting on nothing.
+			// A worker that exits may block as it tears down, then leaves the CPU for good,
+			// waiting on nothing.
 			record(700, 3, Event::Gone),
+			record(705, 3, out),
+			record(708, 3, Event::In),
 			record(710, 3, out),
 			// A shared futex's wait that no seen wakeup ended may hold another process's wakeup,
 			// unseen, and is never a lock's; one a seen wakeup ended is.
@@ -858,10 +868,11 @@ mod tests {
 		assert_eq!(
 			account(&records),
 			Waits {
-				blocked: 50 + 80 + 10 + 350 + 10 + 30 + 5,
+				blocked: 50 + 80 + 10 + 350 + 10 + 3 + 30 + 5,
 				runnable: 20 + 5 + 5,
 				futex: BTreeMap::from([(SITE, 80 + 350), (shared, 5)]),
 				unwoken: 30,
+				windows: 2,
 			}
 		);
 		// A window left open, as a sample's last records before its stop leave one, closes nothing.
@@ -878,6 +889,7 @@ mod tests {
 					runnable: 0,
 					futex: BTreeMap::from([(SITE, 100), (lock, 200)]),
 					unwoken: 100,
+					windows: 1,
 				},
 				2,
 			),
@@ -887,6 +899,7 @@ mod tests {
 					runnable: 40,
 					futex: BTreeMap::from([(lock, 600)]),
 					unwoken: 0,
+					windows: 1,
 				},
 				2,
 			),
