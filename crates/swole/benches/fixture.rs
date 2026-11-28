@@ -136,7 +136,11 @@ struct Worker {
 	recv: std::sync::mpsc::Receiver<u64>,
 }
 
+/// Fails unless the process may use more than one CPU, as a benchmark sizing its threads to the
+/// host checks at setup, before its first call shows swole it runs other threads.
 fn worker() -> Worker {
+	let cpus = std::thread::available_parallelism().unwrap();
+	assert!(cpus.get() > 1, "this process may use {cpus} CPU");
 	let (send, work) = std::sync::mpsc::channel();
 	let (done, recv) = std::sync::mpsc::channel();
 	std::thread::spawn(move || {
