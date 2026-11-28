@@ -8,7 +8,7 @@ When the setup probe detects L0 `perf` access (`perf_event_paranoid <= 0` or `CA
 
 Decided 2026-11-26 (maintainer, `/quest-run`, [kixel-ai/swole#6](https://github.com/kixel-ai/swole/pull/6)): ✅ require exclusive-cores, take a host-enforced whole-socket lease for the uncore/RAPL pass, and report bandwidth, L3 misses, and energy as socket-wide, timing-like measurements that include device I/O and DMA (rejected: also fail the pass unless the host keeps device traffic out, which no host setting can guarantee; report socket-wide readings on shared hosts without a lease, which other agents' traffic would swamp; drop uncore/RAPL).
 
-Decided 2026-11-26 (maintainer, `/quest-plan`, splitting the former `quest/m0/deep-perf.md`): ✅ defer uncore/RAPL to m1 while keeping [native attribution](/quest/m0/native-attribution.md) and [off-CPU/futex contention](/quest/m0/off-cpu-contention.md) in m0, since a whole-socket lease cannot run on shared dev machines or busy CI runners (rejected: keeping uncore/RAPL in m0; keeping `deep-perf` combined).
+Decided 2026-11-26 (maintainer, `/quest-plan`, splitting the former `quest/m0/deep-perf.md`): ✅ defer uncore/RAPL to m1 while keeping native attribution and [off-CPU/futex contention](/quest/m0/off-cpu-contention.md) in m0, since a whole-socket lease cannot run on shared dev machines or busy CI runners (rejected: keeping uncore/RAPL in m0; keeping `deep-perf` combined).
 
 Recommendations for the implementer:
 

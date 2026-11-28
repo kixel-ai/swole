@@ -23,6 +23,9 @@ name = "cargo-swole"
 path = "src/bin/cargo-swole.rs"
 
 [dependencies]
+addr2line = { version = "0.27.1", default-features = false, features = ["loader"] }
+object = { version = "0.40.0", default-features = false, features = ["read_core", "elf", "std"] }
+rustc-demangle = "0.1.28"
 serde_json = "1.0.154"
 toml = "1.1.8"
 
