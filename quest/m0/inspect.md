@@ -12,15 +12,11 @@ Decided 2026-11-26 (maintainer, `/quest-plan`):
 
 Recommendations for the implementer:
 
-- Reuse the Callgrind parser from [per-function attribution](/quest/m0/callgrind-attribution.md), enabling `--dump-line=yes --dump-instr=yes` only in `swole inspect` (leaving bulk `swole sim` fast with `--dump-line=no`).
+- Extend `callgrind.rs`'s per-function parser (which keeps only each function's self cost by name), enabling `--dump-line=yes --dump-instr=yes` only in `swole inspect` (leaving bulk `swole sim` fast with `--dump-line=no`).
 - Resolve symbol addresses and `.text` byte sizes from the compiled benchmark ELF binary (and disassemble the top 1 to 3 hot functions via `objdump` / `llvm-objdump` or an embedded decoder), aligning instruction-level costs (`Ir`, cache misses, branch mispredicts) beside source lines and assembly instructions.
 - With `<base>`, diff the top hot function's `.text` size, instruction/cycle breakdown, and changed hot assembly blocks between base and head.
 - Also record target/function `.text` code size in `sim` / `bench` `--report` where the symbol resolves cleanly, at zero runtime cost.
 - Verify on a fixture with two revisions of a loop (e.g., adding a branch or breaking vectorization) confirming `swole inspect` names the changed source lines, assembly instructions, and `.text` size delta.
-
-## Required
-
-- [Per-function attribution from Callgrind dumps in every sim compare](/quest/m0/callgrind-attribution.md) - extends the Callgrind profile parser with line and instruction attribution
 
 ## Hosts
 

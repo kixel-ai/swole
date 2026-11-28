@@ -749,6 +749,7 @@ mod tests {
 				.iter()
 				.map(|(name, ir)| ((*name).to_owned(), details(*ir)))
 				.collect(),
+			functions: Default::default(),
 			throughput: Default::default(),
 		}
 	}

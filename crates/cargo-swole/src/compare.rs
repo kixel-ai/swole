@@ -92,6 +92,7 @@ pub fn compare(base: &str, options: &Options, mode: Mode) -> Result<(), String> 
 			&metrics::Pick::new(order, options.all_details, true),
 		)
 	);
+	print!("{}", crate::attribution::table(&before, &after));
 	if let Some(report) = &options.report {
 		metrics::report(&after, Some(&before), &counter, Some(&sha)).write(report)?;
 		eprintln!("swole: wrote {}", report.display());
@@ -496,8 +497,14 @@ fn snapshot(top: &Path, index: &Path) -> Result<String, String> {
 		top,
 		&["rev-parse", "--path-format=absolute", "--git-path", "index"],
 	)?);
-	match std::fs::copy(&own, index) {
-		Ok(_) => {}
+	// The copy keeps the original's modification time, since Git tells a file edited in the tick of
+	// the index's last write from a clean one by comparing the two, and a newer copy would pass it as clean.
+	let copy = std::fs::copy(&own, index).and_then(|_| {
+		let modified = std::fs::metadata(&own)?.modified()?;
+		std::fs::File::options().write(true).open(index)?.set_modified(modified)
+	});
+	match copy {
+		Ok(()) => {}
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
 			let _ = std::fs::remove_file(index);
 		}
@@ -839,6 +846,7 @@ mod tests {
 			spread: BTreeMap::new(),
 			threaded: BTreeSet::new(),
 			details: BTreeMap::new(),
+			functions: BTreeMap::new(),
 			throughput: BTreeMap::new(),
 		}
 	}
