@@ -552,7 +552,10 @@ mod linux {
 		open: impl Fn(i32, &mut [i32]) -> std::io::Result<()> + Send + Sync + 'static,
 	) -> Result<Armed, String> {
 		use std::os::unix::process::CommandExt;
-		assert!((1..=CHUNK).contains(&per), "a message hands over a CPU's events at once");
+		assert!(
+			(1..=CHUNK).contains(&per),
+			"a message hands over a CPU's events at once"
+		);
 		let mut pair = [0i32; 2];
 		// SAFETY: `pair` holds the two descriptors the call writes.
 		if unsafe { socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair.as_mut_ptr()) } != 0 {

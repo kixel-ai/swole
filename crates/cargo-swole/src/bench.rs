@@ -73,6 +73,9 @@ const TRACED: Duration = Duration::from_millis(100);
 /// How long a trace of one side may take in all, before its calls fill [`TRACED`].
 const TRACE_WALL: Duration = Duration::from_secs(1);
 
+/// How long a sample of a trace may take, past which its calls stop doubling.
+const TRACE_SLICE: Duration = Duration::from_millis(10);
+
 /// Times the working tree's benchmarks, or with `base` each beside the base's, with what each
 /// used and every counter the host allows, prints them, and writes them to `--out` and `--report`
 /// when given.
@@ -830,7 +833,7 @@ struct Tracing<'a> {
 	cpus: &'a [usize],
 	/// The library its process runs under, as a timed one does.
 	preload: Option<&'a Path>,
-	/// The iterations each of its samples takes, as each timed one did, at most.
+	/// The iterations a timed sample took, which none of its samples takes more of.
 	iterations: u64,
 }
 
@@ -872,25 +875,32 @@ fn trace(job: &Job, how: Tracing, dir: &Path) -> Result<Vec<Measure>, String> {
 			}
 			Some(_) => {}
 		}
-		// A sample to warm up, as timing's calibration does, which the trace drops with setup's.
-		process.sample(how.iterations)?;
+		// A call to warm up, which the trace drops with setup's.
+		process.sample(1)?;
 		drop(rings.drain()?);
 		let started = Instant::now();
 		let mut timed = Duration::ZERO;
-		let mut iterations = how.iterations;
+		// Samples grow from one call, doubling while one takes under a slice of the wall clock, to
+		// as many calls as a timed one: the rings take every process's records on their CPUs, and
+		// a clock that brackets each call alone starts and stops the events on each CPU each call.
+		let (mut iterations, mut most) = (1, how.iterations);
 		let mut samples = Vec::new();
 		while timed < TRACED && started.elapsed() < TRACE_WALL {
+			let begun = Instant::now();
 			let sample = process.sample(iterations)?;
 			let drained = rings.drain()?;
 			// A record dropped would leave a wait open, or never open one, so a sample whose ring
-			// filled counts nothing. A ring holds every process's records on its CPU, so another's
-			// burst fills one too. A sample of fewer calls fits, and one of a single call is retried.
+			// filled counts nothing, and no later sample takes as many calls.
 			if drained.filled > 0 {
-				iterations = (iterations / 2).max(1);
+				most = (iterations / 2).max(1);
+				iterations = most;
 				continue;
 			}
 			timed += Duration::from_nanos(sample.nanos);
 			samples.push((drained.waits(), iterations));
+			if begun.elapsed() < TRACE_SLICE {
+				iterations = (iterations * 2).min(most);
+			}
 		}
 		if samples.is_empty() {
 			process.finish()?;

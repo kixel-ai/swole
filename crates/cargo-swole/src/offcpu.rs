@@ -155,9 +155,7 @@ impl Tracing {
 			option: offset(&read("sys_enter_prctl", "format")?, "option")?,
 		};
 		// Opened as a trace opens them, on a CPU swole may run on, and its ring mapped.
-		let cpu = *crate::perf::allowed()?
-			.first()
-			.ok_or("swole may run on no CPU")?;
+		let cpu = *crate::perf::allowed()?.first().ok_or("swole may run on no CPU")?;
 		let mut fds = [-1i32; Self::EVENTS];
 		let opened = tracing.open(cpu as i32, &mut fds);
 		// SAFETY: the kernel returned each new descriptor, which nothing else owns.
@@ -213,14 +211,17 @@ impl Tracing {
 		};
 		fds[0] = traced(&switches, cpu)?;
 		for (fd, id) in fds[1..].iter_mut().zip([self.enter, self.exit, self.prctl]) {
-			let tracepoint = Attr {
-				kind: PERF_TYPE_TRACEPOINT,
-				config: id,
-				sample_period: 1,
-				sample_type: PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_RAW | PERF_SAMPLE_STACK_USER,
-				sample_stack_user: 8,
-				..base
-			};
+			let tracepoint =
+				Attr {
+					kind: PERF_TYPE_TRACEPOINT,
+					config: id,
+					sample_period: 1,
+					sample_type: PERF_SAMPLE_IP
+						| PERF_SAMPLE_TID | PERF_SAMPLE_TIME
+						| PERF_SAMPLE_RAW | PERF_SAMPLE_STACK_USER,
+					sample_stack_user: 8,
+					..base
+				};
 			*fd = traced(&tracepoint, cpu)?;
 		}
 		Ok(())
@@ -232,12 +233,20 @@ impl Tracing {
 		let malformed = || format!("a trace's ring buffer holds a record of kind {kind} too short to read");
 		let word = |at: usize| -> Result<u64, String> {
 			Ok(u64::from_ne_bytes(
-				record.get(at..at + 8).ok_or_else(malformed)?.try_into().expect("8 bytes"),
+				record
+					.get(at..at + 8)
+					.ok_or_else(malformed)?
+					.try_into()
+					.expect("8 bytes"),
 			))
 		};
 		let half = |at: usize| -> Result<u32, String> {
 			Ok(u32::from_ne_bytes(
-				record.get(at..at + 4).ok_or_else(malformed)?.try_into().expect("4 bytes"),
+				record
+					.get(at..at + 4)
+					.ok_or_else(malformed)?
+					.try_into()
+					.expect("4 bytes"),
 			))
 		};
 		match kind {
@@ -380,32 +389,34 @@ fn account(records: &[Record]) -> Waits {
 /// sample's calls shared, since the scheduler moves them: blocked, preempted, futex, and lock
 /// wait, a futex wait at one of `locks` having waited to take a lock.
 pub fn measures(samples: &[(Waits, u64)], locks: &BTreeSet<Site>) -> Vec<Measure> {
-	let kinds: [(&str, fn(&Waits, &BTreeSet<Site>) -> u64); 4] = [
-		("blocked time", |waits, _| waits.blocked),
-		("preempted time", |waits, _| waits.preempted),
-		("futex wait time", |waits, _| waits.futex.values().sum()),
-		("lock wait time", |waits, locks| {
-			waits
-				.futex
-				.iter()
-				.filter(|(site, _)| locks.contains(site))
-				.map(|(_, ns)| ns)
-				.sum()
-		}),
-	];
+	const NAMES: [&str; 4] = ["blocked time", "preempted time", "futex wait time", "lock wait time"];
 	let calls: u64 = samples.iter().map(|(_, calls)| calls).sum();
 	if calls == 0 {
 		return Vec::new();
 	}
-	kinds
+	// Each sample's waits in the order of `NAMES`, with its calls.
+	let kinds: Vec<([u64; 4], u64)> = samples
+		.iter()
+		.map(|(waits, calls)| {
+			let futex = waits.futex.values().sum();
+			let lock = (waits.futex.iter())
+				.filter(|(site, _)| locks.contains(site))
+				.map(|(_, ns)| ns)
+				.sum();
+			([waits.blocked, waits.preempted, futex, lock], *calls)
+		})
+		.collect();
+	NAMES
 		.into_iter()
-		.map(|(name, of)| {
-			let total: u64 = samples.iter().map(|(waits, _)| of(waits, locks)).sum();
-			let (least, most) = samples
-				.iter()
+		.enumerate()
+		.map(|(i, name)| {
+			let total: u64 = kinds.iter().map(|(waits, _)| waits[i]).sum();
+			let (least, most) = (kinds.iter())
 				.filter(|(_, calls)| *calls > 0)
-				.map(|(waits, calls)| of(waits, locks) as f64 / *calls as f64)
-				.fold((f64::INFINITY, 0.0f64), |(least, most), per| (least.min(per), most.max(per)));
+				.map(|(waits, calls)| waits[i] as f64 / *calls as f64)
+				.fold((f64::INFINITY, 0.0f64), |(least, most), per| {
+					(least.min(per), most.max(per))
+				});
 			Measure {
 				spread: Some((least, most)),
 				..Measure::new(name, total as f64 / calls as f64, "ns")
@@ -455,9 +466,13 @@ fn takes_lock(name: &str) -> bool {
 	// An inherent method's path, as `<std::sys::sync::mutex::futex::Mutex>::lock_contended`.
 	let name = name.replace(['<', '>'], "");
 	if name.starts_with("std::") {
-		return ["Mutex::lock_contended", "RwLock::read_contended", "RwLock::write_contended"]
-			.iter()
-			.any(|function| name.ends_with(function));
+		return [
+			"Mutex::lock_contended",
+			"RwLock::read_contended",
+			"RwLock::write_contended",
+		]
+		.iter()
+		.any(|function| name.ends_with(function));
 	}
 	let name = name.trim_start_matches('_');
 	name.starts_with("lll_lock_wait")
@@ -705,7 +720,7 @@ mod tests {
 			raw.extend(arg.to_ne_bytes());
 		}
 		// The kernel pads the raw record so it and its size end on a word.
-		while (raw.len() + 4) % 8 != 0 {
+		while !(raw.len() + 4).is_multiple_of(8) {
 			raw.push(0);
 		}
 		let mut record = vec![0u8; 8];
@@ -795,11 +810,12 @@ mod tests {
 			parse(PERF_RECORD_SWITCH_CPU_WIDE, PERF_RECORD_MISC_SWITCH_OUT, &switch(5, 21)),
 			at(21, 8, Event::Out { preempted: false })
 		);
-		assert_eq!(parse(PERF_RECORD_SWITCH_CPU_WIDE, 0, &switch(5, 22)), at(22, 8, Event::In));
+		assert_eq!(
+			parse(PERF_RECORD_SWITCH_CPU_WIDE, 0, &switch(5, 22)),
+			at(22, 8, Event::In)
+		);
 		// Another process's.
 		assert_eq!(parse(PERF_RECORD_SWITCH_CPU_WIDE, 0, &switch(6, 23)), Parsed::Other);
 		assert!(tracing.parse(PERF_RECORD_SWITCH_CPU_WIDE, 0, &[0u8; 12], 5).is_err());
 	}
 }
-
-
