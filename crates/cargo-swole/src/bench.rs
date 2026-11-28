@@ -250,8 +250,17 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 			} else {
 				index.to_string()
 			});
-			// The other cores a threaded benchmark spreads over, leased until it is timed and counted.
-			let spreading;
+			// Every benchmark starts on the spread, so one that checks at setup that it may use the
+			// host's CPUs can, and narrows to the reserved CPU once its first call ran no other thread.
+			// A threaded one keeps the other cores, leased until it is timed and counted.
+			let mut spreading = reservation
+				.as_ref()
+				.map(crate::cores::Reservation::spread)
+				.transpose()?;
+			let first = spreading
+				.as_ref()
+				.map(|spread| spread.cpus.clone())
+				.or_else(|| exclusive.clone());
 			let (timed, iterations, used, timed_threaded, declared, own, cpus, inherits) = match (&base, &head) {
 				(Some(base), Some(head)) => {
 					let spawn = |cpus: Option<&[usize]>| -> Result<(Process, Process), String> {
@@ -260,13 +269,20 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 							Process::spawn(head, cpus, preload.as_deref(), &dir.join("head"))?,
 						))
 					};
-					let mut cpus = exclusive.clone();
+					let mut cpus = first;
 					let (mut base, mut head) = spawn(cpus.as_deref())?;
-					spreading = spread(reservation.as_ref(), &name, widen || base.threaded || head.threaded)?;
-					if let Some(spread) = &spreading {
-						base.finish()?;
-						head.finish()?;
-						cpus = Some(spread.cpus.clone());
+					if narrow(
+						spreading.as_ref(),
+						reservation.as_ref(),
+						&name,
+						widen || base.threaded || head.threaded,
+					) {
+						// Both reaped, even when one fails, before the spread is released, so no other
+						// run times beside either.
+						let finished = base.finish();
+						finished.and(head.finish())?;
+						spreading = None;
+						cpus = exclusive.clone();
 						(base, head) = spawn(cpus.as_deref())?;
 					}
 					let (iterations, pairs) = paired(&mut base, &mut head, &mut coin)?;
@@ -300,12 +316,18 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 						(None, Some(head)) => (Which::Head, head),
 						_ => unreachable!("every name is one side's"),
 					};
-					let mut cpus = exclusive.clone();
+					let mut cpus = first;
 					let mut process = Process::spawn(job, cpus.as_deref(), preload.as_deref(), &dir.join(side.name()))?;
-					spreading = spread(reservation.as_ref(), &name, widen || process.threaded)?;
-					if let Some(spread) = &spreading {
+					if narrow(
+						spreading.as_ref(),
+						reservation.as_ref(),
+						&name,
+						widen || process.threaded,
+					) {
 						process.finish()?;
-						cpus = Some(spread.cpus.clone());
+						// Released once the wide process has exited, so no other run times beside it.
+						spreading = None;
+						cpus = exclusive.clone();
 						process = Process::spawn(job, cpus.as_deref(), preload.as_deref(), &dir.join(side.name()))?;
 					}
 					let (iterations, samples) = alone(&mut process)?;
@@ -552,24 +574,28 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 /// scripts of the profile, such as `DEBUG`, as it is.
 const SYMBOLS: &[&str] = &["-Cdebuginfo=limited", "-Cstrip=none"];
 
-/// The CPUs `name`'s processes spread over in place of the reserved CPU, when another thread ran
-/// beside its first call, which one CPU would serialize.
-fn spread(
+/// Whether `name`'s processes, started on `spreading`, narrow to the reserved CPU, since no other
+/// thread ran beside its first call; one that ran one keeps the spread, as one CPU would serialize
+/// its threads.
+fn narrow(
+	spreading: Option<&crate::cores::Spread>,
 	reservation: Option<&crate::cores::Reservation>,
 	name: &str,
 	threaded: bool,
-) -> Result<Option<crate::cores::Spread>, String> {
-	let Some(reservation) = reservation.filter(|_| threaded) else {
-		return Ok(None);
+) -> bool {
+	let (Some(spread), Some(reservation)) = (spreading, reservation) else {
+		return false;
 	};
-	let spread = reservation.spread()?;
-	eprintln!(
-		"swole: {name} runs other threads, so it times on CPUs {}, every core no other swole run leases, rather \
-		 than CPU {} alone",
-		perf::list(&spread.cpus),
-		reservation.cpu()
-	);
-	Ok(Some(spread))
+	if threaded {
+		eprintln!(
+			"swole: {name} runs other threads, so it times on CPUs {}, every core no other swole run leases, rather \
+			 than CPU {} alone",
+			perf::list(&spread.cpus),
+			reservation.cpu()
+		);
+		return false;
+	}
+	true
 }
 
 /// What the process used over `samples`, each a call's share of its sample's, user and system
