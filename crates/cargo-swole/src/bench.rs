@@ -876,8 +876,7 @@ fn trace(job: &Job, how: Tracing, dir: &Path) -> Result<Vec<Measure>, String> {
 			Some(_) => {}
 		}
 		// A call to warm up, which the trace drops with setup's.
-		process.sample(1)?;
-		drop(rings.drain()?);
+		rings.during(|| process.sample(1))?.0?;
 		let started = Instant::now();
 		let mut timed = Duration::ZERO;
 		// Samples grow from one call, doubling while one takes under a slice of the wall clock, to
@@ -887,10 +886,10 @@ fn trace(job: &Job, how: Tracing, dir: &Path) -> Result<Vec<Measure>, String> {
 		let mut samples = Vec::new();
 		while timed < TRACED && started.elapsed() < TRACE_WALL {
 			let begun = Instant::now();
-			let sample = process.sample(iterations)?;
-			let drained = rings.drain()?;
+			let (sample, drained) = rings.during(|| process.sample(iterations))?;
+			let sample = sample?;
 			// A record dropped would leave a wait open, or never open one, so a sample whose ring
-			// filled counts nothing, and no later sample takes as many calls.
+			// filled before it was read counts nothing, and no later sample takes as many calls.
 			if drained.filled > 0 {
 				most = (iterations / 2).max(1);
 				iterations = most;

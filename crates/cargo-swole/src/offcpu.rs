@@ -38,10 +38,12 @@ pub const MOST_RECORD: usize = 256;
 /// The tracepoints a trace opens, and where their records hold what it reads.
 #[derive(Clone, Debug)]
 pub struct Tracing {
-	/// The IDs of `syscalls:sys_enter_futex`, `sys_exit_futex`, and `sys_enter_prctl`.
+	/// The IDs of `syscalls:sys_enter_futex`, `sys_exit_futex`, `sys_enter_prctl`, and
+	/// `sys_exit_prctl`.
 	enter: u64,
 	exit: u64,
 	prctl: u64,
+	prctled: u64,
 	/// Where in a futex call's tracepoint record its operation lies, and a prctl's option.
 	op: usize,
 	option: usize,
@@ -68,6 +70,11 @@ enum Event {
 	Enter(Option<Site>),
 	/// It returned from a futex call.
 	Exit,
+	/// It exited, so it leaves the CPU for good.
+	Gone,
+	/// A prctl returned, as the harness's starting the events does, opening the window its clock
+	/// times.
+	Start,
 	/// The harness stopped the events, closing the window its clock timed.
 	Stop,
 }
@@ -85,10 +92,9 @@ struct Record {
 #[derive(Debug, Default)]
 pub struct Drained {
 	records: Vec<Record>,
-	/// How many rings filled, so the kernel may have dropped records of the window. Nothing frees
-	/// a ring's room in a window but the drain after it, so every record dropped in one leaves its
-	/// ring full; the record the kernel writes of what it dropped comes only once there is room
-	/// again, in a later window, and says nothing of that one.
+	/// How many times a read found a ring full, so the kernel may have dropped records of the
+	/// window: the record it writes of what it dropped comes only once there is room again, maybe
+	/// in a later window, and says nothing of which.
 	pub filled: u64,
 }
 
@@ -121,7 +127,7 @@ impl Waits {
 impl Tracing {
 	/// The tracepoints this host lets swole trace its own processes with, opened as a trace opens
 	/// them, or why it cannot.
-	#[cfg(target_os = "linux")]
+	#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 	pub fn probe() -> Result<Self, String> {
 		let root = TRACEFS
 			.iter()
@@ -151,6 +157,7 @@ impl Tracing {
 			enter: id("sys_enter_futex")?,
 			exit: id("sys_exit_futex")?,
 			prctl: id("sys_enter_prctl")?,
+			prctled: id("sys_exit_prctl")?,
 			op: offset(&read("sys_enter_futex", "format")?, "op")?,
 			option: offset(&read("sys_enter_prctl", "format")?, "option")?,
 		};
@@ -175,18 +182,20 @@ impl Tracing {
 		Ok(tracing)
 	}
 
-	#[cfg(not(target_os = "linux"))]
+	/// Elsewhere a futex call's caller is not the word atop its stack, as on AArch64, where it is
+	/// in a register, and no tier counts.
+	#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 	pub fn probe() -> Result<Self, String> {
-		Err("tracing is Linux's".to_owned())
+		Err("tracing is x86_64 Linux's".to_owned())
 	}
 
 	/// How many events it opens on each CPU.
-	pub const EVENTS: usize = 4;
+	pub const EVENTS: usize = 5;
 
-	/// Opens its events on `cpu` into `fds`: the threads' context switches, then the futex call's
-	/// tracepoints and the prctl's, which [`Rings::new`] has write to the first's ring buffer once
-	/// it maps it, since the kernel redirects an event only into a mapped one. It makes system
-	/// calls alone, as between fork and exec.
+	/// Opens its events on `cpu` into `fds`: the threads' context switches and exits, then the
+	/// futex call's tracepoints and the prctl's, which [`Rings::new`] has write to the first's ring
+	/// buffer once it maps it, since the kernel redirects an event only into a mapped one. It makes
+	/// system calls alone, as between fork and exec.
 	#[cfg(target_os = "linux")]
 	pub fn open(&self, cpu: i32, fds: &mut [i32]) -> std::io::Result<()> {
 		use crate::perf::{
@@ -203,14 +212,20 @@ impl Tracing {
 			clockid: CLOCK_MONOTONIC,
 			..Attr::default()
 		};
+		// Its ring wakes a reader once it holds a quarter of its smallest size, so a sample's records
+		// are read as it runs.
 		let switches = Attr {
 			kind: PERF_TYPE_SOFTWARE,
 			config: PERF_COUNT_SW_DUMMY,
-			flags: flags | CONTEXT_SWITCH,
+			flags: flags | CONTEXT_SWITCH | TASK | WATERMARK,
+			wakeup_events: WAKE_AT,
 			..base
 		};
 		fds[0] = traced(&switches, cpu)?;
-		for (fd, id) in fds[1..].iter_mut().zip([self.enter, self.exit, self.prctl]) {
+		for (fd, id) in fds[1..]
+			.iter_mut()
+			.zip([self.enter, self.exit, self.prctl, self.prctled])
+		{
 			let tracepoint =
 				Attr {
 					kind: PERF_TYPE_TRACEPOINT,
@@ -266,6 +281,18 @@ impl Tracing {
 				};
 				Ok(Parsed::Record(Record { time, tid, event }))
 			}
+			PERF_RECORD_EXIT => {
+				// The process and its parent, the thread and its parent's, and the time.
+				let (task, tid, time) = (half(8)?, half(16)?, word(24)?);
+				if task != pid {
+					return Ok(Parsed::Other);
+				}
+				Ok(Parsed::Record(Record {
+					time,
+					tid,
+					event: Event::Gone,
+				}))
+			}
 			PERF_RECORD_SAMPLE => {
 				// The instruction pointer, the process and thread, the time, then the tracepoint's
 				// own record, which leads with its ID, then the top of the user stack.
@@ -302,6 +329,8 @@ impl Tracing {
 					Event::Exit
 				} else if id == self.prctl && field(self.option)? == STOP {
 					Event::Stop
+				} else if id == self.prctled {
+					Event::Start
 				} else {
 					return Ok(Parsed::Other);
 				};
@@ -342,6 +371,8 @@ fn account(records: &[Record]) -> Waits {
 		off: Option<(u64, bool, Option<Site>)>,
 		/// The futex wait it entered and has not returned from.
 		waiting: Option<Site>,
+		/// Whether it exited, so its last switch out waits for nothing.
+		gone: bool,
 	}
 	fn close(waits: &mut Waits, (since, preempted, site): (u64, bool, Option<Site>), until: u64) {
 		let span = until.saturating_sub(since);
@@ -356,30 +387,43 @@ fn account(records: &[Record]) -> Waits {
 	}
 	let mut waits = Waits::default();
 	let mut threads: HashMap<u32, Thread> = HashMap::new();
+	// Whether a window is open, and the thread that stopped the last, which starts the next. The
+	// harness's start returns once every CPU's events are on, but its stop reaches the other CPUs
+	// after it begins: what they record past it is outside the window.
+	let (mut open, mut harness) = (false, None);
 	for record in records {
-		if record.event == Event::Stop {
-			for thread in threads.values_mut() {
-				if let Some(off) = thread.off.take() {
-					close(&mut waits, off, record.time);
-				}
-			}
-			threads.clear();
-			continue;
-		}
-		let thread = threads.entry(record.tid).or_default();
 		match record.event {
-			Event::Out { preempted } => {
-				let site = thread.waiting.filter(|_| !preempted);
-				thread.off = Some((record.time, preempted, site));
+			Event::Start if !open && harness.is_none_or(|tid| tid == record.tid) => open = true,
+			Event::Stop if open => {
+				for thread in threads.values_mut() {
+					if let Some(off) = thread.off.take() {
+						close(&mut waits, off, record.time);
+					}
+				}
+				threads.clear();
+				(open, harness) = (false, Some(record.tid));
 			}
-			Event::In => {
-				if let Some(off) = thread.off.take() {
-					close(&mut waits, off, record.time);
+			_ if !open => {}
+			Event::Start | Event::Stop => {}
+			event => {
+				let thread = threads.entry(record.tid).or_default();
+				match event {
+					Event::Out { .. } if thread.gone => {}
+					Event::Out { preempted } => {
+						let site = thread.waiting.filter(|_| !preempted);
+						thread.off = Some((record.time, preempted, site));
+					}
+					Event::In => {
+						if let Some(off) = thread.off.take() {
+							close(&mut waits, off, record.time);
+						}
+					}
+					Event::Enter(site) => thread.waiting = site,
+					Event::Exit => thread.waiting = None,
+					Event::Gone => thread.gone = true,
+					Event::Start | Event::Stop => unreachable!("matched above"),
 				}
 			}
-			Event::Enter(site) => thread.waiting = site,
-			Event::Exit => thread.waiting = None,
-			Event::Stop => unreachable!("handled above"),
 		}
 	}
 	waits
@@ -450,7 +494,7 @@ pub fn locks<'a>(sites: impl IntoIterator<Item = &'a Site>, maps: &str) -> Resul
 		if at.iter().any(|name| name == "syscall")
 			&& let Some(ret) = site.ret
 		{
-			at = names(ret - 1);
+			at = ret.checked_sub(1).map(&mut names).unwrap_or_default();
 		}
 		if site.pi || at.iter().any(|name| takes_lock(name)) {
 			locks.insert(*site);
@@ -485,6 +529,8 @@ pub use linux::Rings;
 
 #[cfg(target_os = "linux")]
 mod linux {
+	use std::os::fd::AsRawFd;
+
 	use super::{Drained, MOST_RECORD, Parsed, Tracing};
 	use crate::perf::redirect;
 	use crate::profile::Ring;
@@ -521,9 +567,53 @@ mod linux {
 			})
 		}
 
-		/// Every record since the last drain, in time order across the CPUs.
-		pub fn drain(&mut self) -> Result<Drained, String> {
+		/// What `run` returns, and every record its rings took meanwhile, in time order across the
+		/// CPUs: they are read while it runs, as a ring fills past its watermark, so a sample's
+		/// records need not fit in them at once.
+		pub fn during<T: Send>(&mut self, run: impl FnOnce() -> T + Send) -> Result<(T, Drained), String> {
+			let (wake, done) = std::io::pipe().map_err(|e| format!("cannot open a pipe: {e}"))?;
 			let mut drained = Drained::default();
+			let out = std::thread::scope(|scope| -> Result<T, String> {
+				// Its end of the pipe closes as it returns, which wakes the reader one last time.
+				let worker = scope.spawn(move || {
+					let out = run();
+					drop(done);
+					out
+				});
+				let mut fds: Vec<PollFd> = (self.rings.iter().map(|ring| ring.fd().as_raw_fd()))
+					.chain([wake.as_raw_fd()])
+					.map(|fd| PollFd {
+						fd,
+						events: POLLIN,
+						revents: 0,
+					})
+					.collect();
+				loop {
+					// SAFETY: `fds` holds `fds.len()` entries the call writes the events of.
+					if unsafe { poll(fds.as_mut_ptr(), fds.len() as u64, -1) } < 0 {
+						let err = std::io::Error::last_os_error();
+						if err.kind() == std::io::ErrorKind::Interrupted {
+							continue;
+						}
+						return Err(format!("cannot wait on a trace's ring buffers: {err}"));
+					}
+					self.read(&mut drained)?;
+					let (rings, wake) = fds.split_at(fds.len() - 1);
+					if rings.iter().any(|fd| fd.revents & (POLLERR | POLLHUP | POLLNVAL) != 0) {
+						return Err("a trace's ring buffer closed while it was read".to_owned());
+					}
+					if wake[0].revents != 0 {
+						break;
+					}
+				}
+				Ok(worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+			})?;
+			drained.records.sort_by_key(|record| record.time);
+			Ok((out, drained))
+		}
+
+		/// Every record since the last read into `drained`.
+		fn read(&mut self, drained: &mut Drained) -> Result<(), String> {
 			for ring in &mut self.rings {
 				let filled = ring.records(MOST_RECORD, |kind, misc, record| {
 					match self.tracing.parse(kind, misc, record, self.pid)? {
@@ -534,9 +624,25 @@ mod linux {
 				})?;
 				drained.filled += u64::from(filled);
 			}
-			drained.records.sort_by_key(|record| record.time);
-			Ok(drained)
+			Ok(())
 		}
+	}
+
+	/// `struct pollfd`.
+	#[repr(C)]
+	struct PollFd {
+		fd: i32,
+		events: i16,
+		revents: i16,
+	}
+
+	const POLLIN: i16 = 0x1;
+	const POLLERR: i16 = 0x8;
+	const POLLHUP: i16 = 0x10;
+	const POLLNVAL: i16 = 0x20;
+
+	unsafe extern "C" {
+		fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
 	}
 }
 
@@ -544,6 +650,11 @@ mod linux {
 const SAMPLE_ID_ALL: u64 = 1 << 18;
 const USE_CLOCKID: u64 = 1 << 25;
 const CONTEXT_SWITCH: u64 = 1 << 26;
+/// Records of each thread's start and exit.
+const TASK: u64 = 1 << 13;
+/// Wakes a reader by the bytes its ring holds, `wakeup_events` being their count.
+const WATERMARK: u64 = 1 << 14;
+const WAKE_AT: u32 = 64 << 10;
 const PERF_TYPE_TRACEPOINT: u32 = 2;
 /// The software event that counts nothing, which carries a trace's context switches.
 const PERF_COUNT_SW_DUMMY: u64 = 9;
@@ -553,6 +664,7 @@ const PERF_SAMPLE_STACK_USER: u64 = 1 << 13;
 const CLOCK_MONOTONIC: i32 = 1;
 const EPERM: i32 = 1;
 const EACCES: i32 = 13;
+const PERF_RECORD_EXIT: u32 = 4;
 const PERF_RECORD_SAMPLE: u32 = 9;
 /// A switch on a CPU a whole-CPU event watches.
 const PERF_RECORD_SWITCH_CPU_WIDE: u32 = 15;
@@ -579,6 +691,9 @@ mod tests {
 		let out = Event::Out { preempted: false };
 		let preempted = Event::Out { preempted: true };
 		let records = [
+			// Before the window opens, nothing counts.
+			record(50, 2, out),
+			record(90, 1, Event::Start),
 			// A sleep, then a futex wait, then a preemption inside a futex call, which waits for a
 			// CPU rather than the futex.
 			record(100, 1, out),
@@ -599,8 +714,19 @@ mod tests {
 			record(500, 2, Event::In),
 			record(600, 2, Event::Enter(Some(SITE))),
 			record(650, 2, out),
+			// A worker that exits leaves the CPU for good, waiting on nothing.
+			record(700, 3, Event::Gone),
+			record(710, 3, out),
+			// The benchmark's own prctl opens nothing.
+			record(800, 1, Event::Start),
 			record(1000, 1, Event::Stop),
+			// A switch another CPU recorded before the stop reached it, and its prctl, are outside
+			// any window.
+			record(1010, 2, Event::In),
+			record(1020, 2, out),
+			record(1030, 2, Event::Start),
 			// The next window: the thread's switch back in, and its return, close nothing.
+			record(1900, 1, Event::Start),
 			record(2000, 2, Event::In),
 			record(2010, 2, Event::Exit),
 			record(2020, 2, out),
@@ -615,8 +741,8 @@ mod tests {
 				futex: BTreeMap::from([(SITE, 100 + 350)]),
 			}
 		);
-		// A window left open, as a drain mid-window would leave one, closes nothing.
-		assert_eq!(account(&records[..1]), Waits::default());
+		// A window left open, as a sample's last records before its stop leave one, closes nothing.
+		assert_eq!(account(&records[..3]), Waits::default());
 	}
 
 	#[test]
@@ -706,6 +832,7 @@ mod tests {
 			enter: 499,
 			exit: 498,
 			prctl: 199,
+			prctled: 200,
 			op: 24,
 			option: 16,
 		}
@@ -788,6 +915,22 @@ mod tests {
 			parse(PERF_RECORD_SAMPLE, 0, &sample(199, 15, &[32, 0, 0, 0, 0], Some(1))),
 			Parsed::Other
 		);
+		// Any prctl's return may open one, as the harness's starting them does.
+		assert_eq!(
+			parse(PERF_RECORD_SAMPLE, 0, &sample(200, 16, &[0], Some(1))),
+			at(16, 7, Event::Start)
+		);
+		// A thread's exit: the process and its parent, the thread and its parent, and the time.
+		let exit = |pid: u32| -> Vec<u8> {
+			let mut record = vec![0u8; 8];
+			for half in [pid, 1, 7, 1] {
+				record.extend(half.to_ne_bytes());
+			}
+			record.extend(17u64.to_ne_bytes());
+			record
+		};
+		assert_eq!(parse(PERF_RECORD_EXIT, 0, &exit(5)), at(17, 7, Event::Gone));
+		assert_eq!(parse(PERF_RECORD_EXIT, 0, &exit(6)), Parsed::Other);
 		let switch = |pid: u32, time: u64| {
 			let mut record = vec![0u8; 8];
 			// The thread on the switch's other side, another process's.

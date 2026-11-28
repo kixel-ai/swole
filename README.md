@@ -363,8 +363,8 @@ what each job gets; the native [fingerprint](#fingerprints) holds all of it.
   count holds the reads' few dozen user-space instructions once a sample rather than once a
   call.
   `quick` counts user space alone at any tier.
-- Tier L-1, `perf_event_paranoid` at most -1 or `CAP_PERFMON`, and the kernel's syscall
-  tracepoints readable under tracefs: `bench` traces where each benchmark's threads
+- Tier L-1, `perf_event_paranoid` at most -1 or `CAP_PERFMON`, on x86_64, and the kernel's
+  syscall tracepoints readable under tracefs: `bench` traces where each benchmark's threads
   [wait off the CPU](#off-cpu-waits), printing that it does or why it cannot.
 - No tier, above 2 without `CAP_PERFMON`, or a host without a PMU, or one that does not let a
   process read its counters in user space (`cap_user_rdpmc` off), or a CPU other than x86_64, or
@@ -529,9 +529,10 @@ of calls, recording each of the process's context switches and, by the kernel's
 alone, since events every thread inherited would cost each thread the benchmark starts hundreds of
 microseconds, and the harness starts and stops them with its clock, so setup, steps, and inputs
 built between calls wait in none of them, and neither the times nor the counters share a process
-with it. Each wait a thread began inside the clock's window counts until it ends or the window
-does, so a worker parked since before the window, waiting for work that never came, counts
-nothing:
+with it. The window opens as the harness's start of the events returns and closes as its stop
+begins, so what other CPUs record before the stop reaches them stays out. Each wait a thread began
+inside it counts until it ends or the window does, so a worker parked since before the window,
+waiting for work that never came, counts nothing, nor does a thread's last switch as it exits:
 
 - `blocked time`: off the CPU, waiting on something, as a sleep, I/O, or a futex;
 - `preempted time`: off the CPU while still runnable, as when the scheduler ran another thread;
@@ -545,9 +546,11 @@ nothing:
   `pthread_rwlock_*(rd|wr)lock`, or the futex operation takes a priority-inheriting lock. A lock
   of its own futex, as parking_lot's, counts as a futex wait alone.
 
-Each is sampled, between the least and most one sample's calls waited. A sample whose ring buffer
-filled, which a burst of other processes' records on its CPUs can do as well as its own, counts
-nothing, and the trace takes fewer calls a sample; one with no sample left fails the run. A
+Each is sampled, between the least and most one sample's calls waited. Samples grow from one call,
+doubling while one takes under 10 ms, to as many calls as a timed sample, and swole reads the rings
+while a sample runs, each time one holds 64 KiB. A sample a ring filled in before swole read it,
+which a burst of other processes' records on its CPUs can do as well as its own, counts nothing,
+and no later sample takes as many calls; a side left with no sample fails the run. A
 benchmark that times itself has none, since its calls may hold waits its time leaves out, as does a
 side whose harness predates profiling. A trace needs the host's tier L-1, as
 [Capabilities](#capabilities) says, and its tracepoints' IDs from tracefs, as
