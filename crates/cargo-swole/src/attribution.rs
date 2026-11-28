@@ -27,13 +27,6 @@ pub fn table(before: &Counts, after: &Counts) -> String {
 		let Some(head) = after.functions.get(name) else {
 			continue;
 		};
-		let (base_total, head_total) = (sum(base), sum(head));
-		// A name two objects define is shown with its object, to tell them apart.
-		let mut objects: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-		for function in base.keys().chain(head.keys()) {
-			objects.entry(&function.name).or_default().insert(&function.object);
-		}
-		let ambiguous = |function: &Function| objects[function.name.as_str()].len() > 1;
 		let shown = name.replace('|', "\\|");
 		// A benchmark counted more than once reports the median of its runs, but these functions
 		// are the first run's, which the scheduler may have moved the other way.
@@ -42,12 +35,22 @@ pub fn table(before: &Counts, after: &Counts) -> String {
 		} else {
 			shown
 		};
-		let totals = base_total.counts().into_iter().zip(head_total.counts());
-		for (index, ((measure, was, _), (_, now, _))) in totals.enumerate() {
-			if was == now {
-				continue;
-			}
-			for (function, before, after) in shifted(base, head, index, was, now) {
+		let measures = Costs::default().counts().map(|(measure, _, _)| measure);
+		for (index, measure) in measures.into_iter().enumerate() {
+			let measure_of = |functions: &Functions| -> BTreeMap<Function, u64> {
+				functions
+					.iter()
+					.map(|(function, costs)| (function.clone(), costs.counts()[index].1))
+					.collect()
+			};
+			let (base, head) = (measure_of(base), measure_of(head));
+			let was: u64 = base.values().sum();
+			for Row {
+				function,
+				before,
+				after,
+			} in shifted(&base, &head)
+			{
 				if out.is_empty() {
 					out.push_str(
 						"\nFunctions behind each change, by self cost, up to five for each measure:\n\n\
@@ -56,18 +59,6 @@ pub fn table(before: &Counts, after: &Counts) -> String {
 					);
 				}
 				let change = after as i128 - before as i128;
-				// A function one side's profile lacks entirely, not merely idle there, may only have gone unseen.
-				let kind = match (base.contains_key(function), head.contains_key(function)) {
-					(false, _) => " (not in base)",
-					(_, false) => " (not in head)",
-					_ => "",
-				};
-				let qualified = if ambiguous(function) {
-					format!("{} ({})", function.name, function.object)
-				} else {
-					function.name.clone()
-				};
-				let function = qualified.replace('|', "\\|");
 				// A measure the base never had has no share to speak of.
 				let share = if was == 0 {
 					String::new()
@@ -76,7 +67,7 @@ pub fn table(before: &Counts, after: &Counts) -> String {
 				};
 				writeln!(
 					out,
-					"| {shown} | {measure} | `{function}`{kind} | {before} | {after} | {change:+}{share} |"
+					"| {shown} | {measure} | {function} | {before} | {after} | {change:+}{share} |"
 				)
 				.expect("a String takes every write");
 			}
@@ -85,44 +76,90 @@ pub fn table(before: &Counts, after: &Counts) -> String {
 	out
 }
 
-/// The benchmark's own cost of each measure: its functions' added.
-fn sum(functions: &Functions) -> Costs {
-	let mut total = Costs::default();
-	for costs in functions.values() {
-		total.add(costs);
-	}
-	total
+/// A cost a function's row reports: sim's exact counts, or bench's sampled cycles a call.
+pub trait Cost: Copy + PartialOrd + std::iter::Sum + std::ops::Add<Output = Self> {
+	/// How far apart `self` and `other` are.
+	fn gap(self, other: Self) -> Self;
 }
 
-/// The functions that moved measure `index` the way the benchmark did, from `was` to `now`,
-/// with their base and head costs, largest first: at least [`LEAST`] and at most [`MOST`], and
-/// past the least only until they explain the majority of the benchmark's change.
-fn shifted<'a>(
-	base: &'a Functions,
-	head: &'a Functions,
-	index: usize,
-	was: u64,
-	now: u64,
-) -> Vec<(&'a Function, u64, u64)> {
-	let value =
-		|functions: &Functions, function: &Function| functions.get(function).map_or(0, |costs| costs.counts()[index].1);
+impl Cost for u64 {
+	fn gap(self, other: Self) -> Self {
+		self.abs_diff(other)
+	}
+}
+
+impl Cost for f64 {
+	fn gap(self, other: Self) -> Self {
+		(self - other).abs()
+	}
+}
+
+/// A function behind a benchmark's change, as its table row names it, with its base and head cost.
+#[derive(Debug, PartialEq)]
+pub struct Row<C> {
+	/// Its name in backticks, escaped for a Markdown cell, with its object when another object
+	/// defines the same name, and marked when one side lacks it entirely.
+	pub function: String,
+	pub before: C,
+	pub after: C,
+}
+
+/// The functions whose self cost moved the way the benchmark's did, base to head, largest first:
+/// at least [`LEAST`] and at most [`MOST`], and past the least only until they explain the
+/// majority of the benchmark's change. Empty when the benchmark's cost, its functions' added,
+/// did not move.
+pub fn shifted<C: Cost>(base: &BTreeMap<Function, C>, head: &BTreeMap<Function, C>) -> Vec<Row<C>> {
+	let (was, now): (C, C) = (base.values().copied().sum(), head.values().copied().sum());
 	let names: BTreeSet<&Function> = base.keys().chain(head.keys()).collect();
-	let mut moved: Vec<(&Function, u64, u64)> = names
-		.into_iter()
-		.map(|function| (function, value(base, function), value(head, function)))
+	let zero = was.gap(was);
+	let value =
+		|functions: &BTreeMap<Function, C>, function: &Function| functions.get(function).copied().unwrap_or(zero);
+	let mut moved: Vec<(&Function, C, C)> = names
+		.iter()
+		.map(|&function| (function, value(base, function), value(head, function)))
 		// What moved with the benchmark; a function that moved against it only offset some.
-		.filter(|(_, before, after)| if now > was { after > before } else { after < before })
+		.filter(|(_, before, after)| {
+			if now > was {
+				after > before
+			} else {
+				now < was && after < before
+			}
+		})
 		.collect();
-	moved.sort_by_key(|(name, before, after)| (std::cmp::Reverse(before.abs_diff(*after)), *name));
-	let net = was.abs_diff(now);
-	let mut explained = 0u64;
+	moved.sort_by(|a, b| {
+		b.2.gap(b.1)
+			.partial_cmp(&a.2.gap(a.1))
+			.expect("costs are finite")
+			.then(a.0.cmp(b.0))
+	});
+	let net = was.gap(now);
+	let mut explained = zero;
 	let mut shown = Vec::new();
-	for (name, before, after) in moved {
-		if shown.len() >= MOST || (shown.len() >= LEAST && explained * 2 > net) {
+	for (function, before, after) in moved {
+		if shown.len() >= MOST || (shown.len() >= LEAST && explained + explained > net) {
 			break;
 		}
-		explained += before.abs_diff(after);
-		shown.push((name, before, after));
+		explained = explained + before.gap(after);
+		// A function one side's profile lacks entirely, not merely idle there, may only have gone unseen.
+		let kind = match (base.contains_key(function), head.contains_key(function)) {
+			(false, _) => " (not in base)",
+			(_, false) => " (not in head)",
+			_ => "",
+		};
+		// A name two objects define is shown with its object, to tell them apart.
+		let ambiguous = names
+			.iter()
+			.any(|other| other.name == function.name && other.object != function.object);
+		let name = if ambiguous {
+			format!("{} ({})", function.name, function.object)
+		} else {
+			function.name.clone()
+		};
+		shown.push(Row {
+			function: format!("`{}`{kind}", name.replace('|', "\\|")),
+			before,
+			after,
+		});
 	}
 	shown
 }

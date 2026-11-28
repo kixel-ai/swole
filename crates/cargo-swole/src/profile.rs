@@ -12,13 +12,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 
-/// A function a profile splits cycles among: its name, demangled, and the file of the object
-/// that holds it, which tells two of one name apart.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Function {
-	pub name: String,
-	pub object: String,
-}
+use crate::attribution::{Row, shifted};
+use crate::callgrind::Function;
 
 /// One side's profile of a benchmark.
 #[derive(Clone, Debug, PartialEq)]
@@ -260,26 +255,19 @@ fn demangle(name: &str) -> String {
 	rustc_demangle::try_demangle(name).map_or_else(|_| name.to_owned(), |name| format!("{name:#}"))
 }
 
-/// The most functions shown for one benchmark.
-const MOST: usize = 5;
-
-/// The fewest shown, when it has that many that moved with the benchmark, before the ones shown
-/// explain the majority of its change.
-const LEAST: usize = 3;
-
 /// For each benchmark whose time changed, the functions whose sampled self cycles moved its
 /// sampled cycles most, a Markdown table as sim's attribution prints one; empty when none has any.
 pub fn table(profiles: &BTreeMap<String, [Profile; 2]>, sampling: &crate::perf::Sampling) -> String {
 	let mut out = String::new();
 	for (name, [base, head]) in profiles {
-		let (was, now): (f64, f64) = (base.functions.values().sum(), head.functions.values().sum());
-		// A name two objects define is shown with its object, to tell them apart.
-		let mut objects: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-		for function in base.functions.keys().chain(head.functions.keys()) {
-			objects.entry(&function.name).or_default().insert(&function.object);
-		}
+		let was: f64 = base.functions.values().sum();
 		let shown = name.replace('|', "\\|");
-		for (function, before, after) in shifted(&base.functions, &head.functions, was, now) {
+		for Row {
+			function,
+			before,
+			after,
+		} in shifted(&base.functions, &head.functions)
+		{
 			if out.is_empty() {
 				write!(
 					out,
@@ -293,25 +281,10 @@ pub fn table(profiles: &BTreeMap<String, [Profile; 2]>, sampling: &crate::perf::
 				.expect("a String takes every write");
 			}
 			let change = after - before;
-			// A function one side's samples lack may only have gone unseen.
-			let kind = match (
-				base.functions.contains_key(function),
-				head.functions.contains_key(function),
-			) {
-				(false, _) => " (not in base)",
-				(_, false) => " (not in head)",
-				_ => "",
-			};
-			let qualified = if objects[function.name.as_str()].len() > 1 {
-				format!("{} ({})", function.name, function.object)
-			} else {
-				function.name.clone()
-			};
-			let function = qualified.replace('|', "\\|");
 			let sampled = crate::metrics::SAMPLED;
 			writeln!(
 				out,
-				"| {shown} | cycles | `{function}`{kind} | {sampled}{before:.0} | {sampled}{after:.0} | \
+				"| {shown} | cycles | {function} | {sampled}{before:.0} | {sampled}{after:.0} | \
 				 {sampled}{change:+.0} ({:+.2}%) |",
 				change / was * 100.0
 			)
@@ -319,38 +292,6 @@ pub fn table(profiles: &BTreeMap<String, [Profile; 2]>, sampling: &crate::perf::
 		}
 	}
 	out
-}
-
-/// The functions that moved the way the benchmark's sampled cycles did, from `was` to `now`, with
-/// their base and head cycles, largest first: at least [`LEAST`] and at most [`MOST`], and past
-/// the least only until they explain the majority of the benchmark's change.
-fn shifted<'a>(
-	base: &'a BTreeMap<Function, f64>,
-	head: &'a BTreeMap<Function, f64>,
-	was: f64,
-	now: f64,
-) -> Vec<(&'a Function, f64, f64)> {
-	let value =
-		|functions: &BTreeMap<Function, f64>, function: &Function| functions.get(function).copied().unwrap_or(0.0);
-	let names: BTreeSet<&Function> = base.keys().chain(head.keys()).collect();
-	let mut moved: Vec<(&Function, f64, f64)> = names
-		.into_iter()
-		.map(|function| (function, value(base, function), value(head, function)))
-		// What moved with the benchmark; a function that moved against it only offset some.
-		.filter(|(_, before, after)| if now > was { after > before } else { after < before })
-		.collect();
-	moved.sort_by(|a, b| (b.2 - b.1).abs().total_cmp(&(a.2 - a.1).abs()).then(a.0.cmp(b.0)));
-	let net = (now - was).abs();
-	let mut explained = 0.0;
-	let mut shown = Vec::new();
-	for (function, before, after) in moved {
-		if shown.len() >= MOST || (shown.len() >= LEAST && explained * 2.0 > net) {
-			break;
-		}
-		explained += (after - before).abs();
-		shown.push((function, before, after));
-	}
-	shown
 }
 
 /// Each side's profile as `--report` writes it: every function's cycles a call, most first.
@@ -493,7 +434,7 @@ mod tests {
 	}
 
 	#[test]
-	fn names_the_functions_behind_a_change_largest_first() {
+	fn prints_sampled_cycles_in_sims_table_shape() {
 		let table = table(
 			&[("decode", 1000.0), ("alloc", 500.0), ("main", 100.0), ("gone", 40.0)],
 			&[("decode", 1400.0), ("alloc", 560.0), ("main", 100.0), ("new", 30.0)],
@@ -512,49 +453,7 @@ mod tests {
 		assert!(rows[1].contains("`alloc` | ~500 | ~560 | ~+60"), "{table}");
 		assert!(rows[2].contains("`new` (not in base) | ~0 | ~30 | ~+30"), "{table}");
 		assert!(!table.contains("gone"), "{table}");
-	}
-
-	#[test]
-	fn names_a_removed_function_when_it_shrank_and_nothing_when_it_held() {
-		let table = table(&[("a", 400.0), ("b", 100.0)], &[("a", 400.0)]);
-		assert!(
-			table.contains("`b` (not in head) | ~100 | ~0 | ~-100 (-20.00%)"),
-			"{table}"
-		);
-		assert!(!table.contains("`a`"), "{table}");
 		assert_eq!(super::table(&BTreeMap::new(), &sampling()), "");
-		// Sampled cycles that held name none.
-		let held = BTreeMap::from([("bench".to_owned(), [profile(&[("a", 4.0)]), profile(&[("a", 4.0)])])]);
-		assert_eq!(super::table(&held, &sampling()), "");
-	}
-
-	#[test]
-	fn lists_more_than_the_biggest_until_the_majority_is_explained() {
-		let base: Vec<(String, f64)> = (0..8).map(|i| (format!("f{i}"), 100.0)).collect();
-		let head: Vec<(String, f64)> = base
-			.iter()
-			.map(|(name, cycles)| (name.clone(), cycles + 10.0))
-			.collect();
-		fn refs(list: &[(String, f64)]) -> Vec<(&str, f64)> {
-			list.iter().map(|(n, v)| (n.as_str(), *v)).collect()
-		}
-		let table = table(&refs(&base), &refs(&head));
-		// Eight functions grew by the same amount: five show, since three do not make a majority.
-		assert_eq!(
-			table.lines().filter(|row| row.starts_with("| bench |")).count(),
-			5,
-			"{table}"
-		);
-	}
-
-	#[test]
-	fn shows_the_object_of_a_name_two_objects_define() {
-		let table = table(
-			&[("decode@liba", 1000.0), ("decode@libb", 1000.0), ("main", 10.0)],
-			&[("decode@liba", 1500.0), ("decode@libb", 950.0), ("main", 10.0)],
-		);
-		assert!(table.contains("`decode (liba)` | ~1000 | ~1500 | ~+500"), "{table}");
-		assert!(!table.contains("libb"), "{table}");
 	}
 
 	#[test]
