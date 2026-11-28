@@ -246,11 +246,12 @@ it runs, and print a Markdown table of each benchmark's base, head, and change, 
 changes first, then the benchmarks one side has, then those that held, with the [likely
 cause](#diagnostics) beside each regression; then one of every other measure that moved: for
 `sim`, each [simulated event](#simulated-cycles) and the estimated cycles, whose change moves a
-benchmark as its instructions' does. A
+benchmark as its instructions' does, the headline's change naming it (`+0.00%, cycles +4.26%`)
+when it alone moved. A
 sampled (`~`) value compares by its spread, never as one exact count: between two sampled values,
 the change says whether their spreads overlap (`within spread`) or not (`beyond spread`), and with
-one side's spread alone, it is marked `~` and gives no verdict. `sim` then names, for each measure of each changed
-benchmark, the three to five functions whose own cost moved it most, from the Callgrind profiles it already reads
+one side's spread alone, it is marked `~` and gives no verdict. `sim` then names, for each measure of each
+benchmark the details print, in their order, the three to five functions whose own cost moved it most, from the Callgrind profiles it already reads
 (the first run's, marked when the benchmark counts more than once), with a function one side's profile lacks
 marked. `swole bench <base>` builds both sides in the same worktree and times
 them [paired](#bench). One directory
@@ -346,7 +347,8 @@ what each job gets; the native [fingerprint](#fingerprints) holds all of it.
 
 - Tier L2, `perf_event_paranoid` at most 2: user-space instructions, cycles and instructions a
   cycle, reference cycles (`ref-cycles`, cycles at the core's base frequency: Intel's fixed
-  counter, or AMD's from Zen 4 on), each ring's three in one group, branches and mispredicts, L1
+  counter, or AMD's from Zen 4 on; `bench` alone), each ring's three in one group where the PMU
+  fits them, a ratio derived only from counters it counted together, branches and mispredicts, L1
   data and instruction, last-level, and data and instruction TLB misses, the
   [top-down breakdown](#diagnostics), frontend and backend stall cycles where the PMU counts them,
   and the kernel's `page-faults` taken in user space. The thread's time on a CPU, `task-clock`, is
@@ -553,9 +555,11 @@ does, each where the run took what it divides, into the details table and `--rep
 - the branch miss rate, mispredicts over branches;
 - the kernel's share of the instructions, where tier L1 counts both rings, and under `bench` of
   the CPU time, from rusage;
-- under `bench`, `CPUs busy`: the CPU time the process used over its samples' wall clock, as the
-  harness measures both. Under one, the benchmark waited off the CPU, as on a lock or I/O; over
-  one, it ran threads in parallel;
+- under `bench`, `CPUs busy`: the process's average CPU occupancy, the CPU time it used, user and
+  system, over its samples' wall clock, as the harness measures both, sampled between the least
+  and most one sample was, since the scheduler moves it. Under one, the process was off the CPU,
+  as on a lock or I/O, or when the host ran something else; over one, it ran threads in parallel,
+  any of the process's beside the benchmark's own included;
 - `cycles/ref-cycles` in each ring, counted in one group over one window, which falls as the core
   throttles and rises with turbo; or, where the PMU counts no reference cycles, under `bench`, an
   `estimated clock:u` in GHz, the counted cycles over the timed process's user time, which also
@@ -578,12 +582,13 @@ change shows in points (`pp`).
 A paired `bench`'s regression, a slowdown whose whole interval lies above no change, and a
 compare's, a headline count, or `sim`'s estimated cycles, grown past its spread, names its likely cause in a column beside it, from the
 first two of these its measures show, each citing the measure on both sides: `throttled`
-(`cycles/ref-cycles:u` fell 2%, or the estimated clock 5%), `off-CPU` (`CPUs busy` lost 0.1 and
+(`cycles/ref-cycles:u` fell 2%; never the estimated clock alone), `off-CPU` (`CPUs busy` lost 0.1 and
 ended under 0.9), `more instructions` (1% more), `memory-bound` (the last-level, L1 data, or data
 TLB MPKI grew by a quarter and 0.1, or the breakdown's memory bound gained 3 points), else
 `backend-bound` (its backend bound did), `branch mispredicts` (its miss rate, MPKI, or share),
 else `bad speculation`, `frontend-bound`, `kernel` (its share gained 5 points), and for a time that
-moved 1 to 3% with its instructions, branches, and MPKI the same, the frontend bound no lower,
+moved 1 to 3% with its instructions, branches, and some MPKI counted on both sides the same,
+and the breakdown's frontend bound, where it counts one, grown past its spread,
 `likely code alignment`: the same code at other addresses, as an unrelated change can shift it.
 A sampled measure counts only past its spread, a side counted once past its one value.
 
@@ -593,7 +598,8 @@ stdout keeps a large suite's results short: each headline table prints every ben
 by its change, and the details table after it prints every other measure only of the benchmarks
 that moved (or one side has), and of each, only the rows that moved, with a note of what it
 left out; a suite of at most ten benchmarks prints every one, and `--all-details` every row of
-every one. `--report` holds them all. A change from an exact zero shows the absolute change, as
+every one. A run without a base moves nothing, so a suite of more than ten prints no details,
+and says so. `--report` holds them all. A change from an exact zero shows the absolute change, as
 `+3`, rather than a percentage of none.
 
 `--out` writes only the headline measures of each benchmark, so a run of a large workspace stays

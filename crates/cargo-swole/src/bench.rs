@@ -363,12 +363,10 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 					)? {
 					measures.extend(allocs);
 				}
-				if let Some((used, calls, wall)) = &used[i] {
+				if let Some((used, calls, busy)) = &used[i] {
 					measures.extend(used.measures(*calls * iterations));
-					// The harness's own wall clock, which none of swole's requests and replies add to.
-					if let Some(wall) = wall {
-						measures.extend(crate::diagnose::busy(used.user_ns + used.system_ns, wall.as_nanos()));
-					}
+					// Over the harness's own wall clock, which none of swole's requests and replies add to.
+					measures.extend(busy.clone());
 				}
 				// What derives from the side's time and counts, per what each of its calls processes.
 				if let (Some(throughput), Some(time)) = (declared[i], [timed.base(), timed.head()][i]) {
@@ -492,18 +490,22 @@ fn spread(
 	Ok(Some(spread))
 }
 
-/// What the process used over `samples`, in all, how many samples that took, and the wall clock
-/// that covers, when its harness says what it used, and says over how long.
-fn usage<'a>(samples: impl Iterator<Item = &'a Sample>) -> Option<(perf::Usage, u64, Option<Duration>)> {
+/// What the process used over `samples`, in all, how many samples that took, and how busy it
+/// kept the CPUs, when its harness says what it used, and says over how long.
+fn usage<'a>(samples: impl Iterator<Item = &'a Sample>) -> Option<(perf::Usage, u64, Option<crate::Measure>)> {
 	let mut total = perf::Usage::default();
 	let mut count = 0;
-	let mut wall = Some(Duration::ZERO);
+	let mut windows = Some(Vec::new());
 	for sample in samples {
-		total.add(&sample.usage?);
+		let used = sample.usage?;
+		total.add(&used);
 		count += 1;
-		wall = wall.zip(sample.window).map(|(wall, window)| wall + window);
+		windows = windows.zip(sample.window).map(|(mut windows, window)| {
+			windows.push((used.user_ns + used.system_ns, window.as_nanos()));
+			windows
+		});
 	}
-	(count > 0).then_some((total, count, wall))
+	(count > 0).then(|| (total, count, windows.and_then(crate::diagnose::busy)))
 }
 
 /// What counting a benchmark found.

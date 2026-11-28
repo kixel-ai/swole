@@ -171,10 +171,22 @@ pub fn derive(measures: &[Measure], timed: bool) -> Vec<Measure> {
 	out
 }
 
-/// How busy the CPUs were over a benchmark's samples: the CPU time its process used, user and
-/// system, over their wall clock. Under one, it waited off the CPU; over one, it ran in parallel.
-pub fn busy(cpu_ns: u64, wall_ns: u128) -> Option<Measure> {
-	(wall_ns > 0).then(|| Measure::new("CPUs busy", cpu_ns as f64 / wall_ns as f64, "CPUs"))
+/// How busy the CPUs were over a benchmark's samples, each the CPU time its process used, user
+/// and system, and the wall clock that covers: their total over their total, sampled within the
+/// least and most one sample was, since the scheduler moves it. Under one, it waited off the CPU;
+/// over one, it ran in parallel.
+pub fn busy(samples: impl IntoIterator<Item = (u64, u128)>) -> Option<Measure> {
+	let (mut cpu, mut wall) = (0u128, 0u128);
+	let (mut least, mut most) = (f64::INFINITY, 0.0f64);
+	for (cpu_ns, wall_ns) in samples.into_iter().filter(|&(_, wall_ns)| wall_ns > 0) {
+		let busy = cpu_ns as f64 / wall_ns as f64;
+		(cpu, wall) = (cpu + u128::from(cpu_ns), wall + wall_ns);
+		(least, most) = (least.min(busy), most.max(busy));
+	}
+	(wall > 0).then(|| Measure {
+		spread: Some((least, most)),
+		..Measure::new("CPUs busy", cpu as f64 / wall as f64, "CPUs")
+	})
 }
 
 /// How far a measure must move, by each rule, to say why a benchmark regressed: far past what a
@@ -190,9 +202,8 @@ mod moved {
 	pub const MPKI: (f64, f64) = (0.25, 0.1);
 	/// The share instructions must grow by, past which more work explains a slower time.
 	pub const INSTRUCTIONS: f64 = 0.01;
-	/// The share cycles a reference cycle must fall by, or the estimated clock.
+	/// The share cycles a reference cycle must fall by.
 	pub const CLOCK: f64 = 0.02;
-	pub const ESTIMATED_CLOCK: f64 = 0.05;
 	/// What the CPUs busy must lose, and stay under, for a benchmark to wait off the CPU.
 	pub const BUSY: (f64, f64) = (0.1, 0.9);
 	/// How little a count may move to be the same, and an MPKI.
@@ -295,12 +306,9 @@ pub fn cause(base: &[Measure], head: &[Measure], timed: Option<f64>) -> Option<S
 		}
 	};
 	if timed.is_some() {
-		add(
-			"throttled",
-			sides
-				.fell(&["cycles/ref-cycles:u"], moved::CLOCK)
-				.or_else(|| sides.fell(&["estimated clock:u"], moved::ESTIMATED_CLOCK)),
-		);
+		// Only a clock counted beside its reference: the estimate's user time is another process's,
+		// and holds what a sample runs between calls, which a slower hook moves at the same clock.
+		add("throttled", sides.fell(&["cycles/ref-cycles:u"], moved::CLOCK));
 		add(
 			"off-CPU",
 			sides.get("CPUs busy").and_then(|busy| {
@@ -358,12 +366,15 @@ pub fn cause(base: &[Measure], head: &[Measure], timed: Option<f64>) -> Option<S
 		&& ["instructions:u", "branches:u"]
 			.iter()
 			.all(|name| sides.held(name, (moved::SAME, 0.0)))
-		&& NATIVE
-			.iter()
-			.map(|(_, name)| format!("{name}:u"))
-			.filter(|name| sides.get(name).is_some())
-			.all(|name| sides.held(&name, moved::SAME_MPKI))
-	{
+		// The same misses, which says nothing unless both sides counted some.
+		&& {
+			let misses: Vec<String> = NATIVE
+				.iter()
+				.map(|(_, name)| format!("{name}:u"))
+				.filter(|name| sides.get(name).is_some())
+				.collect();
+			!misses.is_empty() && misses.iter().all(|name| sides.held(name, moved::SAME_MPKI))
+		} {
 		let frontend = sides.get("topdown frontend bound");
 		if frontend
 			.as_ref()
@@ -572,8 +583,26 @@ mod tests {
 			cause(&base[..3], &head[..3], Some(0.02)).unwrap(),
 			"likely code alignment (same instructions, branches, and misses)"
 		);
+		// Nor without a miss counted on both sides to call the same.
+		let unmissed = |side: &[Measure]| [side[0].clone(), side[1].clone()];
+		assert_eq!(cause(&unmissed(&base), &unmissed(&head), Some(0.02)), None);
 		// A count has no time to shift.
 		assert_eq!(cause(&base, &head, None), None);
+	}
+
+	#[test]
+	fn an_estimated_clock_alone_names_no_throttle() {
+		let base = [Measure::new("estimated clock:u", 4.0, "GHz")];
+		let head = [Measure::new("estimated clock:u", 3.0, "GHz")];
+		assert_eq!(cause(&base, &head, Some(0.2)), None);
+	}
+
+	#[test]
+	fn cpus_busy_spans_its_samples() {
+		let busy = busy([(900, 1000), (500, 1000), (0, 0)]).unwrap();
+		assert_eq!(busy.value, 0.7);
+		assert_eq!(busy.spread, Some((0.5, 0.9)));
+		assert!(super::busy([(1, 0)]).is_none());
 	}
 
 	#[test]

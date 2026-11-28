@@ -353,7 +353,9 @@ impl Perf {
 		// Intel's top-down metrics, which `rdpmc` reads as fractions of `slots`, take a pass the
 		// harness reads with `read()`; a PMU that counts its breakdown as events packs it as any.
 		let mut metrics = None;
-		match topdown(&pmu)?.filter(|_| !quick) {
+		// `quick` counts no breakdown, so it reads none of the PMU's event formats either.
+		let breakdown = if quick { None } else { topdown(&pmu)? };
+		match breakdown {
 			None => {}
 			Some(Topdown::Metrics(group)) => match trial(&group) {
 				Ok(true) => {
@@ -369,11 +371,17 @@ impl Perf {
 			Some(Topdown::Events(breakdown)) => {
 				for (level, mut unit) in breakdown {
 					loop {
+						let smt = unit.last().is_some_and(|event| event.name == SMT);
 						match trial(&unit) {
 							Ok(true) => units.push(unit),
 							// A PMU with a counter fewer, such as one the NMI watchdog holds, counts
-							// the breakdown without the SMT sibling's share.
-							Ok(false) if unit.last().is_some_and(|event| event.name == SMT) => {
+							// the breakdown without the SMT sibling's share, whether the group fails to
+							// schedule or the kernel refuses it at open.
+							Ok(false) if smt => {
+								unit.pop();
+								continue;
+							}
+							Err(err) if smt && unsupported(&err) => {
 								unit.pop();
 								continue;
 							}

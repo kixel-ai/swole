@@ -14,17 +14,18 @@ const MOST: usize = 5;
 /// explain the majority of its change.
 const LEAST: usize = 3;
 
-/// For each benchmark both sides counted and some measure of which changed, the functions whose
-/// self cost moved that measure most, a Markdown table; empty when no benchmark has any.
+/// For each of `names`, in their order, that both sides counted and some measure of which
+/// changed, the functions whose self cost moved that measure most, a Markdown table; empty when
+/// no benchmark has any.
 ///
 /// Self costs partition a benchmark's count, so the functions' changes add up to the benchmark's
 /// exactly, which a function's inclusive cost, double-counting a recursion, would not. A
 /// benchmark counted more than once is marked, since its functions' costs, from its first
 /// run alone, may move with the scheduler against the median.
-pub fn table(before: &Counts, after: &Counts) -> String {
+pub fn table(before: &Counts, after: &Counts, names: &[String]) -> String {
 	let mut out = String::new();
-	for (name, base) in &before.functions {
-		let Some(head) = after.functions.get(name) else {
+	for name in names {
+		let (Some(base), Some(head)) = (before.functions.get(name), after.functions.get(name)) else {
 			continue;
 		};
 		let (base_total, head_total) = (sum(base), sum(head));
@@ -131,6 +132,11 @@ fn shifted<'a>(
 mod tests {
 	use super::*;
 
+	/// Every benchmark the base profiled, in name order.
+	fn every(before: &Counts) -> Vec<String> {
+		before.functions.keys().cloned().collect()
+	}
+
 	/// A benchmark's functions, each its instructions, which cost a quarter as many data reads. A
 	/// name `function@object` is in that object, else in `bin`.
 	fn functions(costs: &[(&str, u64)]) -> Functions {
@@ -172,7 +178,7 @@ mod tests {
 			&[("decode", 1000), ("alloc", 500), ("main", 100), ("gone", 40)],
 			&[("decode", 1400), ("alloc", 560), ("main", 100), ("new", 30)],
 		);
-		let table = table(&before, &after);
+		let table = table(&before, &after, &every(&before));
 		let rows: Vec<&str> = table.lines().filter(|row| row.contains("instructions")).collect();
 		// +400 and +60 and +30 and -40 make +450: decode alone is the majority.
 		assert_eq!(rows.len(), 3, "{table}");
@@ -185,7 +191,7 @@ mod tests {
 	#[test]
 	fn names_a_removed_function_when_the_benchmark_shrank_and_skips_an_unchanged_measure() {
 		let (before, after) = sides(&[("a", 400), ("b", 100)], &[("a", 400)]);
-		let table = table(&before, &after);
+		let table = table(&before, &after, &every(&before));
 		assert!(
 			table.contains("`b` (not in head) | 100 | 0 | -100 (-20.00%)"),
 			"{table}"
@@ -193,7 +199,7 @@ mod tests {
 		assert!(!table.contains("`a`"), "{table}");
 		// Identical sides print nothing.
 		let (before, after) = sides(&[("a", 400)], &[("a", 400)]);
-		assert_eq!(super::table(&before, &after), "");
+		assert_eq!(super::table(&before, &after, &every(&before)), "");
 	}
 
 	#[test]
@@ -205,7 +211,7 @@ mod tests {
 		}
 		let (before, after) = sides(&as_refs(&spread), &as_refs(&head));
 		// Eight functions grew by the same amount: five show, since three do not make a majority.
-		let table = table(&before, &after);
+		let table = table(&before, &after, &every(&before));
 		assert_eq!(
 			table.lines().filter(|row| row.contains("| instructions |")).count(),
 			5,
@@ -219,7 +225,7 @@ mod tests {
 			&[("decode@liba", 1000), ("decode@libb", 1000), ("main", 10)],
 			&[("decode@liba", 1500), ("decode@libb", 950), ("main", 10)],
 		);
-		let table = table(&before, &after);
+		let table = table(&before, &after, &every(&before));
 		// Merged by name alone, +500 and -50 would read as +450 of one function.
 		assert!(table.contains("`decode (liba)` | 1000 | 1500 | +500"), "{table}");
 		assert!(!table.contains("libb"), "{table}");
@@ -231,7 +237,7 @@ mod tests {
 		let (before, mut after) = sides(&[("a", 400)], &[("a", 500)]);
 		after.functions.insert("other".to_owned(), functions(&[("a", 1)]));
 		after.spread.insert("bench".to_owned(), (1, 2));
-		let table = table(&before, &after);
+		let table = table(&before, &after, &every(&before));
 		assert!(table.contains("| bench (first run) |"), "{table}");
 		assert!(!table.contains("| other"), "{table}");
 	}

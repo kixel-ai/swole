@@ -83,16 +83,18 @@ pub fn compare(base: &str, options: &Options, mode: Mode) -> Result<(), String> 
 	threaded.threaded = before.threaded.union(&after.threaded).cloned().collect();
 	threaded.spread = before.spread.clone().into_iter().chain(after.spread.clone()).collect();
 	print!("{}", crate::threaded(&threaded));
+	// The functions behind each change follow the details, of the same benchmarks in their order.
+	let pick = metrics::Pick::new(order, options.all_details, true);
 	print!(
 		"{}",
 		metrics::details(
 			Some(&before.shown()),
 			&after.shown(),
 			&std::collections::BTreeMap::new(),
-			&metrics::Pick::new(order, options.all_details, true),
+			&pick,
 		)
 	);
-	print!("{}", crate::attribution::table(&before, &after));
+	print!("{}", crate::attribution::table(&before, &after, pick.names()));
 	if let Some(report) = &options.report {
 		metrics::report(&after, Some(&before), &counter, Some(&sha)).write(report)?;
 		eprintln!("swole: wrote {}", report.display());
@@ -727,13 +729,25 @@ fn table(before: &Counts, after: &Counts) -> Result<(String, Vec<(String, bool)>
 				let headlines = std::iter::once((b_side, a_side)).chain(cycles(&base).zip(cycles(&head)));
 				// Two sampled counts move only past their spreads; one sampled beside an exact one
 				// has no verdict, so it moved without regressing.
-				let (mut moved, mut regressed, mut impact) = (false, false, 0.0f64);
-				for ((b, b_spread), (a, a_spread)) in headlines {
+				// A moved benchmark sorts by the headlines that moved, a held one by every one.
+				let (mut moved, mut regressed) = (false, false);
+				let (mut moved_impact, mut held_impact) = (0.0f64, 0.0f64);
+				// The estimated cycles' change, when they alone moved it, beside the instructions'.
+				let mut change = metrics::change(b_side, a_side);
+				for (index, ((b, b_spread), (a, a_spread))) in headlines.enumerate() {
 					let shifted = a != b && a_spread.zip(b_spread).is_none_or(|(a, b)| !metrics::overlap(b, a));
+					if index > 0 && shifted && !moved {
+						change += &format!(", cycles {}", metrics::change((b, b_spread), (a, a_spread)));
+					}
 					moved |= shifted;
 					regressed |= shifted && a_spread.is_some() == b_spread.is_some() && a > b;
-					impact = impact.max(if b == 0.0 { f64::INFINITY } else { (a - b).abs() / b });
+					let impact = if b == 0.0 { f64::INFINITY } else { (a - b).abs() / b };
+					held_impact = held_impact.max(impact);
+					if shifted {
+						moved_impact = moved_impact.max(impact);
+					}
 				}
+				let impact = if moved { moved_impact } else { held_impact };
 				let cause = regressed
 					.then(|| crate::diagnose::cause(base.get(name)?, head.get(name)?, None))
 					.flatten();
@@ -744,7 +758,7 @@ fn table(before: &Counts, after: &Counts) -> Result<(String, Vec<(String, bool)>
 						metrics::Rank::Held
 					},
 					impact,
-					metrics::change(b_side, a_side),
+					change,
 					cause,
 				)
 			}
@@ -878,6 +892,23 @@ mod tests {
 	}
 
 	#[test]
+	fn sorts_a_moved_benchmark_by_the_headlines_that_moved() {
+		let cycles = |value: f64| vec![crate::Measure::new(crate::callgrind::ESTIMATED, value, "cycles")];
+		let mut before = counts("f", &[("wide", 1000), ("small", 100)]);
+		let mut after = counts("f", &[("wide", 1500), ("small", 120)]);
+		// Its instructions held within their spreads, so only its cycles' 5% moved it.
+		before.spread.insert("wide".to_owned(), (900, 2000));
+		after.spread.insert("wide".to_owned(), (1400, 2500));
+		before.details.insert("wide".to_owned(), cycles(10_000.0));
+		after.details.insert("wide".to_owned(), cycles(10_500.0));
+		let (_, order) = table(&before, &after).unwrap();
+		assert_eq!(
+			order,
+			[("small", true), ("wide", true)].map(|(name, moved)| (name.to_owned(), moved))
+		);
+	}
+
+	#[test]
 	fn names_the_likely_cause_beside_a_regression() {
 		let measures = |misses: f64| {
 			vec![
@@ -917,7 +948,8 @@ mod tests {
 		after.details.insert("c".to_owned(), cycles(20.0));
 		let (rendered, order) = table(&before, &after).unwrap();
 		assert!(
-			rendered.ends_with("| c | 10000 | 10000 | +0.00% | memory-bound (LL MPKI 0.100 → 2.000) |\n"),
+			rendered
+				.ends_with("| c | 10000 | 10000 | +0.00%, cycles +18.81% | memory-bound (LL MPKI 0.100 → 2.000) |\n"),
 			"{rendered}"
 		);
 		assert_eq!(order, [("c".to_owned(), true)]);

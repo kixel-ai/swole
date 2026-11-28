@@ -223,23 +223,34 @@ fn times_each_harness_benchmark() {
 		// reference where the PMU counts one, else an estimate from user time, and the top-down
 		// breakdown's first level, which divides every slot, where the PMU breaks it down.
 		let alone = head("alone");
-		assert_eq!(alone["branch MPKI:u"]["unit"], "MPKI", "{alone}");
-		assert!(
-			alone["branch miss rate:u"]["value"].as_f64().unwrap() < 100.0,
-			"{alone}"
-		);
-		let pass = |event: &str| {
-			host.iter()
-				.any(|line| line.starts_with("pass ") && line.contains(event))
+		// Whether one pass, one group, counts every one of `events`.
+		let pass = |events: &[&str]| {
+			host.iter().any(|line| {
+				line.strip_prefix("pass ")
+					.and_then(|line| line.split_once(": "))
+					.is_some_and(|(_, names)| events.iter().all(|event| names.split(' ').any(|name| name == *event)))
+			})
 		};
-		if pass("ref-cycles:u") {
+		if pass(&["branch-misses:u"]) {
+			assert_eq!(alone["branch MPKI:u"]["unit"], "MPKI", "{alone}");
+		}
+		if pass(&["branch-misses:u"]) && pass(&["branches:u"]) {
+			assert!(
+				alone["branch miss rate:u"]["value"].as_f64().unwrap() < 100.0,
+				"{alone}"
+			);
+		}
+		if pass(&["cycles:u", "ref-cycles:u"]) {
 			let clock = alone["cycles/ref-cycles:u"]["value"].as_f64().unwrap();
 			assert!((0.1..10.0).contains(&clock), "{alone}");
 			assert!(alone.get("estimated clock:u").is_none(), "{alone}");
-		} else if pass("cycles:u") {
+		} else if pass(&["cycles:u"]) {
 			assert_eq!(alone["estimated clock:u"]["unit"], "GHz", "{alone}");
 		}
-		if pass("slots:u") || pass("topdown-retiring:u") {
+		if pass(&["slots:u"]) || pass(&["topdown-retiring:u"]) {
+			// A call eight times `alone`'s, whose window's edges, where each event of a group is
+			// read a few cycles apart, move its shares a tenth as much: up to 1% on `alone`'s.
+			let long = head("unstable[8000]");
 			let first = [
 				"retiring",
 				"bad speculation",
@@ -249,10 +260,21 @@ fn times_each_harness_benchmark() {
 			];
 			let total: f64 = first
 				.iter()
-				.filter_map(|share| alone[format!("topdown {share}")]["value"].as_f64())
+				.filter_map(|share| long[format!("topdown {share}")]["value"].as_f64())
 				.sum();
-			// The SMT sibling's share, which a PMU a counter short leaves out, is all that is missing.
-			assert!((90.0..=100.5).contains(&total), "{total}: {alone}");
+			// The SMT sibling's share, which a PMU a counter short leaves out, is all that may be
+			// missing, and with it as much as the sibling took.
+			assert!(
+				first[..4]
+					.iter()
+					.all(|share| long.get(format!("topdown {share}")).is_some()),
+				"{long}"
+			);
+			// AMD's sibling share, which no pass counts on a PMU a counter short.
+			let smt = "de_no_dispatch_per_slot.smt_contention:u";
+			let amd = host.iter().any(|line| line.contains("de_no_dispatch_per_slot"));
+			let least = if amd && !pass(&[smt]) { 0.0 } else { 90.0 };
+			assert!((least..=100.5).contains(&total), "{total}: {long}");
 		}
 		// And each counter per byte, cycles among them where the host counts them.
 		let sized = head("sized[2000]");

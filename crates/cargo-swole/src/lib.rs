@@ -88,7 +88,7 @@ options:
                        each beside its heap allocations (sim and quick: no <base>)
   --report <file>      write every measure of every benchmark as JSON
   --all-details        print every measure of every benchmark, not only those that moved in a
-                       suite of more than 10
+                       suite of more than 10 (without a base, none moved)
   --jobs <n>           how many jobs run at once (default: every core, or for quick, every core
                        of the PMU it counts on; bench runs one at a time)
   --build <command>    a shell command that builds the programs, run first (sim, with --program)

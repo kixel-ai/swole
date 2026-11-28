@@ -433,9 +433,11 @@ fn serve(
 		// swole waits for, reading what precedes it as the benchmark's own output.
 		#[cfg(all(unix, target_pointer_width = "64"))]
 		let used = {
+			// Both ends together, so no delay between them counts in one and not the other.
+			let (end, wall) = (rusage::Usage::now(), window.elapsed());
 			let mut used = rusage::Usage::default();
-			rusage::Usage::now().add_since(start, &mut used);
-			format!("\n{RUSAGE}{}\n{WALL}{}", used.fields(), window.elapsed().as_nanos())
+			end.add_since(start, &mut used);
+			format!("\n{RUSAGE}{}\n{WALL}{}", used.fields(), wall.as_nanos())
 		};
 		#[cfg(not(all(unix, target_pointer_width = "64")))]
 		let used = "";

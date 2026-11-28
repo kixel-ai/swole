@@ -598,6 +598,11 @@ pub struct Pick {
 }
 
 impl Pick {
+	/// The benchmarks it picks, in their table's order.
+	pub fn names(&self) -> &[String] {
+		&self.names
+	}
+
 	/// From each benchmark in the order a table shows it and whether its headline moved: with
 	/// `all`, every one and every row; else every one in a suite of at most [`SMALL`], or the moved
 	/// alone, each with only the rows that moved.
@@ -630,7 +635,7 @@ pub fn details(
 	paired: &BTreeMap<String, f64>,
 	pick: &Pick,
 ) -> String {
-	let mut rows = String::new();
+	let (mut rows, mut held_rows) = (String::new(), 0usize);
 	for name in &pick.names {
 		// A `|` in a name would split its cell.
 		let shown_name = name.replace('|', "\\|");
@@ -670,6 +675,7 @@ pub fn details(
 					let change = match (find(base, measure, unit), find(head, measure, unit)) {
 						(Some(b), Some(a)) => {
 							if !pick.every_row && rate.map_or(held(b, a), |rate| rate.abs() < 0.00005) {
+								held_rows += 1;
 								continue;
 							}
 							match rate {
@@ -715,11 +721,27 @@ pub fn details(
 		out += &rows;
 	}
 	let (left_out, why) = pick.left_out;
-	if left_out > 0 {
+	let measures = |n: usize| {
+		if n == 1 {
+			"1 measure".to_owned()
+		} else {
+			format!("{n} measures")
+		}
+	};
+	let omitted = match (left_out, held_rows) {
+		(0, 0) => None,
+		(0, rows) => Some(format!("{} that held", measures(rows))),
+		(benchmarks, 0) => Some(format!("The other measures of {benchmarks} benchmarks{why}")),
+		(benchmarks, rows) => Some(format!(
+			"The other measures of {benchmarks} benchmarks{why}, and {} that held,",
+			measures(rows)
+		)),
+	};
+	if let Some(omitted) = omitted {
 		writeln!(
 			out,
-			"\nThe other measures of {left_out} benchmarks{why} are left out: --all-details prints them, and --report \
-			 writes them."
+			"\n{omitted} {} left out: --all-details prints them, and --report writes them.",
+			if (left_out, held_rows) == (0, 1) { "is" } else { "are" }
 		)
 		.expect("a String takes every write");
 	}
@@ -797,8 +819,8 @@ mod tests {
 			),
 			"\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n\
 			 | b07 | cycles:u | 100 | 150 | +50.00% |\n| b07 | topdown retiring | 40.00% | 42.50% | +2.50 pp |\n\
-			 \nThe other measures of 11 benchmarks whose headline held are left out: --all-details prints them, and \
-			 --report writes them.\n"
+			 \nThe other measures of 11 benchmarks whose headline held, and 1 measure that held, are left out: \
+			 --all-details prints them, and --report writes them.\n"
 		);
 		// Every row of every one with --all-details.
 		let all = details(
@@ -817,7 +839,8 @@ mod tests {
 		assert_eq!(
 			details(Some(&few), &moved, &BTreeMap::new(), &Pick::new(order, false, true)),
 			"\n| benchmark | measure | base | head | change |\n|---|---|---:|---:|---:|\n\
-			 | b01 | topdown retiring | 40.00% | 41.00% | +1.00 pp |\n"
+			 | b01 | topdown retiring | 40.00% | 41.00% | +1.00 pp |\n\
+			 \n8 measures that held are left out: --all-details prints them, and --report writes them.\n"
 		);
 		// Without a base, a large suite prints no details, and says so.
 		let order = names.iter().map(|name| (name.clone(), false)).collect();
