@@ -104,8 +104,8 @@ const SIMULATED: [(&[&str], &str); 4] = [
 /// The ratios that derive from a benchmark's `measures`, each where the run took what it divides:
 /// misses per thousand instructions and the branch miss rate, natively in each ring or as
 /// Callgrind simulates them, and the kernel's share of the instructions; and when `timed`, as
-/// `bench` is, the kernel's share of the CPU time, and the clock its cycles over its user time
-/// estimate where it counted no reference cycles. A ratio of a sampled measure is sampled, its spread the widest its inputs'
+/// `bench` is, the clock its cycles over its user time estimate where it counted no reference
+/// cycles. A ratio of a sampled measure is sampled, its spread the widest its inputs'
 /// allow.
 pub fn derive(measures: &[Measure], timed: bool) -> Vec<Measure> {
 	let mut out = Vec::new();
@@ -149,15 +149,6 @@ pub fn derive(measures: &[Measure], timed: bool) -> Vec<Measure> {
 		find(measures, "instructions:u"),
 		"kernel instruction share",
 	));
-	// A count's rusage covers one call, which the tick splits between user and system time by
-	// where it landed; only a timed run's many samples say how the kernel shares it.
-	if timed {
-		out.extend(share(
-			find(measures, "system time"),
-			find(measures, "user time"),
-			"kernel time share",
-		));
-	}
 	// Without reference cycles, user time is the only clock: it covers what a sample ran between
 	// calls, and the timed process rather than the counted one, so it only estimates.
 	if timed && !measures.iter().any(|measure| measure.name == "cycles/ref-cycles:u") {
@@ -186,6 +177,25 @@ pub fn busy(samples: impl IntoIterator<Item = (u64, u128)>) -> Option<Measure> {
 	(wall > 0).then(|| Measure {
 		spread: Some((least, most)),
 		..Measure::new("CPUs busy", cpu as f64 / wall as f64, "CPUs")
+	})
+}
+
+/// The kernel's share of a timed benchmark's CPU time over its samples, each the user and system
+/// time its process used: their totals' share, sampled within the least and most one sample's
+/// own pair gave, since the tick splits a sample's CPU time between them. A count's rusage covers
+/// one call, so only a timed run's many samples say how the kernel shares it.
+pub fn kernel_share(samples: impl IntoIterator<Item = (u64, u64)>) -> Option<Measure> {
+	let share = |user: f64, system: f64| 100.0 * system / (user + system);
+	let (mut user, mut system) = (0.0, 0.0);
+	let (mut least, mut most) = (f64::INFINITY, 0.0f64);
+	for (user_ns, system_ns) in samples.into_iter().filter(|&(user, system)| user + system > 0) {
+		let (u, s) = (user_ns as f64, system_ns as f64);
+		(user, system) = (user + u, system + s);
+		(least, most) = (least.min(share(u, s)), most.max(share(u, s)));
+	}
+	(user + system > 0.0).then(|| Measure {
+		spread: Some((least, most)),
+		..Measure::new("kernel time share", share(user, system), "%")
 	})
 }
 
@@ -429,7 +439,6 @@ mod tests {
 		assert_eq!(value("branch MPKI:u"), 4.0);
 		assert_eq!(value("branch miss rate:u"), 2.0);
 		assert_eq!(value("kernel instruction share"), 20.0);
-		assert_eq!(value("kernel time share"), 75.0);
 		assert_eq!(value("estimated clock:u"), 4.0);
 		assert_eq!(get(&derived, "estimated clock:u").unit, "GHz");
 		assert!(derived.iter().all(|measure| measure.spread.is_none()));
@@ -494,6 +503,18 @@ mod tests {
 			)
 			.is_empty()
 		);
+	}
+
+	#[test]
+	fn kernel_time_share_spans_each_samples_own_pair() {
+		// One sample the tick charged only to user time, another only to system time.
+		let share = kernel_share([(100, 0), (0, 100), (0, 0)]).unwrap();
+		assert_eq!(share.value, 50.0);
+		assert_eq!(share.spread, Some((0.0, 100.0)));
+		let share = kernel_share([(300, 100), (100, 100)]).unwrap();
+		assert_eq!(share.value, 100.0 * 200.0 / 600.0);
+		assert_eq!(share.spread, Some((25.0, 50.0)));
+		assert!(kernel_share([(0, 0)]).is_none());
 	}
 
 	/// A side of a timed benchmark with each measure named.

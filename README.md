@@ -247,7 +247,7 @@ changes first, then the benchmarks one side has, then those that held, with the 
 cause](#diagnostics) beside each regression; then one of every other measure that moved: for
 `sim`, each [simulated event](#simulated-cycles) and the estimated cycles, whose change moves a
 benchmark as its instructions' does, the headline's change naming it (`+0.00%, cycles +4.26%`)
-when it alone moved. A
+whenever it moved. A
 sampled (`~`) value compares by its spread, never as one exact count: between two sampled values,
 the change says whether their spreads overlap (`within spread`) or not (`beyond spread`), and with
 one side's spread alone, it is marked `~` and gives no verdict. `sim` then names, for each measure of each

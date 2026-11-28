@@ -146,7 +146,7 @@ fn times_each_harness_benchmark() {
 		assert_eq!(head["time"]["unit"], "ns", "{name}: {head}");
 		assert!(head["max RSS"]["value"].as_f64().unwrap() > 0.0, "{name}: {head}");
 		// Sampled within the least and most one sample used, as the tick splits it from system time.
-		assert!(head["user time"]["lower"].is_f64(), "{name}: {head}");
+		assert!(head["user time"]["lower"].is_number(), "{name}: {head}");
 		assert!(
 			head["CPUs busy"].is_null() || head["CPUs busy"]["unit"] == "CPUs",
 			"{name}: {head}"

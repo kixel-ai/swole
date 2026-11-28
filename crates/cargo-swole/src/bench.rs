@@ -574,12 +574,13 @@ fn spread(
 
 /// What the process used over `samples`, each a call's share of its sample's, user and system
 /// time sampled within the least and most one sample used, since the tick splits a sample's CPU
-/// time between them, and how busy it kept the CPUs, when its harness says what it used, and says
-/// over how long.
+/// time between them, the kernel's share of it, and how busy it kept the CPUs, when its harness
+/// says what it used, and says over how long.
 fn usage<'a>(samples: impl Iterator<Item = &'a Sample>, iterations: u64) -> Option<Vec<Measure>> {
 	let mut total = perf::Usage::default();
 	let mut count = 0;
 	let mut windows = Some(Vec::new());
+	let mut pairs = Vec::new();
 	let (mut user, mut system) = ((u64::MAX, 0), (u64::MAX, 0));
 	for sample in samples {
 		let used = sample.usage?;
@@ -587,6 +588,7 @@ fn usage<'a>(samples: impl Iterator<Item = &'a Sample>, iterations: u64) -> Opti
 		count += 1;
 		user = (user.0.min(used.user_ns), user.1.max(used.user_ns));
 		system = (system.0.min(used.system_ns), system.1.max(used.system_ns));
+		pairs.push((used.user_ns, used.system_ns));
 		windows = windows.zip(sample.window).map(|(mut windows, window)| {
 			windows.push((used.user_ns + used.system_ns, window.as_nanos()));
 			windows
@@ -605,6 +607,7 @@ fn usage<'a>(samples: impl Iterator<Item = &'a Sample>, iterations: u64) -> Opti
 		};
 		measure.spread = Some((per(least), per(most)));
 	}
+	measures.extend(crate::diagnose::kernel_share(pairs));
 	// Over the harness's own wall clock, which none of swole's requests and replies add to.
 	measures.extend(windows.and_then(crate::diagnose::busy));
 	Some(measures)
