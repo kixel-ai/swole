@@ -277,9 +277,10 @@ pub fn bench(base: Option<&str>, options: &Options) -> Result<(), String> {
 						&name,
 						widen || base.threaded || head.threaded,
 					) {
-						base.finish()?;
-						head.finish()?;
-						// Released once the wide processes have exited, so no other run times beside them.
+						// Both reaped, even when one fails, before the spread is released, so no other
+						// run times beside either.
+						let finished = base.finish();
+						finished.and(head.finish())?;
 						spreading = None;
 						cpus = exclusive.clone();
 						(base, head) = spawn(cpus.as_deref())?;
