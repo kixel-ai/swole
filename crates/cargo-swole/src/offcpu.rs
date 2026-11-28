@@ -85,7 +85,7 @@ enum Event {
 	Enter(Option<Site>),
 	/// It returned from a futex call.
 	Exit,
-	/// It exited, so it leaves the CPU for good.
+	/// It exited, returning from no futex call it was in, though it may still block as it tears down.
 	Gone,
 	/// A prctl returned, as the harness's starting the events does, opening the window its clock
 	/// times.
@@ -318,7 +318,8 @@ impl Tracing {
 				// The thread switched to or from, then the record's process and thread, the one
 				// switching, and its time, which every event's records end with.
 				let (task, tid, time) = (half(16)?, half(20)?, word(24)?);
-				// A thread reaped before its last switch out has no ID left to name it by.
+				// Linux reaps an exiting thread before its last switch out, which then names no
+				// thread, so that switch opens no wait.
 				if task != pid || tid == u32::MAX {
 					return Ok(Parsed::Other);
 				}
@@ -436,8 +437,6 @@ fn account(records: &[Record]) -> Waits {
 		off: Option<(u64, bool, Option<Site>)>,
 		/// The futex wait it entered and has not returned from.
 		waiting: Option<Site>,
-		/// Whether it exited, so its last switch out, which no switch in follows, waits for nothing.
-		gone: bool,
 	}
 	/// Counts a wait from `since` until `until`, which a wakeup the trace saw ended if `woken`.
 	fn close(waits: &mut Waits, (since, runnable, site): (u64, bool, Option<Site>), until: u64, woken: bool) {
@@ -463,9 +462,9 @@ fn account(records: &[Record]) -> Waits {
 		match record.event {
 			Event::Start if !open && harness.is_none_or(|tid| tid == record.tid) => open = true,
 			Event::Stop if open => {
-				// An exiting thread may still block as it tears down, but its last switch out
-				// never ends.
-				for thread in threads.values_mut().filter(|thread| !thread.gone) {
+				// An exiting thread may still block as it tears down, after its exit's record, and
+				// counts like any other: its last switch out, reaped by then, names no thread.
+				for thread in threads.values_mut() {
 					if let Some(off) = thread.off.take() {
 						close(&mut waits, off, record.time, false);
 					}
@@ -501,7 +500,7 @@ fn account(records: &[Record]) -> Waits {
 					Event::Enter(site) => thread.waiting = site,
 					Event::Exit => thread.waiting = None,
 					// A thread exit_group kills mid-wait never returns from its futex call.
-					Event::Gone => (thread.gone, thread.waiting) = (true, None),
+					Event::Gone => thread.waiting = None,
 					Event::Start | Event::Stop | Event::Wake => unreachable!("matched above"),
 				}
 			}
@@ -835,8 +834,8 @@ mod tests {
 			record(500, 2, Event::In),
 			record(600, 2, Event::Enter(Some(SITE))),
 			record(650, 2, out),
-			// A worker that exits may block as it tears down, then leaves the CPU for good,
-			// waiting on nothing.
+			// A worker that exits may block as it tears down, still blocked when the window
+			// closes; its last switch out, reaped, is no record of its.
 			record(700, 3, Event::Gone),
 			record(705, 3, out),
 			record(708, 3, Event::In),
@@ -868,7 +867,7 @@ mod tests {
 		assert_eq!(
 			account(&records),
 			Waits {
-				blocked: 50 + 80 + 10 + 350 + 10 + 3 + 30 + 5,
+				blocked: 50 + 80 + 10 + 350 + 10 + 3 + 290 + 30 + 5,
 				runnable: 20 + 5 + 5,
 				futex: BTreeMap::from([(SITE, 80 + 350), (shared, 5)]),
 				unwoken: 30,

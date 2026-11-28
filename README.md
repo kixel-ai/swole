@@ -536,7 +536,8 @@ with it. The harness starts the events just after its clock starts and stops the
 clock stops, and the window opens as its start of the events returns and closes as its stop begins,
 so it lies within the time, and what other CPUs record before the stop reaches them stays out. Each wait a thread began
 inside it counts until it ends or the window does, so a worker parked since before the window,
-waiting for work that never came, counts nothing, nor does a thread's last switch as it exits:
+waiting for work that never came, counts nothing, nor does a thread's last switch as it exits,
+which names no thread once Linux reaps it, though a block as it tears down counts:
 
 - `blocked time`: off the CPU, waiting on something, as a sleep, I/O, or a futex, until woken;
 - `runnable time`: off the CPU while runnable, waiting for one, as when the scheduler preempted
