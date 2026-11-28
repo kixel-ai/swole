@@ -246,7 +246,10 @@ it runs, and print a Markdown table of each benchmark's base, head, and change, 
 other measure: for `sim`, each [simulated event](#simulated-cycles) and the estimated cycles. A
 sampled (`~`) value compares by its spread, never as one exact count: between two sampled values,
 the change says whether their spreads overlap (`within spread`) or not (`beyond spread`), and with
-one side's spread alone, it is marked `~` and gives no verdict. `swole bench <base>` builds both sides in the same worktree and times
+one side's spread alone, it is marked `~` and gives no verdict. `sim` then names, for each measure of each changed
+benchmark, the three to five functions whose own cost moved it most, from the Callgrind profiles it already reads
+(the first run's, marked when the benchmark counts more than once), with a function one side's profile lacks
+marked. `swole bench <base>` builds both sides in the same worktree and times
 them [paired](#bench). One directory
 counts both sides, so a path the build compiles in, such as a panic's location, is the same in
 each and moves neither count. The worktree sits outside the repository, so no
